@@ -1,0 +1,180 @@
+name: Engine CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: engine-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-linux:
+    name: Host C++20 (Linux clang++)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure and build engine host tests
+        run: |
+          CXX=clang++ cmake -S . -B build-host -DWSE_BUILD_HEADER_CHECKS=ON
+          cmake --build build-host -j"$(nproc)"
+
+      - name: Run CTest suites
+        run: |
+          ctest --test-dir build-host --output-on-failure --no-tests=error
+
+      - name: Validate emitted SPIR-V 1.0 modules with spirv-val
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spirv-tools
+          spv_dir="$(mktemp -d)"
+          trap 'rm -rf "${spv_dir}"' EXIT
+          WSE_DUMP_SPIRV_DIR="${spv_dir}" ./build-host/asset_test
+          shopt -s nullglob
+          spvs=("${spv_dir}"/*.spv)
+          if [ "${#spvs[@]}" -eq 0 ]; then
+            echo "No SPIR-V files dumped" >&2
+            exit 1
+          fi
+          for f in "${spvs[@]}"; do
+            spirv-val --target-env vulkan1.0 "${f}"
+          done
+          echo "Validated ${#spvs[@]} SPIR-V 1.0 modules with spirv-val"
+
+      - name: Check WSE opcode status
+        run: python3 tools/extract_wse_opcodes.py --check
+
+      - name: Check evidence citations
+        run: python3 tools/check_citations.py --self-test --docs
+
+  host-sanitizers:
+    name: Host ASan + UBSan (Linux clang++)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure and build with sanitizers
+        run: |
+          CXX=clang++ cmake -S . -B build-san -DWSE_SANITIZE=ON
+          cmake --build build-san -j"$(nproc)"
+
+      - name: Run CTest suites under ASan/UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: |
+          ctest --test-dir build-san --output-on-failure --no-tests=error
+
+  android-arm64:
+    name: Android NDK (aarch64-linux-android29)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate Android NDK and compile all headers & tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "${ndk}" ] && [ -n "${ANDROID_HOME:-}" ] && [ -d "${ANDROID_HOME}/ndk" ]; then
+            ndk="$(find "${ANDROID_HOME}/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          fi
+          if [ -z "${ndk}" ] || [ ! -d "${ndk}" ]; then
+            echo "Android NDK not found on runner" >&2
+            exit 1
+          fi
+          echo "Using Android NDK: ${ndk}"
+
+          clang_bin="${ndk}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
+          if [ ! -x "${clang_bin}" ]; then
+            echo "Missing NDK compiler wrapper: ${clang_bin}" >&2
+            exit 1
+          fi
+          header_out="$(mktemp -d)"
+          trap 'rm -rf "${header_out}"' EXIT
+
+          while IFS= read -r -d '' hdr; do
+            rel="${hdr#engine/include/}"
+            obj="${header_out}/$(echo "${rel}" | tr '/.' '__').o"
+            stub="${header_out}/$(echo "${rel}" | tr '/.' '__').cpp"
+            printf '#include "%s"\n' "${rel}" > "${stub}"
+            echo "arm64 header check: ${rel}"
+            "${clang_bin}" -std=c++20 -O2 -Wall -Wextra -Werror -I engine/include -c "${stub}" -o "${obj}"
+          done < <(find engine/include -name '*.h' -print0 | sort -z)
+
+          cmake -S . -B build-android \
+            -DCMAKE_TOOLCHAIN_FILE="${ndk}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_static \
+            -DWSE_BUILD_HEADER_CHECKS=ON
+          cmake --build build-android -j"$(nproc)"
+
+  android-apk:
+    name: Android APK (arm64-v8a)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.12'
+
+      - name: Build arm64-v8a debug APK
+        env:
+          WSE_NDK_VERSION: '30.0.16248370'
+          WSE_CMAKE_VERSION: '3.31.6'
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="${sdk_root}"
+          export ANDROID_SDK_ROOT="${sdk_root}"
+
+          # Pinned toolchain: the build must not change because the runner
+          # image gained a newer NDK or CMake. Installed on demand if absent.
+          sdkmanager="${sdk_root}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -d "${sdk_root}/ndk/${WSE_NDK_VERSION}" ]; then
+            (yes || true) | "${sdkmanager}" --install "ndk;${WSE_NDK_VERSION}" > /dev/null
+          fi
+          if [ ! -d "${sdk_root}/cmake/${WSE_CMAKE_VERSION}" ]; then
+            (yes || true) | "${sdkmanager}" --install "cmake;${WSE_CMAKE_VERSION}" > /dev/null
+          fi
+          extra_props=(
+            "-Pwse.ndkVersion=${WSE_NDK_VERSION}"
+            "-Pwse.cmakeVersion=${WSE_CMAKE_VERSION}"
+          )
+          echo "Gradle props: ${extra_props[*]}"
+
+          gradle -p android assembleDebug --no-daemon "${extra_props[@]}"
+
+          apk_path="android/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "${apk_path}"
+          contents="$(unzip -Z1 "${apk_path}")"
+          echo "${contents}" | grep -Fx "lib/arm64-v8a/libwse2.so"
+          echo "${contents}" | grep -Fx "lib/arm64-v8a/libSDL3.so"
+          echo "${contents}" | grep -Fx "lib/arm64-v8a/libpanvk_hw.so"
+          echo "${contents}" | grep -Fx "assets/scripts.txt"
+          # Only the self-test fixture may be packaged (BYOA: no other assets).
+          extra_assets="$(echo "${contents}" | grep '^assets/' | grep -Fxv "assets/scripts.txt" || true)"
+          if [ -n "${extra_assets}" ]; then
+            echo "Unexpected APK assets:" >&2
+            echo "${extra_assets}" >&2
+            exit 1
+          fi
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wse2-android-selftest-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
