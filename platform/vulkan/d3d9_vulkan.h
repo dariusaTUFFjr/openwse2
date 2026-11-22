@@ -28,16 +28,17 @@ struct ScaledRect {
     std::int32_t bottom = 0;
 };
 
+// Rounded like `scale_rect`, so a full-size viewport fills exactly the region the upscaler reads.
 [[nodiscard]] inline std::pair<std::uint32_t, std::uint32_t> scaled_render_extent(
     std::uint32_t width, std::uint32_t height, float scale) noexcept {
     if (width == 0U || height == 0U) return {width, height};
     const float s = std::isfinite(scale) ? std::clamp(scale, 0.5F, 1.0F) : 1.0F;
     if (s >= 1.0F) return {width, height};
     const auto sw = static_cast<std::uint32_t>(
-        std::clamp<std::int64_t>(static_cast<std::int64_t>(std::ceil(static_cast<double>(width) * s)),
+        std::clamp<std::int64_t>(std::llround(static_cast<double>(width) * s),
                                  1LL, static_cast<std::int64_t>(width)));
     const auto sh = static_cast<std::uint32_t>(
-        std::clamp<std::int64_t>(static_cast<std::int64_t>(std::ceil(static_cast<double>(height) * s)),
+        std::clamp<std::int64_t>(std::llround(static_cast<double>(height) * s),
                                  1LL, static_cast<std::int64_t>(height)));
     return {sw, sh};
 }
