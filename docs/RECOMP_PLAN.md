@@ -859,7 +859,7 @@ own, and none blocks another.
     bytecode only.
 - **Sub-slices (ambitious v1 scope, decided with the user, 2026-11-22; R5a redesigned 2026-11-22):**
   - **R5a (D3D9 on Vulkan with translated shaders, System Vulkan, main menu):** in order:
-    1. **Effects (`fx_2_0`):** a parser for the `.fxo` container (parameters with their types and
+    1. **Effects (`fx_2_0`; parser landed 2026-11-22, `wse/recomp/fx_effect.h`):** a parser for the `.fxo` container (parameters with their types and
        annotations, techniques, passes with their render and sampler states and shader blobs) behind
        our `ID3DXEffect` (`shim_d3dx.h`), so `SetFloat`/`SetMatrix`/`SetTexture` and `BeginPass`
        resolve to real constants and states. Host test: every effect in the install parses with the

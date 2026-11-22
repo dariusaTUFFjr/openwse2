@@ -13,7 +13,10 @@
 #include <thread>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <string>
@@ -21,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "wse/recomp/fx_effect.h"
 #include "wse/recomp/pdb_reader.h"
 #include "wse/recomp/pe_image.h"
 #include "wse/recomp/r0_inputs.h"
@@ -5507,6 +5511,191 @@ void test_r4_shim_edge_cases() {
     expect(faults.empty(), "edge: no faults");
 }
 
+// R5a step 1: the fx_2_0 effect parser (wse/recomp/fx_effect.h) on a synthetic effect built here,
+// then, when the user's install is present, on its seven effect files.
+void test_fx_effects() {
+    namespace fx = wse::recomp::fx;
+    // Builds the bytes after the 8-byte header; offsets are relative to the start of `d`.
+    std::vector<std::uint8_t> d;
+    auto put = [&](std::uint32_t v) {
+        const std::size_t at = d.size();
+        d.resize(at + 4);
+        std::memcpy(d.data() + at, &v, 4);
+        return static_cast<std::uint32_t>(at);
+    };
+    auto putf = [&](float f) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, &f, 4);
+        return put(v);
+    };
+    auto name = [&](const char* s) {
+        const std::uint32_t n = static_cast<std::uint32_t>(std::strlen(s) + 1);
+        const std::uint32_t at = put(n);
+        for (std::uint32_t i = 0; i < n; ++i) d.push_back(static_cast<std::uint8_t>(s[i]));
+        while (d.size() % 4 != 0) d.push_back(0);
+        return at;
+    };
+    // Typedefs need their names first; lay names out, then typedef records.
+    const std::uint32_t empty = name("");
+    const std::uint32_t n_color = name("color");
+    const std::uint32_t n_sampler = name("tex_sampler");
+    const std::uint32_t n_tex = name("tex");
+    const std::uint32_t n_vs = name("vs_array");
+    const std::uint32_t n_tech = name("t0");
+    const std::uint32_t n_pass = name("p0");
+    auto td = [&](std::uint32_t type, std::uint32_t cls, std::uint32_t nm, std::uint32_t elements, std::uint32_t rows,
+                  std::uint32_t cols) {
+        const std::uint32_t at = put(type);
+        put(cls);
+        put(nm);
+        put(empty);
+        put(elements);
+        if (cls <= 3) {
+            put(rows);
+            put(cols);
+        }
+        return at;
+    };
+    const std::uint32_t t_color = td(fx::kFloat, 1, n_color, 0, 1, 4);
+    const std::uint32_t v_color = putf(1.0F);
+    putf(0.5F);
+    putf(0.25F);
+    putf(2.0F);
+    const std::uint32_t t_sampler = td(fx::kSampler, 4, n_sampler, 0, 0, 0);
+    const std::uint32_t t_tex = td(fx::kTexture, 4, n_tex, 0, 0, 0);
+    const std::uint32_t v_tex = put(2);  // object id of the texture
+    const std::uint32_t v_sampler = put(1);  // one sampler state
+    put(164);  // Texture
+    put(0);
+    put(t_tex);
+    put(v_tex);
+    const std::uint32_t t_vs = td(fx::kVertexShader, 4, n_vs, 2, 0, 0);
+    const std::uint32_t v_vs = put(3);
+    put(4);
+    const std::uint32_t t_vs1 = td(fx::kVertexShader, 4, n_vs, 0, 0, 0);
+    const std::uint32_t t_ps1 = td(fx::kPixelShader, 4, n_vs, 0, 0, 0);
+    const std::uint32_t v_obj5 = put(5);
+    const std::uint32_t v_obj6 = put(6);
+    // The table.
+    const std::uint32_t table = put(3);  // parameters
+    put(1);  // techniques
+    put(0);
+    put(7);  // object slots
+    for (auto [t, v] : {std::pair{t_color, v_color}, std::pair{t_sampler, v_sampler}, std::pair{t_vs, v_vs}}) {
+        put(t);
+        put(v);
+        put(0);  // flags
+        put(0);  // annotations
+    }
+    put(n_tech);
+    put(0);  // annotations
+    put(1);  // passes
+    put(n_pass);
+    put(0);
+    put(2);  // states
+    put(146);  // VertexShader
+    put(0);
+    put(t_vs1);
+    put(v_obj5);
+    put(147);  // PixelShader
+    put(0);
+    put(t_ps1);
+    put(v_obj6);
+    put(2);  // objects
+    put(2);  // resources
+    put(5);  // object 5: vs_2_0 bytecode
+    put(8);
+    put(0xFFFE0200U);
+    put(0x0000FFFFU);
+    put(6);  // object 6: ps_2_0 bytecode
+    put(8);
+    put(0xFFFF0200U);
+    put(0x0000FFFFU);
+    put(0);  // resource: an inline vs_3_0 shader for technique 0, pass 0, state 0
+    put(0);
+    put(fx::kNoTechnique);
+    put(0);
+    put(0);
+    put(8);
+    put(0xFFFE0300U);
+    put(0x0000FFFFU);
+    put(0);  // resource: technique 0, pass 0, state 1 names the parameter holding its shader
+    put(0);
+    put(fx::kNoTechnique);
+    put(1);
+    put(1);
+    name("ps_main_compiled");
+
+    std::vector<std::uint8_t> file(8);
+    const std::uint32_t tag = fx::kFx20Tag;
+    std::memcpy(file.data(), &tag, 4);
+    std::memcpy(file.data() + 4, &table, 4);
+    file.insert(file.end(), d.begin(), d.end());
+
+    fx::Effect e;
+    std::string err;
+    const bool ok = fx::parse(file, e, &err);
+    expect(ok, "fx: synthetic effect parses");
+    if (ok) {
+        const fx::Parameter* color = e.parameter("color");
+        float c[4] = {};
+        if (color != nullptr && color->value.size() == 16) std::memcpy(c, color->value.data(), 16);
+        expect(e.parameters.size() == 3 && e.techniques.size() == 1 && e.object_slots == 7 && color != nullptr &&
+                   color->type.cls == fx::ParamClass::vector && color->type.columns == 4 && c[0] == 1.0F && c[3] == 2.0F,
+               "fx: parameter types and default values");
+        const fx::Parameter* sampler = e.parameter("tex_sampler");
+        std::uint32_t tex_id = 0;
+        if (sampler != nullptr && sampler->sampler_states.size() == 1 && sampler->sampler_states[0].value.size() == 4) {
+            std::memcpy(&tex_id, sampler->sampler_states[0].value.data(), 4);
+        }
+        expect(sampler != nullptr && sampler->type.is_sampler() && sampler->sampler_states.size() == 1 &&
+                   sampler->sampler_states[0].operation == 164 && tex_id == 2,
+               "fx: sampler states and the texture they bind");
+        const fx::Parameter* vs = e.parameter("vs_array");
+        expect(vs != nullptr && vs->type.elements == 2 && vs->value.size() == 8, "fx: object array holds one id per element");
+        const fx::Technique* t = e.technique("t0");
+        expect(t != nullptr && t->passes.size() == 1 && t->passes[0].name == "p0" && t->passes[0].states.size() == 2 &&
+                   t->passes[0].states[0].operation == 146 && t->passes[0].states[1].operation == 147,
+               "fx: technique, pass and shader states");
+        expect(e.objects.size() == 2 && e.resources.size() == 2 && e.resources[0].usage == 0 &&
+                   e.resources[1].name == "ps_main_compiled" && fx::shader_count(e) == 3,
+               "fx: objects, inline shaders and named resources");
+    }
+    // Every truncation fails cleanly (never reads past the end), as do a wrong tag and a huge count.
+    bool truncations_fail = true;
+    for (std::size_t n = 0; n < file.size(); n += 4) {
+        fx::Effect cut;
+        if (fx::parse(std::span<const std::uint8_t>(file.data(), n), cut)) truncations_fail = false;
+    }
+    std::vector<std::uint8_t> bad_tag = file;
+    bad_tag[0] ^= 1;
+    std::vector<std::uint8_t> huge = file;
+    const std::uint32_t big = 0x7FFFFFFFU;
+    std::memcpy(huge.data() + 8 + table, &big, 4);
+    fx::Effect scratch;
+    expect(truncations_fail && !fx::parse(bad_tag, scratch) && !fx::parse(huge, scratch),
+           "fx: truncated, mistagged and oversized effects are refused");
+
+    // The user's install (local only): each effect parses to its last byte, with the shader count an
+    // independent bytecode scan measured (2026-11-22).
+    const char* env_root = std::getenv("WSE_WARBAND_ROOT");
+    const std::string root = env_root != nullptr ? env_root : "C:/GOG Games/Mount and Blade - Warband";
+    const std::pair<const char*, std::size_t> retail[] = {{"earlyz.fxo", 5},       {"earlyz_wse2.fxo", 20}, {"mb_2a.fxo", 356},
+                                                          {"mb_2b.fxo", 356},       {"mb_wse2_2a.fxo", 377}, {"mb_wse2_2b.fxo", 377},
+                                                          {"mb_wse2_3_0.fxo", 399}};
+    std::ifstream probe(root + "/mb_wse2_3_0.fxo", std::ios::binary);
+    if (probe) {
+        bool all = true;
+        for (const auto& [file_name, shaders] : retail) {
+            std::ifstream in(root + "/" + file_name, std::ios::binary);
+            std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            fx::Effect effect;
+            if (!fx::parse(bytes, effect) || fx::shader_count(effect) != shaders) all = false;
+        }
+        expect(all, "fx: the install's seven effects parse with the measured shader counts");
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -5551,6 +5740,7 @@ int run_recomp_suite(const char* fixture_path) {
     test_d3d9();
     test_fmod_steam();
     test_r4_shim_edge_cases();
+    test_fx_effects();
     test_unwinder();
     if (g_failures == 0) {
         std::printf("recomp tests: PASS\n");

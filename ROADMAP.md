@@ -191,6 +191,7 @@ Newest first. One line per landed milestone; details belong in the commit and in
 
 | Date | Commit | Milestone |
 | --- | --- | --- |
+| 2026-11-22 | — | R5a step 1: `fx_2_0` effect parser (`wse/recomp/fx_effect.h`); all seven effect files of the install parse to the last byte with the measured shader counts (399, 377, 356, 20, 5) |
 | 2026-11-22 | — | R5 design: translate the game's own shader bytecode from R5a (35 distinct instructions across the install's effects), check frames and every shader against real D3D9 on the PC, and R5a's five steps (docs only) |
 | 2026-11-22 | — | Phase 5 R4 done on the phone: Native runs 1,000 frames in 101 s with no fault on the user's OPPO Reno 11 from parts prepared on the PC (`tools/prepare_for_phone`); the phone now picks the shared target from the kernel (LLVM 18 never reports RCpc) |
 | 2026-11-22 | — | v1 split into must-haves and stretch goals; added record-and-replay, crash reports from R5, safe saves with backups, readable menus (P14.5), confirmed PC zip import and a storage view (P14.6), battery and heat in the frame-time log; review fixes: UI stays sharp under upscaling, vibration triggered from sounds, shadows from the retail renderer, HDR10 optional, voice orders on-device only (docs only) |
