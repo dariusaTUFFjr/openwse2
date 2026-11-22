@@ -993,6 +993,18 @@ struct VulkanD3d9Backend::Impl {
     std::uint64_t fence_frame = 0;     // the frame `frame_fence` covers
     std::uint64_t completed_frame = 0; // every frame up to this one has finished on the GPU
 
+    // Load-time breakdown (`texture_timings()`).
+    std::uint64_t tex_ns = 0, tex_count = 0, tex_bytes = 0;
+    struct TexTimer {
+        Impl& impl;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~TexTimer() {
+            impl.tex_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            ++impl.tex_count;
+        }
+    };
+
     // Staging upload & readback buffers.
     VkBuffer staging_buf = VK_NULL_HANDLE;
     MemAlloc staging_mem{};
@@ -1218,6 +1230,7 @@ struct VulkanD3d9Backend::Impl {
         }
         vk_surface = VK_NULL_HANDLE;
         destroy_ahb_ring_locked();
+        destroy_cpu_readback_locked();
         cpu_win_w = 0U;
         cpu_win_h = 0U;
         android_path = AndroidPresentPath::none;
@@ -1878,13 +1891,112 @@ struct VulkanD3d9Backend::Impl {
     }
 
     // Tier 3: CPU readback + ANativeWindow_lock upload (waits for the frame: it copies the pixels).
+    // Each frame slot reads its frame back into its own buffer; the window gets a frame once it has
+    // finished on the GPU (after `advance_frame_slot()`), so the CPU copy no longer stalls the game
+    // (2026-11-22). A caller that wants the pixels (`out_rgba8`) waits, as before.
+    struct CpuReadback {
+        VkBuffer buf = VK_NULL_HANDLE;
+        MemAlloc mem{};
+        VkDeviceSize cap = 0;
+    };
+    std::array<CpuReadback, kFramesInFlight> cpu_rb{};
+    struct CpuPending {
+        std::size_t slot = 0;
+        std::uint64_t frame = 0;
+        std::uint32_t width = 0, height = 0;
+    };
+    std::array<CpuPending, kFramesInFlight + 1U> cpu_pending{};
+    std::size_t cpu_pending_count = 0;
+
+    bool ensure_cpu_readback(CpuReadback& r, VkDeviceSize needed) {
+        if (r.buf != VK_NULL_HANDLE && r.cap >= needed) return true;
+        if (r.buf != VK_NULL_HANDLE) vk.destroy_buffer(h.device, r.buf, nullptr);
+        r.buf = VK_NULL_HANDLE;
+        alloc.free(r.mem);
+        r.cap = 0;
+        VkBufferCreateInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size = needed;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vk.create_buffer(h.device, &bi, nullptr, &r.buf) != VK_SUCCESS) {
+            r.buf = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements reqs{};
+        vk.get_buffer_mem_reqs(h.device, r.buf, &reqs);
+        if (!alloc.alloc(reqs, false, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                         VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, r.mem, &last_error) ||
+            vk.bind_buffer_memory(h.device, r.buf, r.mem.memory, r.mem.offset) != VK_SUCCESS) {
+            vk.destroy_buffer(h.device, r.buf, nullptr);
+            r.buf = VK_NULL_HANDLE;
+            alloc.free(r.mem);
+            return false;
+        }
+        r.cap = needed;
+        return true;
+    }
+
+    void destroy_cpu_readback_locked() noexcept {
+        for (CpuReadback& r : cpu_rb) {
+            if (r.buf != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE) vk.destroy_buffer(h.device, r.buf, nullptr);
+            r.buf = VK_NULL_HANDLE;
+            alloc.free(r.mem);
+            r.cap = 0;
+        }
+        cpu_pending_count = 0;
+    }
+
+    void write_window_locked(const std::uint8_t* src, std::uint32_t w, std::uint32_t ht) {
+        if (active_window == nullptr || src == nullptr) return;
+        if (cpu_win_w != w || cpu_win_h != ht) {
+            (void)ANativeWindow_setBuffersGeometry(active_window, static_cast<std::int32_t>(w),
+                                                   static_cast<std::int32_t>(ht), WINDOW_FORMAT_RGBA_8888);
+            cpu_win_w = w;
+            cpu_win_h = ht;
+        }
+        ANativeWindow_Buffer wb{};
+        if (ANativeWindow_lock(active_window, &wb, nullptr) != 0 || wb.bits == nullptr) return;
+        const std::uint32_t copy_w = std::min<std::uint32_t>(w, static_cast<std::uint32_t>(std::max<std::int32_t>(0, wb.width)));
+        const std::uint32_t copy_h = std::min<std::uint32_t>(ht, static_cast<std::uint32_t>(std::max<std::int32_t>(0, wb.height)));
+        auto* dst = static_cast<std::uint8_t*>(wb.bits);
+        const std::size_t src_stride = static_cast<std::size_t>(w) * 4U;
+        const std::size_t dst_stride = static_cast<std::size_t>(std::max<std::int32_t>(0, wb.stride)) * 4U;
+        const std::size_t row_bytes = static_cast<std::size_t>(copy_w) * 4U;
+        if (row_bytes > 0U && dst_stride >= row_bytes) {
+            if (dst_stride == src_stride && copy_w == w) {
+                std::memcpy(dst, src, src_stride * copy_h);
+            } else {
+                for (std::uint32_t y = 0; y < copy_h; ++y) std::memcpy(dst + y * dst_stride, src + y * src_stride, row_bytes);
+            }
+        }
+        (void)ANativeWindow_unlockAndPost(active_window);
+    }
+
+    // Writes every pending frame that has finished to the window (only the newest is worth showing).
+    void show_finished_cpu_locked() {
+        std::size_t done = 0;
+        while (done < cpu_pending_count && cpu_pending[done].frame <= completed_frame) ++done;
+        if (done == 0U) return;
+        const CpuPending& p = cpu_pending[done - 1U];
+        CpuReadback& r = cpu_rb[p.slot];
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(p.width) * p.height * 4U;
+        if (r.buf != VK_NULL_HANDLE && r.cap >= bytes) {
+            alloc.invalidate(r.mem, 0U, bytes);
+            write_window_locked(static_cast<const std::uint8_t*>(r.mem.mapped), p.width, p.height);
+        }
+        for (std::size_t i = done; i < cpu_pending_count; ++i) cpu_pending[i - done] = cpu_pending[i];
+        cpu_pending_count -= done;
+    }
+
     bool present_cpu_window_locked(VkDeviceSize rb_bytes, std::vector<std::uint8_t>* out_rgba8) {
         if (!ensure_frame_recording()) return false;
         if (render_pass_active) {
             vk.cmd_end_render_pass(frame_cmd);
             render_pass_active = false;
         }
-        const bool rb_ok = ensure_readback(rb_bytes, &last_error);
+        CpuReadback& slot_rb = cpu_rb[cur_slot];
+        const bool rb_ok = ensure_cpu_readback(slot_rb, rb_bytes);
         if (rb_ok) {
             VkImageMemoryBarrier bar{};
             bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1903,47 +2015,37 @@ struct VulkanD3d9Backend::Impl {
             cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
             cpy.imageExtent = {bb_width, bb_height, 1U};
             vk.cmd_copy_image_to_buffer(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                        readback_buf, 1U, &cpy);
+                                        slot_rb.buf, 1U, &cpy);
             bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+            // The copy is read by the CPU once the frame's fence has signalled.
+            VkMemoryBarrier hb{};
+            hb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0U, 1U, &hb,
+                                    0U, nullptr, 0U, nullptr);
             bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         }
-        if (!submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, true)) return false;
-
-        if (rb_ok) {
-            alloc.invalidate(readback_mem, 0U, rb_bytes);
-            if (cpu_win_w != bb_width || cpu_win_h != bb_height) {
-                (void)ANativeWindow_setBuffersGeometry(active_window, static_cast<std::int32_t>(bb_width),
-                                                       static_cast<std::int32_t>(bb_height), WINDOW_FORMAT_RGBA_8888);
-                cpu_win_w = bb_width;
-                cpu_win_h = bb_height;
-            }
-            ANativeWindow_Buffer wb{};
-            if (ANativeWindow_lock(active_window, &wb, nullptr) == 0 && wb.bits != nullptr) {
-                const std::uint32_t copy_w =
-                    std::min<std::uint32_t>(bb_width, static_cast<std::uint32_t>(std::max<std::int32_t>(0, wb.width)));
-                const std::uint32_t copy_h =
-                    std::min<std::uint32_t>(bb_height, static_cast<std::uint32_t>(std::max<std::int32_t>(0, wb.height)));
-                const auto* src = static_cast<const std::uint8_t*>(readback_mem.mapped);
-                auto* dst = static_cast<std::uint8_t*>(wb.bits);
-                const std::size_t src_stride = static_cast<std::size_t>(bb_width) * 4U;
-                const std::size_t dst_stride = static_cast<std::size_t>(std::max<std::int32_t>(0, wb.stride)) * 4U;
-                const std::size_t row_bytes = static_cast<std::size_t>(copy_w) * 4U;
-                if (row_bytes > 0U && dst_stride >= row_bytes) {
-                    for (std::uint32_t y = 0; y < copy_h; ++y) {
-                        std::memcpy(dst + y * dst_stride, src + y * src_stride, row_bytes);
-                    }
-                }
-                (void)ANativeWindow_unlockAndPost(active_window);
-            }
-            if (out_rgba8 != nullptr) {
-                out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
-                std::memcpy(out_rgba8->data(), readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
-            }
+        const bool want_pixels = out_rgba8 != nullptr;
+        if (!submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, want_pixels)) return false;
+        if (!rb_ok) return true;
+        if (want_pixels) {  // waited: show it now and hand the pixels back
+            alloc.invalidate(slot_rb.mem, 0U, rb_bytes);
+            const auto* src = static_cast<const std::uint8_t*>(slot_rb.mem.mapped);
+            write_window_locked(src, bb_width, bb_height);
+            out_rgba8->assign(src, src + static_cast<std::size_t>(rb_bytes));
+            return true;
+        }
+        const CpuPending entry{cur_slot, fence_frame, bb_width, bb_height};
+        if (cpu_pending_count < cpu_pending.size()) {
+            cpu_pending[cpu_pending_count++] = entry;
+        } else {
+            cpu_pending.back() = entry;
         }
         return true;
     }
@@ -3929,6 +4031,8 @@ void VulkanD3d9Backend::create_texture(std::uint64_t id, int kind, std::uint32_t
 void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t face, std::uint32_t level,
                                              std::span<const std::uint8_t> bytes, std::uint32_t row_pitch) {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    const Impl::TexTimer timer{*impl_};
+    impl_->tex_bytes += bytes.size();
     if (!impl_->gpu_ready) return;
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
@@ -3993,6 +4097,8 @@ void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t fac
 
 void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std::uint8_t> dds_bytes) {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    const Impl::TexTimer timer{*impl_};
+    impl_->tex_bytes += dds_bytes.size();
     if (!impl_->gpu_ready || dds_bytes.empty()) return;
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
@@ -4364,6 +4470,7 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
             impl_->advance_frame_slot();
 #ifdef __ANDROID__
             impl_->show_finished_ahb_locked();
+            impl_->show_finished_cpu_locked();
 #endif
         }
 
@@ -4430,6 +4537,11 @@ void VulkanD3d9Backend::flush_pipeline_cache() noexcept {
 std::string VulkanD3d9Backend::active_presentation_path() const {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     return impl_->report.presentation_path;
+}
+
+VulkanD3d9Backend::TextureTimings VulkanD3d9Backend::texture_timings() const {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    return {static_cast<double>(impl_->tex_ns) / 1e9, impl_->tex_count, impl_->tex_bytes};
 }
 
 std::size_t VulkanD3d9Backend::compiled_shader_count() const noexcept {

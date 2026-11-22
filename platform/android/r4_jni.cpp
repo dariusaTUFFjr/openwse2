@@ -10,6 +10,8 @@
 #include <dlfcn.h>
 #include <jni.h>
 #include <sys/auxv.h>
+#include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -156,12 +158,24 @@ private:
     jmethodID mid_read_ = nullptr;
 };
 
+// Install reads (count, bytes, wall time including the wait for the lock), for the load-time
+// breakdown in the report's `fps:` lines.
+std::atomic<std::uint64_t> g_file_ns{0}, g_file_count{0}, g_file_bytes{0};
+
 // Serializes every call of a Vfs that is not thread-safe (`SafVfs`): guest threads read files
 // concurrently (resource loading threads).
 class LockedVfs final : public wse::platform::Vfs {
 public:
     explicit LockedVfs(wse::platform::Vfs& inner) : inner_(inner) {}
-    bool read_file(std::string_view p, std::vector<std::uint8_t>& out) override { return locked([&] { return inner_.read_file(p, out); }); }
+    bool read_file(std::string_view p, std::vector<std::uint8_t>& out) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = locked([&] { return inner_.read_file(p, out); });
+        g_file_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        ++g_file_count;
+        g_file_bytes += out.size();
+        return ok;
+    }
     bool write_file(std::string_view p, std::span<const std::uint8_t> d) override { return locked([&] { return inner_.write_file(p, d); }); }
     bool remove_file(std::string_view p) override { return locked([&] { return inner_.remove_file(p); }); }
     bool list_dir(std::string_view p, std::vector<wse::platform::VfsEntry>& out) override {
@@ -528,6 +542,32 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
                         " pipelines=" + std::to_string(bk->cached_pipeline_count());
             }
             line += " path=" + std::string(present_path) + "\n";
+            // Where the time goes: install reads, texture preparation, the game thread's own CPU
+            // time (this callback runs on it) and the whole app's CPU time, against wall time.
+            {
+                static const auto run_start = now;
+                timespec ts{};
+                const double game_cpu = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0
+                                            ? static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9
+                                            : 0.0;
+                rusage ru{};
+                double app_cpu = 0.0;
+                if (getrusage(RUSAGE_SELF, &ru) == 0) {
+                    app_cpu = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+                              static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+                }
+                std::string load = "load: wall=" + format_fixed1(std::chrono::duration<double>(now - run_start).count()) +
+                                   "s files=" + format_fixed1(static_cast<double>(g_file_ns.load()) / 1e9) + "s/" +
+                                   std::to_string(g_file_count.load()) + "/" +
+                                   std::to_string(g_file_bytes.load() >> 20) + "MiB";
+                if (bk) {
+                    const auto tt = bk->texture_timings();
+                    load += " textures=" + format_fixed1(tt.seconds) + "s/" + std::to_string(tt.textures) + "/" +
+                            std::to_string(tt.bytes >> 20) + "MiB";
+                }
+                load += " game_cpu=" + format_fixed1(game_cpu) + "s app_cpu=" + format_fixed1(app_cpu) + "s\n";
+                line += load;
+            }
             report(line);
         }
         if (should_hud && hud) {

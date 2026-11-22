@@ -97,6 +97,14 @@ public:
 
     // Diagnostics for tests and reports.
     [[nodiscard]] std::size_t compiled_shader_count() const noexcept;
+    // Time spent turning game textures into GPU images (decoding `.dds` to RGBA8 where the GPU
+    // has no BC support, and staging the upload), for the load-time breakdown in reports.
+    struct TextureTimings {
+        double seconds = 0.0;
+        std::uint64_t textures = 0;
+        std::uint64_t bytes = 0;  // uploaded
+    };
+    [[nodiscard]] TextureTimings texture_timings() const;
     [[nodiscard]] std::size_t failed_shader_count() const noexcept;
     [[nodiscard]] std::size_t cached_pipeline_count() const noexcept;
     [[nodiscard]] std::size_t cached_sampler_count() const noexcept;

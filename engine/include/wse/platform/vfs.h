@@ -497,29 +497,73 @@ private:
 
     // Maps a Vfs path to a host path. With `for_create`, the final component
     // may be absent (its spelling is then taken from the request).
+    //
+    // Directories already resolved (and proven inside the root) are remembered
+    // until a mutating call, so a file in a known directory costs one `stat`
+    // (plus an `lstat` for the link check) instead of a `stat` per component
+    // and a `readlink` + `stat` per component for `weakly_canonical`: Warband
+    // opens ~1,100 files while loading, and over WSL's 9p mount of `C:` those
+    // calls took ~100 s of a 135 s run (2026-11-22).
     std::optional<std::filesystem::path> resolve(std::string_view path, bool for_create) const {
         const auto parts = split_path(path);
         if (!parts) return std::nullopt;
         std::filesystem::path current = root_;
-        for (std::size_t i = 0; i < parts->size(); ++i) {
+        std::size_t start = 0;
+        std::string key;  // ASCII-folded parts [0, i) joined by '/'
+        {
+            // The longest remembered directory prefix (usually the parent).
+            std::vector<std::string> prefixes;
+            std::string k;
+            for (std::size_t i = 0; i + 1 < parts->size(); ++i) {
+                if (!k.empty()) k += '/';
+                k += ascii_lower((*parts)[i]);
+                prefixes.push_back(k);
+            }
+            for (std::size_t n = prefixes.size(); n > 0; --n) {
+                if (const auto hit = resolved_dirs_.find(prefixes[n - 1]); hit != resolved_dirs_.end()) {
+                    current = hit->second;
+                    start = n;
+                    key = prefixes[n - 1];
+                    break;
+                }
+            }
+        }
+        for (std::size_t i = start; i < parts->size(); ++i) {
             const std::string& part = (*parts)[i];
+            const bool last = i + 1 == parts->size();
             std::error_code ec;
             std::filesystem::path exact = current / part;
             if (std::filesystem::exists(exact, ec) && !ec) {
                 current = std::move(exact);
-                continue;
-            }
-            if (auto match = find_case_insensitive(current, part)) {
+            } else if (auto match = find_case_insensitive(current, part)) {
                 current = std::move(*match);
-                continue;
+            } else if (for_create && last) {
+                // `current` (the parent) is the root or a directory proven inside it.
+                return !escapes_root(exact) ? std::optional(exact) : std::nullopt;
+            } else {
+                return std::nullopt;
             }
-            if (for_create && i + 1 == parts->size()) {
-                return inside_root(exact) ? std::optional(exact) : std::nullopt;
+            if (!last) {
+                if (!key.empty()) key += '/';
+                key += ascii_lower(part);
+                if (!inside_root(current)) return std::nullopt;
+                if (resolved_dirs_.size() < 4096U) resolved_dirs_.emplace(key, current);
             }
-            return std::nullopt;
         }
-        if (!inside_root(current)) return std::nullopt;
+        // Every directory above is inside the root; the final component needs
+        // the full check only when it is itself a link.
+        if (escapes_root(current)) return std::nullopt;
         return current;
+    }
+
+    // True when `target` (whose parent is known to be inside the root) is a
+    // link that resolves outside it, or the root itself cannot be resolved.
+    bool escapes_root(const std::filesystem::path& target) const {
+        if (canonical_root_.empty()) return true;
+        std::error_code ec;
+        const auto st = std::filesystem::symlink_status(target, ec);
+        if (ec || st.type() != std::filesystem::file_type::symlink) return false;
+        return !inside_root(target);
     }
 
     struct DirListing {
@@ -627,11 +671,16 @@ private:
     // change it made (resolve() inside the call may have cached the old state).
     struct CacheReset {
         const HostVfs& vfs;
-        ~CacheReset() { vfs.dir_cache_.clear(); }
+        ~CacheReset() {
+            vfs.dir_cache_.clear();
+            vfs.resolved_dirs_.clear();
+        }
     };
 
     // Keyed by the ASCII-folded host path; see `cache_key`.
     mutable std::unordered_map<std::filesystem::path::string_type, DirListing> dir_cache_;
+    // ASCII-folded relative directory path -> host directory proven inside the root.
+    mutable std::unordered_map<std::string, std::filesystem::path> resolved_dirs_;
     mutable std::size_t directory_scans_ = 0;
 };
 
