@@ -980,8 +980,8 @@ struct VulkanD3d9Backend::Impl {
         VkDescriptorSet ubo_set = VK_NULL_HANDLE;
         std::vector<RetiredBuf> retired;
 #ifdef __ANDROID__
+        // Safe to reuse once this slot's fence has signaled: the submit that waited on it is done.
         VkSemaphore sc_acquire = VK_NULL_HANDLE;
-        VkSemaphore sc_done = VK_NULL_HANDLE;
 #endif
     };
     std::array<FrameSlot, kFramesInFlight> slots{};
@@ -992,6 +992,9 @@ struct VulkanD3d9Backend::Impl {
     bool frame_in_flight = false;      // `frame_fence` is pending
     std::uint64_t fence_frame = 0;     // the frame `frame_fence` covers
     std::uint64_t completed_frame = 0; // every frame up to this one has finished on the GPU
+    // Mid-frame flushes that waited for the GPU: a draw of the current frame recorded before the
+    // latest one has finished, so its dynamic buffer copy is free again.
+    std::uint64_t drains = 0;
 
     // Load-time breakdown (`texture_timings()`).
     std::uint64_t tex_ns = 0, tex_count = 0, tex_bytes = 0;
@@ -1071,6 +1074,7 @@ struct VulkanD3d9Backend::Impl {
             VkBuffer buf = VK_NULL_HANDLE;
             MemAlloc mem{};
             std::uint64_t last_used = 0;  // frame of the last draw that read it (0: never)
+            std::uint64_t used_drain = 0;  // `drains` when that draw was recorded
         };
         std::vector<DynInst> insts;
         int cur = -1;
@@ -1156,7 +1160,20 @@ struct VulkanD3d9Backend::Impl {
     VkFormat sc_format = VK_FORMAT_R8G8B8A8_UNORM;
     VkExtent2D sc_extent{0U, 0U};
     std::vector<VkImage> sc_images;
+    // Render-done semaphores, one per swapchain image: a present's wait on its semaphore is not
+    // covered by any fence, so a semaphore is only known to be free again once its image comes
+    // back from vkAcquireNextImageKHR (Vulkan's swapchain semaphore reuse rule).
+    std::vector<VkSemaphore> sc_done_img;
     bool sc_dirty = false;
+    // VK_SUBOPTIMAL_KHR also means "the surface is rotated and you did not pre-rotate": a landscape
+    // game on a portrait-first phone gets it on every frame, because the swapchain asks for the
+    // identity transform and lets the compositor rotate. Rebuilding then (with a device-wide wait)
+    // fixes nothing and repeats every frame, so a suboptimal result only rebuilds the swapchain
+    // when the surface's size or rotation changed since the swapchain was made.
+    VkSurfaceTransformFlagBitsKHR sc_made_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    VkExtent2D sc_made_extent{0U, 0U};
+    bool sc_check = false;
+    std::uint32_t sc_check_wait = 0U;
 
     // Path B: Zero-copy AHardwareBuffer + ASurfaceControl (PanVK / Turnip).
     static constexpr std::size_t kAhbRingSize = 3U;
@@ -1208,8 +1225,30 @@ struct VulkanD3d9Backend::Impl {
         }
         swapchain = VK_NULL_HANDLE;
         sc_images.clear();
+        destroy_done_semaphores_locked();
         sc_extent = {0U, 0U};
         sc_dirty = false;
+        sc_check = false;
+    }
+
+    void destroy_done_semaphores_locked() noexcept {
+        for (VkSemaphore& sem : sc_done_img) {
+            if (sem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
+                vk.destroy_semaphore(h.device, sem, nullptr);
+            }
+        }
+        sc_done_img.clear();
+    }
+
+    // Whether the surface changed size or rotation since the swapchain was made (see sc_check).
+    [[nodiscard]] bool surface_changed_locked() {
+        VkSurfaceCapabilitiesKHR caps{};
+        if (vk.get_phys_surface_caps == nullptr ||
+            vk.get_phys_surface_caps(h.physical_device, vk_surface, &caps) != VK_SUCCESS) {
+            return true;
+        }
+        if (caps.currentTransform != sc_made_transform) return true;
+        return caps.currentExtent.width != sc_made_extent.width || caps.currentExtent.height != sc_made_extent.height;
     }
 
     void destroy_ahb_ring_locked() noexcept {
@@ -1249,12 +1288,10 @@ struct VulkanD3d9Backend::Impl {
         }
         destroy_swapchain_only_locked();
         for (FrameSlot& s : slots) {
-            for (VkSemaphore* sem : {&s.sc_acquire, &s.sc_done}) {
-                if (*sem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
-                    vk.destroy_semaphore(h.device, *sem, nullptr);
-                }
-                *sem = VK_NULL_HANDLE;
+            if (s.sc_acquire != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
+                vk.destroy_semaphore(h.device, s.sc_acquire, nullptr);
             }
+            s.sc_acquire = VK_NULL_HANDLE;
         }
         if (vk_surface != VK_NULL_HANDLE && h.instance != VK_NULL_HANDLE && vk.destroy_surface != nullptr) {
             vk.destroy_surface(h.instance, vk_surface, nullptr);
@@ -1379,10 +1416,27 @@ struct VulkanD3d9Backend::Impl {
             return false;
         }
         sc_images.resize(sc_cnt);
+        // Every caller waited for the device first, so the old images' presents are done.
+        destroy_done_semaphores_locked();
+        VkSemaphoreCreateInfo done_ci{};
+        done_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        sc_done_img.assign(sc_cnt, VK_NULL_HANDLE);
+        for (VkSemaphore& sem : sc_done_img) {
+            if (vk.create_semaphore(h.device, &done_ci, nullptr, &sem) != VK_SUCCESS) {
+                sem = VK_NULL_HANDLE;
+                destroy_done_semaphores_locked();
+                sc_images.clear();
+                vk.destroy_swapchain(h.device, next_sc, nullptr);
+                return false;
+            }
+        }
         swapchain = next_sc;
         sc_format = chosen_fmt.format;
         sc_extent = extent;
+        sc_made_transform = caps.currentTransform;
+        sc_made_extent = caps.currentExtent;
         sc_dirty = false;
+        sc_check = false;
         return true;
     }
 
@@ -1414,8 +1468,7 @@ struct VulkanD3d9Backend::Impl {
         VkSemaphoreCreateInfo sem_ci{};
         sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         for (FrameSlot& s : slots) {
-            if (vk.create_semaphore(h.device, &sem_ci, nullptr, &s.sc_acquire) != VK_SUCCESS ||
-                vk.create_semaphore(h.device, &sem_ci, nullptr, &s.sc_done) != VK_SUCCESS) {
+            if (vk.create_semaphore(h.device, &sem_ci, nullptr, &s.sc_acquire) != VK_SUCCESS) {
                 teardown_android_presentation_locked();
                 return false;
             }
@@ -1584,6 +1637,16 @@ struct VulkanD3d9Backend::Impl {
         const VkDeviceSize rb_bytes = static_cast<VkDeviceSize>(bb_width) * bb_height * 4U;
 
         if (android_path == AndroidPresentPath::swapchain) {
+            // A suboptimal result: look at the surface at most every 30 frames (see sc_check).
+            if (sc_check && !sc_dirty && swapchain != VK_NULL_HANDLE) {
+                if (sc_check_wait == 0U) {
+                    sc_check = false;
+                    sc_check_wait = 30U;
+                    if (surface_changed_locked()) sc_dirty = true;
+                } else {
+                    --sc_check_wait;
+                }
+            }
             if (sc_dirty || swapchain == VK_NULL_HANDLE) {
                 if (vk.device_wait_idle != nullptr) (void)vk.device_wait_idle(h.device);
                 if (!create_swapchain_for_surface_locked()) {
@@ -1596,10 +1659,8 @@ struct VulkanD3d9Backend::Impl {
             }
 
             std::uint32_t img_idx = 0U;
-            // One acquire/render-done semaphore pair per frame slot: with two frames in flight
-            // the previous frame's submit may still be waiting on its own pair.
+            // Acquire semaphores go per frame slot, render-done ones per swapchain image.
             const VkSemaphore acquire_sem = slots[cur_slot].sc_acquire;
-            const VkSemaphore done_sem = slots[cur_slot].sc_done;
             VkResult ar = vk.acquire_next_image(h.device, swapchain, 1'000'000'000ULL,
                                                 acquire_sem, VK_NULL_HANDLE, &img_idx);
             if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -1612,7 +1673,8 @@ struct VulkanD3d9Backend::Impl {
                 if (ar == VK_ERROR_SURFACE_LOST_KHR) teardown_android_presentation_locked();
                 return true;
             }
-            if (ar == VK_SUBOPTIMAL_KHR) sc_dirty = true;
+            if (ar == VK_SUBOPTIMAL_KHR) sc_check = true;
+            const VkSemaphore done_sem = sc_done_img[img_idx];  // same size as sc_images
 
             if (!ensure_frame_recording()) return false;
             if (render_pass_active) {
@@ -1745,7 +1807,8 @@ struct VulkanD3d9Backend::Impl {
             pi.pSwapchains = &swapchain;
             pi.pImageIndices = &img_idx;
             const VkResult pr = vk.queue_present(h.graphics_queue, &pi);
-            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) sc_dirty = true;
+            if (pr == VK_ERROR_OUT_OF_DATE_KHR) sc_dirty = true;
+            if (pr == VK_SUBOPTIMAL_KHR) sc_check = true;
 
             if (do_rb) {
                 alloc.invalidate(readback_mem, 0U, rb_bytes);
@@ -2465,7 +2528,9 @@ struct VulkanD3d9Backend::Impl {
 
     // --- dynamic buffers ---------------------------------------------------------------------
     [[nodiscard]] bool dyn_busy(const BufferObj::DynInst& d) const noexcept {
-        return d.last_used != 0U && (d.last_used == frame_index || d.last_used > completed_frame);
+        if (d.last_used == 0U) return false;
+        if (d.last_used == frame_index) return d.used_drain == drains;
+        return d.last_used > completed_frame;
     }
     // A copy no queued frame reads (a new one when all are busy). -1 on failure.
     int dyn_acquire(BufferObj& b) {
@@ -3392,7 +3457,7 @@ struct VulkanD3d9Backend::Impl {
     // pass: object destruction, window changes, a full staging ring).
     void flush_frame_if_recording() {
         if (!gpu_ready || (!frame_recording && !up_recording)) return;
-        (void)submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, true);
+        if (submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, true)) ++drains;
     }
 
     bool ensure_frame_recording() {
@@ -3843,6 +3908,7 @@ struct VulkanD3d9Backend::Impl {
             }
             BufferObj::DynInst& d = b.insts[static_cast<std::size_t>(b.cur)];
             d.last_used = frame_index;
+            d.used_drain = drains;
             b.dirty = false;
             out_buf = d.buf;
             out_off = 0U;

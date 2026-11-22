@@ -6169,6 +6169,24 @@ void test_d3d9_backend_and_preshader() {
                    replay_mock.decls == 1 && replay_mock.shaders == 1 && replay_mock.clears == 1 &&
                    replay_mock.draws == 1 && replay_mock.last_draw.rs[27] == 1 && cb_frame == 1,
                "D3d9CaptureReplayer: reproduces live shim stateblock, delta buffer, draw, and frame readback");
+
+        // Released objects are freed at the next Present, but not while the device has them bound.
+        std::uint64_t tex = 0, lvl = 0;
+        (void)com(s, dev, comi::kIDirect3DDevice9, "CreateTexture", {64, 64, 1, 0, d3s::kD3dFmtA8R8G8B8, 1, va(&tex), 0});
+        (void)com(s, tex, comi::kIDirect3DTexture9, "GetSurfaceLevel", {0, va(&lvl)});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "SetTexture", {0, tex});
+        const std::uint64_t freed0 = d3d.freed();
+        const auto vb_left = com(s, vb, comi::kIDirect3DVertexBuffer9, "Release", {});
+        (void)com(s, tex, comi::kIDirect3DTexture9, "Release", {});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "Present", {0, 0, 0, 0});
+        const bool vb_freed = d3d.freed() == freed0 + 1 && live_mock.bufs.count(vb) == 0;
+        (void)com(s, dev, comi::kIDirect3DDevice9, "SetTexture", {0, 0});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "Present", {0, 0, 0, 0});
+        const bool tex_kept_for_level = d3d.freed() == freed0 + 1;  // the game still holds its level surface
+        (void)com(s, lvl, comi::kIDirect3DSurface9, "Release", {});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "Present", {0, 0, 0, 0});
+        expect(vb_left == 0 && vb_freed && tex_kept_for_level && d3d.freed() == freed0 + 2,
+               "shim::D3d9: frees released buffers and textures at Present once nothing holds them");
     }
 }
 

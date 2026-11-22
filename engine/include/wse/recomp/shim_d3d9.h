@@ -117,6 +117,11 @@ public:
         const std::lock_guard<std::mutex> lock(m_);
         return objs_.size();
     }
+    // Objects whose memory and backend resources were freed after their last Release.
+    [[nodiscard]] std::uint64_t freed() const {
+        const std::lock_guard<std::mutex> lock(m_);
+        return freed_;
+    }
 
     std::size_t install() {
         build_vtables();
@@ -893,7 +898,14 @@ private:
             } else if (name == "AddRef") {
                 m = [](CpuState& s, Obj& o, std::uint64_t) { win64_return(s, ++o.refs); };
             } else if (name == "Release") {
-                m = [](CpuState& s, Obj& o, std::uint64_t) { win64_return(s, o.refs > 0 ? --o.refs : 0); };  // kept: never freed
+                m = [this](CpuState& s, Obj& o, std::uint64_t self) {
+                    const std::uint32_t left = o.refs > 0 ? --o.refs : 0;
+                    if (left == 0 && freeable(o)) {
+                        const std::lock_guard<std::mutex> lock(m_);
+                        released_.insert(self);
+                    }
+                    win64_return(s, left);
+                };
             } else if (recorded(name)) {
                 m = [this, full](CpuState& s, Obj&, std::uint64_t) {
                     first_call(full);
@@ -918,6 +930,89 @@ private:
         tables_[static_cast<int>(k) * 2 + variant] = std::move(t);
     }
 
+    // --- freeing released objects ---------------------------------------------------------------
+    // A texture, buffer or stand-alone surface whose count reaches zero is freed at the next
+    // Present (its CPU copy and its backend resource), as D3D9 frees it. Until then, and while the
+    // device still has it bound (a texture stage, stream, index buffer, render target, state block
+    // or effect texture: D3D9 keeps those alive internally) or the game still holds one of its level
+    // surfaces, it stays. The 64-byte guest object itself is kept, so a stray call on a freed
+    // pointer still reaches a known object instead of crashing. Device, effect, shader and
+    // declaration objects are small and stay as before.
+    static bool freeable(const Obj& o) {
+        switch (o.kind) {
+            case Kind::texture: case Kind::cube: case Kind::volume: case Kind::vbuffer: case Kind::ibuffer: return true;
+            case Kind::surface: return !o.child;
+            default: return false;
+        }
+    }
+    std::set<std::uint64_t> bound_objects() {
+        std::set<std::uint64_t> b;
+        auto ops = [&b](const std::vector<SbOp>& v) {
+            for (const SbOp& op : v) if (op.obj != 0) b.insert(op.obj);
+        };
+        for (const auto& [addr, st] : devices_) {
+            (void)addr;
+            for (const auto& [i, t] : st->textures) { (void)i; b.insert(t); }
+            for (const auto& [i, v] : st->streams) { (void)i; b.insert(v[0]); }
+            b.insert(st->indices);
+            b.insert(st->backbuffer);
+            b.insert(st->depth);
+            for (std::uint64_t t : st->draw.textures) b.insert(t);
+            b.insert(st->draw.indices);
+            b.insert(st->draw.render_target);
+            b.insert(st->draw.depth_stencil);
+            ops(st->open_sb);
+            for (const auto& [sb, v] : st->state_blocks) { (void)sb; ops(v); }
+        }
+        const std::lock_guard<std::mutex> lock(m_);
+        for (const auto& [addr, o] : objs_) {
+            (void)addr;
+            if (o->fx) for (std::uint64_t t : o->fx->textures) b.insert(t);
+        }
+        b.erase(0);
+        return b;
+    }
+    void sweep_released() {
+        std::vector<std::uint64_t> cands;
+        {
+            const std::lock_guard<std::mutex> lock(m_);
+            cands.assign(released_.begin(), released_.end());
+        }
+        if (cands.empty()) return;
+        const std::set<std::uint64_t> bound = bound_objects();
+        for (const std::uint64_t addr : cands) {
+            Obj* o = obj(addr);
+            const bool revived = o == nullptr || o->refs > 0;  // AddRef'd again since
+            if (!revived) {
+                bool busy = bound.count(addr) != 0;
+                for (const auto& [i, c] : o->children) {
+                    (void)i;
+                    const Obj* co = obj(c);
+                    if (bound.count(c) != 0 || (co != nullptr && co->refs > 1)) busy = true;  // 1: the parent's own
+                }
+                if (busy) continue;
+            }
+            {
+                const std::lock_guard<std::mutex> lock(m_);
+                released_.erase(addr);
+            }
+            if (!revived) free_object(addr, *o);
+        }
+    }
+    void free_object(std::uint64_t addr, Obj& o) {
+        if (backend != nullptr) {
+            for (const auto& [i, c] : o.children) { (void)i; backend->destroy_surface(c); }
+            if (o.kind == Kind::vbuffer || o.kind == Kind::ibuffer) backend->destroy_buffer(addr);
+            else if (o.kind == Kind::surface) backend->destroy_surface(addr);
+            else backend->destroy_texture(addr);
+        }
+        const std::lock_guard<std::mutex> lock(m_);
+        for (auto& m : o.memory) std::vector<std::uint8_t>().swap(m);
+        capture_.shadow.erase(addr);
+        capture_.locks.erase(addr);
+        ++freed_;
+    }
+
     DeviceState* dev(std::uint64_t addr) {
         const auto it = devices_.find(addr);
         return it == devices_.end() ? nullptr : it->second.get();
@@ -937,6 +1032,8 @@ private:
     mutable std::mutex m_;
     std::map<int, Table> tables_;
     std::map<std::uint64_t, std::unique_ptr<Obj>> objs_;
+    std::set<std::uint64_t> released_;  // count reached zero; freed at the next Present when unused
+    std::uint64_t freed_ = 0;
     CaptureState capture_;
     std::map<std::uint64_t, std::unique_ptr<DeviceState>> devices_;
     std::vector<std::unique_ptr<std::uint8_t[]>> blocks_;
@@ -1096,6 +1193,7 @@ inline void D3d9::build_vtables() {
          }},
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
              if (backend != nullptr) (void)backend->present();
+             sweep_released();
              ++frames_;
              if (on_present) on_present(frames_);
              ret(s, 0);
@@ -1556,6 +1654,7 @@ inline void D3d9::build_vtables() {
     make_table(Kind::swapchain, 0, com::kIDirect3DSwapChain9, {
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
              if (backend != nullptr) (void)backend->present();
+             sweep_released();
              ++frames_;
              if (on_present) on_present(frames_);
              ret(s, 0);
