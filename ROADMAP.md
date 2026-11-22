@@ -191,6 +191,7 @@ Newest first. One line per landed milestone; details belong in the commit and in
 
 | Date | Commit | Milestone |
 | --- | --- | --- |
+| 2026-11-22 | — | R5a step 3, part 1: D3D9/D3DX call capture (`wse/recomp/d3d9_capture.h`, `r4_run --capture`), with per-method data rules; the replay on real D3D9 comes next |
 | 2026-11-22 | — | R5a step 2: D3D9 shader bytecode to Vulkan GLSL (`wse/recomp/d3d9_shader.h`); all 1,157 shaders of the install's effects translate and compile with glslang (correctness against real D3D9 is step 3) |
 | 2026-11-22 | — | R5a step 1: `fx_2_0` effect parser (`wse/recomp/fx_effect.h`); all seven effect files of the install parse to the last byte with the measured shader counts (399, 377, 356, 20, 5) |
 | 2026-11-22 | — | R5 design: translate the game's own shader bytecode from R5a (35 distinct instructions across the install's effects), check frames and every shader against real D3D9 on the PC, and R5a's five steps (docs only) |

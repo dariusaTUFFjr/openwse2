@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/fx_effect.h"
 #include "wse/recomp/pdb_reader.h"
 #include "wse/recomp/pe_image.h"
@@ -5511,6 +5512,98 @@ void test_r4_shim_edge_cases() {
     expect(faults.empty(), "edge: no faults");
 }
 
+// R5a step 3: the D3D9 shim reports each call with its data (wse/recomp/d3d9_capture.h), and a
+// capture survives writing and reading back.
+void test_d3d9_capture() {
+    using d3d_test::com;
+    using u32_test::call;
+    namespace sh = wse::recomp::shim;
+    namespace ci = wse::recomp::com;
+    namespace cap = wse::recomp::d3dcap;
+    Runtime rt;
+    sh::D3d9 d3d(rt);
+    std::vector<cap::Call> calls;
+    d3d.on_call = [&](const cap::Call& c) { calls.push_back(c); };
+    (void)d3d.install();
+    GuestStack stack(256 * 1024);
+    CpuState s;
+    stack.prepare(s);
+    rt.attach(s);
+    auto va = [](const void* p) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p)); };
+    const std::uint64_t d9 = call(rt, s, "d3d9.dll", "Direct3DCreate9", {32});
+    alignas(8) std::uint8_t pp[64] = {};
+    const std::uint32_t w = 640, h = 480, one = 1, d24 = sh::kD3dFmtD24S8;
+    std::memcpy(pp, &w, 4);
+    std::memcpy(pp + 4, &h, 4);
+    std::memcpy(pp + 44, &one, 4);
+    std::memcpy(pp + 48, &d24, 4);
+    std::uint64_t device = 0;
+    (void)com(s, d9, ci::kIDirect3D9, "CreateDevice", {0, 1, 0x10012, 0x40, va(pp), va(&device)});
+    const std::uint32_t viewport[6] = {0, 0, 640, 480, 0, 0x3F800000U};
+    (void)com(s, device, ci::kIDirect3DDevice9, "SetViewport", {va(viewport)});
+    std::uint64_t vb = 0;
+    (void)com(s, device, ci::kIDirect3DDevice9, "CreateVertexBuffer", {64, 0, 0, 0, va(&vb), 0});
+    std::uint64_t data = 0;
+    (void)com(s, vb, ci::kIDirect3DVertexBuffer9, "Lock", {16, 8, va(&data), 0});
+    if (data != 0) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(data)), 0xAB, 8);
+    (void)com(s, vb, ci::kIDirect3DVertexBuffer9, "Unlock", {});
+    std::uint64_t effect = 0;
+    (void)call(rt, s, "d3dx9_43.dll", "D3DXCreateEffectFromFileA", {device, va("x.fx"), 0, 0, 0, 0, va(&effect), 0});
+    (void)com(s, effect, ci::kID3DXEffect, "GetParameterByName", {0, va("world")});
+    (void)com(s, device, ci::kIDirect3DDevice9, "Present", {0, 0, 0, 0});
+
+    auto find = [&](const char* method) -> const cap::Call* {
+        for (const cap::Call& c : calls) {
+            if (c.method == method) return &c;
+        }
+        return nullptr;
+    };
+    const cap::Call* create = find("CreateDevice");
+    const cap::Call* vp = find("SetViewport");
+    const cap::Call* cvb = find("CreateVertexBuffer");
+    const cap::Call* unlock = find("Unlock");
+    const cap::Call* fxc = find("D3DXCreateEffectFromFileA");
+    const cap::Call* byname = find("GetParameterByName");
+    std::uint64_t out_dev = 0, out_vb = 0;
+    if (create != nullptr && create->find(cap::kTagOut + 5) != nullptr) std::memcpy(&out_dev, create->find(cap::kTagOut + 5)->bytes.data(), 8);
+    if (cvb != nullptr && cvb->find(cap::kTagOut + 4) != nullptr) std::memcpy(&out_vb, cvb->find(cap::kTagOut + 4)->bytes.data(), 8);
+    const cap::Data* locked = unlock != nullptr ? unlock->find(cap::kTagLocked) : nullptr;
+    std::uint32_t lock_off = 0, lock_size = 0;
+    if (locked != nullptr && locked->bytes.size() >= 8) {
+        std::memcpy(&lock_off, locked->bytes.data(), 4);
+        std::memcpy(&lock_size, locked->bytes.data() + 4, 4);
+    }
+    expect(calls.size() >= 8 && calls.front().method == "Direct3DCreate9" && out_dev == device && create->find(cap::kTagArg + 4) != nullptr &&
+               vp != nullptr && vp->find(cap::kTagArg + 0) != nullptr && vp->find(cap::kTagArg + 0)->bytes.size() == 24 && out_vb == vb,
+           "capture: calls in order, created objects and pointed-to data recorded");
+    expect(locked != nullptr && lock_off == 16 && lock_size == 8 && locked->bytes.size() == 16 && locked->bytes[8] == 0xAB &&
+               fxc != nullptr && fxc->find(cap::kTagArg + 1) != nullptr &&
+               std::string(fxc->find(cap::kTagArg + 1)->bytes.begin(), fxc->find(cap::kTagArg + 1)->bytes.end()) == "x.fx" &&
+               byname != nullptr && byname->find(cap::kTagArg + 1) != nullptr && calls.back().method == "Present",
+           "capture: the locked range on unlock, effect paths and parameter names");
+    // Round trip: encode as the writer does, decode, compare; a cut-short file keeps whole records.
+    std::vector<std::uint8_t> file(cap::kMagic, cap::kMagic + 8);
+    const std::uint32_t version = cap::kVersion;
+    file.insert(file.end(), reinterpret_cast<const std::uint8_t*>(&version), reinterpret_cast<const std::uint8_t*>(&version) + 4);
+    for (const cap::Call& c : calls) {
+        const std::vector<std::uint8_t> rec = cap::encode(c);
+        const auto n = static_cast<std::uint32_t>(rec.size());
+        file.insert(file.end(), reinterpret_cast<const std::uint8_t*>(&n), reinterpret_cast<const std::uint8_t*>(&n) + 4);
+        file.insert(file.end(), rec.begin(), rec.end());
+    }
+    std::vector<cap::Call> back;
+    const bool decoded = cap::decode(file, back);
+    bool same = decoded && back.size() == calls.size();
+    for (std::size_t i = 0; same && i < calls.size(); ++i) {
+        same = back[i].iface == calls[i].iface && back[i].method == calls[i].method && back[i].self == calls[i].self &&
+               back[i].ret == calls[i].ret && back[i].data.size() == calls[i].data.size() &&
+               std::memcmp(back[i].args, calls[i].args, sizeof(calls[i].args)) == 0;
+    }
+    std::vector<cap::Call> partial;
+    const bool cut = cap::decode(std::span<const std::uint8_t>(file.data(), file.size() - 3), partial);
+    expect(same && !cut && partial.size() == calls.size() - 1, "capture: a file reads back the same calls; a cut-short file keeps whole records");
+}
+
 // R5a step 1: the fx_2_0 effect parser (wse/recomp/fx_effect.h) on a synthetic effect built here,
 // then, when the user's install is present, on its seven effect files.
 void test_fx_effects() {
@@ -5800,6 +5893,7 @@ int run_recomp_suite(const char* fixture_path) {
     test_fmod_steam();
     test_r4_shim_edge_cases();
     test_fx_effects();
+    test_d3d9_capture();
     test_unwinder();
     if (g_failures == 0) {
         std::printf("recomp tests: PASS\n");

@@ -39,6 +39,7 @@
 
 #include "wse/recomp/com_vtables.h"
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/fx_effect.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/shim_crt.h"
@@ -70,7 +71,18 @@ public:
     enum class Kind { d3d, device, swapchain, surface, texture, cube, volume, vbuffer, ibuffer, decl, vshader, pshader,
                       stateblock, query, effect, effect_pool, buffer, dinput, didevice };
 
-    D3d9(Runtime& rt, D3d9Config cfg = {}) : rt_(rt), cfg_(cfg) {}
+    D3d9(Runtime& rt, D3d9Config cfg = {}) : rt_(rt), cfg_(cfg) {
+        if (created_hook()) created_hook()(*this);
+    }
+    // Called with every device the moment it is built: a tool sets it before a run (`r4_run
+    // --capture` sets `on_call`), so the startup code itself needs no change.
+    static std::function<void(D3d9&)>& created_hook() {
+        static std::function<void(D3d9&)> hook;
+        return hook;
+    }
+    // Every COM method and D3DX/d3d9/DINPUT8 function this device answers, after it ran, with the
+    // data its pointers reach (`d3d9_capture.h`; R5a step 3). Unset: nothing is gathered.
+    std::function<void(const d3dcap::Call&)> on_call;
     D3d9(const D3d9&) = delete;
     D3d9& operator=(const D3d9&) = delete;
 
@@ -105,10 +117,19 @@ public:
         std::size_t n = 0;
         using crt_detail::put;
         n += rt_.set_import("d3d9.dll", "Direct3DCreate9", [this](CpuState& s) {
-            win64_return(s, create(Kind::d3d));
+            captured("d3d9.dll", "Direct3DCreate9", s, nullptr, 0, false, [&] { win64_return(s, create(Kind::d3d)); });
         });
         // DirectInput8Create(hinst, dwVersion, riidltf, ppvOut, punkOuter)
         n += rt_.set_import("DINPUT8.dll", "DirectInput8Create", [this](CpuState& s) {
+            captured("DINPUT8.dll", "DirectInput8Create", s, nullptr, 0, false, [&] { direct_input_create(s); });
+        });
+        return install_d3dx(n);
+    }
+
+private:
+    void direct_input_create(CpuState& s) {
+        using crt_detail::put;
+        {
             const std::uint64_t riid = win64_arg(s, 2);
             const std::uint64_t out = win64_arg(s, 3);
             if (out == 0) return win64_return(s, kD3dErrInvalidCall);
@@ -121,8 +142,15 @@ public:
             const std::uint64_t obj = create(Kind::dinput, w ? 1 : 0);
             put<std::uint64_t>(out, obj);
             win64_return(s, 0);
-        });
-        auto dx = [&](const char* name, Runtime::ImportShim shim) { n += rt_.set_import("d3dx9_43.dll", name, shim); };
+        }
+    }
+    std::size_t install_d3dx(std::size_t n) {
+        using crt_detail::put;
+        auto dx = [&](const char* name, Runtime::ImportShim shim) {
+            n += rt_.set_import("d3dx9_43.dll", name, [this, nm = std::string(name), shim](CpuState& s) {
+                captured("d3dx9_43.dll", nm, s, nullptr, 0, false, [&] { shim(s); });
+            });
+        };
         // D3DXCreateTexture(device, w, h, mips, usage, fmt, pool, ppTex)
         dx("D3DXCreateTexture", [this](CpuState& s) {
             const std::uint64_t out = win64_arg(s, 7);
@@ -245,6 +273,167 @@ private:
     using Method = std::function<void(CpuState&, Obj&, std::uint64_t self)>;
 
     static constexpr std::uint32_t kD3dPool = 0;
+
+    // --- capture (R5a step 3, `d3d9_capture.h`) -----------------------------------------------
+    // Explicit per-method rules (real D3D9 and D3DX signatures; argument indexes count after
+    // `this` for COM methods, from the first argument for D3DX functions). A rule never reads
+    // through an argument it does not know to be a pointer.
+    struct CaptureState {
+        std::map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> locks;  // buffer -> offset, size
+    };
+    static int out_arg(const std::string& iface, const std::string& m) {
+        static const std::map<std::string, int> com_outs = {
+            {"IDirect3D9::CreateDevice", 5}, {"IDirect3DDevice9::CreateTexture", 6}, {"IDirect3DDevice9::CreateVolumeTexture", 7},
+            {"IDirect3DDevice9::CreateCubeTexture", 5}, {"IDirect3DDevice9::CreateVertexBuffer", 4}, {"IDirect3DDevice9::CreateIndexBuffer", 4},
+            {"IDirect3DDevice9::CreateRenderTarget", 6}, {"IDirect3DDevice9::CreateDepthStencilSurface", 6},
+            {"IDirect3DDevice9::CreateOffscreenPlainSurface", 4}, {"IDirect3DDevice9::CreateStateBlock", 1},
+            {"IDirect3DDevice9::EndStateBlock", 0}, {"IDirect3DDevice9::CreateVertexDeclaration", 1},
+            {"IDirect3DDevice9::CreateVertexShader", 1}, {"IDirect3DDevice9::CreatePixelShader", 1}, {"IDirect3DDevice9::CreateQuery", 1},
+            {"IDirect3DDevice9::GetBackBuffer", 3}, {"IDirect3DDevice9::GetRenderTarget", 1}, {"IDirect3DDevice9::GetDepthStencilSurface", 0},
+            {"IDirect3DDevice9::GetSwapChain", 1}, {"IDirect3DDevice9::CreateAdditionalSwapChain", 1},
+            {"IDirect3DSwapChain9::GetBackBuffer", 2}, {"IDirect3DTexture9::GetSurfaceLevel", 1}, {"IDirect3DCubeTexture9::GetCubeMapSurface", 2},
+            {"d3dx9_43.dll::D3DXCreateTexture", 7}, {"d3dx9_43.dll::D3DXCreateTextureFromFileExA", 13},
+            {"d3dx9_43.dll::D3DXCreateTextureFromFileInMemoryEx", 14}, {"d3dx9_43.dll::D3DXCreateCubeTextureFromFileExA", 12},
+            {"d3dx9_43.dll::D3DXCreateEffectFromFileA", 6}, {"d3d9.dll::Direct3DCreate9", -2}, {"DINPUT8.dll::DirectInput8Create", 3},
+            {"IDirectInput8A::CreateDevice", 1}, {"IDirectInput8W::CreateDevice", 1},
+        };
+        const auto it = com_outs.find(iface + "::" + m);
+        return it == com_outs.end() ? -1 : it->second;
+    }
+    static std::vector<std::uint8_t> guest_bytes(std::uint64_t p, std::size_t n) {
+        if (p == 0 || n == 0 || n > (64U << 20)) return {};
+        const auto* b = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(p));
+        return std::vector<std::uint8_t>(b, b + n);
+    }
+    static std::vector<std::uint8_t> guest_cstr(std::uint64_t p) {
+        if (p == 0) return {};
+        const std::string s = crt_detail::guest_string(p);
+        return std::vector<std::uint8_t>(s.begin(), s.end());
+    }
+    void capture_data(d3dcap::Call& c, Obj* o) {
+        using d3dcap::Data;
+        const std::string& m = c.method;
+        const std::uint64_t* a = c.args;
+        auto arg = [&](int i, std::vector<std::uint8_t> b) {
+            if (!b.empty()) c.data.push_back(Data{d3dcap::kTagArg + static_cast<std::uint32_t>(i), std::move(b)});
+        };
+        if (const int k = out_arg(c.iface, m); k >= 0 && a[k] != 0) {
+            c.data.push_back(Data{d3dcap::kTagOut + static_cast<std::uint32_t>(k), guest_bytes(a[k], 8)});
+        } else if (k == -2) {
+            c.data.push_back(Data{d3dcap::kTagOut, guest_bytes(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&c.ret)), 8)});
+        }
+        if (c.iface == "IDirect3DDevice9") {
+            if (m == "SetViewport") arg(0, guest_bytes(a[0], 24));
+            else if (m == "SetScissorRect") arg(0, guest_bytes(a[0], 16));
+            else if (m == "Clear") arg(1, guest_bytes(a[1], 16U * static_cast<std::uint32_t>(a[0])));
+            else if (m == "SetTransform" || m == "MultiplyTransform") arg(1, guest_bytes(a[1], 64));
+            else if (m == "SetClipPlane") arg(1, guest_bytes(a[1], 16));
+            else if (m == "SetMaterial") arg(0, guest_bytes(a[0], 68));
+            else if (m == "SetLight") arg(1, guest_bytes(a[1], 104));
+            else if (m == "SetVertexShaderConstantF" || m == "SetPixelShaderConstantF" || m == "SetVertexShaderConstantI" ||
+                     m == "SetPixelShaderConstantI") {
+                arg(1, guest_bytes(a[1], 16U * static_cast<std::uint32_t>(a[2])));
+            } else if (m == "SetVertexShaderConstantB" || m == "SetPixelShaderConstantB") {
+                arg(1, guest_bytes(a[1], 4U * static_cast<std::uint32_t>(a[2])));
+            } else if (m == "CreateVertexDeclaration" && a[0] != 0) {
+                std::size_t n = 0;  // D3DVERTEXELEMENT9 (8 bytes) up to and with D3DDECL_END (Stream 0xFF)
+                while (n < 64 && crt_detail::get<std::uint16_t>(a[0] + 8 * n) != 0xFF) ++n;
+                arg(0, guest_bytes(a[0], 8 * (n + 1)));
+            } else if ((m == "CreateVertexShader" || m == "CreatePixelShader") && a[0] != 0) {
+                std::size_t n = 1;  // tokens up to and with the end token
+                while (n < (1U << 16) && (crt_detail::get<std::uint32_t>(a[0] + 4 * (n - 1)) != 0x0000FFFFU)) ++n;
+                arg(0, guest_bytes(a[0], 4 * n));
+            } else if (m == "CreateDevice" || m == "Reset") {
+                arg(m == "Reset" ? 0 : 4, guest_bytes(a[m == "Reset" ? 0 : 4], 64));  // D3DPRESENT_PARAMETERS
+            }
+        } else if (c.iface == "IDirect3D9" && m == "CreateDevice") {
+            arg(4, guest_bytes(a[4], 64));
+        } else if (c.iface == "ID3DXEffect" && o != nullptr) {
+            // A handle that is not one this device gave out is a pointer to a name (D3DX allows it).
+            const std::uint64_t h = a[0];
+            const bool given = (h >= 0x7E000000ULL && h <= next_handle_) || (o->fx && o->fx->refs.count(h) != 0);
+            // Methods whose first argument is a parameter, technique or pass handle.
+            static const std::set<std::string> handle_first = {
+                "SetValue", "SetBool", "SetBoolArray", "SetInt", "SetIntArray", "SetFloat", "SetFloatArray", "SetVector",
+                "SetVectorArray", "SetMatrix", "SetMatrixArray", "SetMatrixTranspose", "SetMatrixTransposeArray",
+                "SetMatrixPointerArray", "SetMatrixTransposePointerArray", "SetString", "SetTexture", "GetValue", "GetBool",
+                "GetBoolArray", "GetInt", "GetIntArray", "GetFloat", "GetFloatArray", "GetVector", "GetVectorArray", "GetMatrix",
+                "GetMatrixArray", "GetMatrixTranspose", "GetString", "GetTexture", "GetParameterDesc", "GetTechniqueDesc",
+                "GetPassDesc", "SetTechnique", "GetPass", "GetPassByName", "ValidateTechnique", "FindNextValidTechnique",
+                "IsParameterUsed", "GetAnnotation", "GetAnnotationByName", "GetParameterElement", "GetParameterByName",
+                "GetParameterBySemantic", "GetParameter"};
+            if (handle_first.count(m) != 0 && h >= 0x10000 && !given) {
+                c.data.push_back(Data{d3dcap::kTagName, guest_cstr(h)});
+            }
+            if (m == "GetParameterByName" || m == "GetParameterBySemantic" || m == "GetPassByName") arg(1, guest_cstr(a[1]));
+            else if (m == "GetTechniqueByName") arg(0, guest_cstr(a[0]));
+            else if (m == "SetMatrix" || m == "SetMatrixTranspose") arg(1, guest_bytes(a[1], 64));
+            else if (m == "SetVector") arg(1, guest_bytes(a[1], 16));
+            else if (m == "SetValue") arg(1, guest_bytes(a[1], static_cast<std::uint32_t>(a[2])));
+            else if (m == "SetFloatArray" || m == "SetIntArray" || m == "SetBoolArray") arg(1, guest_bytes(a[1], 4U * static_cast<std::uint32_t>(a[2])));
+            else if (m == "SetVectorArray") arg(1, guest_bytes(a[1], 16U * static_cast<std::uint32_t>(a[2])));
+            else if (m == "SetMatrixArray" || m == "SetMatrixTransposeArray") arg(1, guest_bytes(a[1], 64U * static_cast<std::uint32_t>(a[2])));
+            else if (m == "Begin") arg(0, guest_bytes(a[0], 4));
+        } else if (c.iface == "d3dx9_43.dll") {
+            if (m == "D3DXCreateTextureFromFileExA" || m == "D3DXCreateCubeTextureFromFileExA" || m == "D3DXCreateEffectFromFileA") {
+                arg(1, guest_cstr(a[1]));
+            } else if (m == "D3DXCreateTextureFromFileInMemoryEx") {
+                arg(1, guest_bytes(a[1], static_cast<std::uint32_t>(a[2])));
+            }
+        } else if ((c.iface == "IDirect3DVertexBuffer9" || c.iface == "IDirect3DIndexBuffer9") && o != nullptr) {
+            if (m == "Lock") {
+                capture_.locks[c.self] = {static_cast<std::uint32_t>(a[0]), static_cast<std::uint32_t>(a[1])};
+            } else if (m == "Unlock") {
+                const auto [off, size] = capture_.locks.count(c.self) != 0 ? capture_.locks[c.self] : std::pair<std::uint32_t, std::uint32_t>{0, 0};
+                std::vector<std::uint8_t>* mem = bytes(*o, 0);
+                if (mem != nullptr && off < mem->size()) {
+                    const std::size_t n = size == 0 ? mem->size() - off : std::min<std::size_t>(size, mem->size() - off);
+                    std::vector<std::uint8_t> b(8);
+                    std::memcpy(b.data(), &off, 4);
+                    const auto n32 = static_cast<std::uint32_t>(n);
+                    std::memcpy(b.data() + 4, &n32, 4);
+                    b.insert(b.end(), mem->begin() + off, mem->begin() + static_cast<std::ptrdiff_t>(off + n));
+                    c.data.push_back(Data{d3dcap::kTagLocked, std::move(b)});
+                }
+            }
+        } else if (m == "UnlockRect" && o != nullptr) {
+            std::vector<std::uint8_t>* mem = nullptr;
+            std::uint32_t index = 0;
+            if (c.iface == "IDirect3DTexture9") {
+                index = static_cast<std::uint32_t>(a[0]);
+                mem = bytes(*o, index);
+            } else if (c.iface == "IDirect3DCubeTexture9") {
+                index = static_cast<std::uint32_t>(a[0]) * o->desc.levels + static_cast<std::uint32_t>(a[1]);
+                mem = bytes(*o, index);
+            } else if (c.iface == "IDirect3DSurface9") {
+                mem = surface_memory(*o);
+            }
+            if (mem != nullptr) {
+                std::vector<std::uint8_t> b(4);
+                std::memcpy(b.data(), &index, 4);
+                b.insert(b.end(), mem->begin(), mem->end());
+                c.data.push_back(Data{d3dcap::kTagLocked, std::move(b)});
+            }
+        }
+    }
+    // Runs `m` and, when capturing, reports the call with its data.
+    void captured(const std::string& iface, const std::string& method, CpuState& s, Obj* o, std::uint64_t self, bool com_method,
+                  const std::function<void()>& run) {
+        if (!on_call) {
+            run();
+            return;
+        }
+        d3dcap::Call c;
+        c.iface = iface;
+        c.method = method;
+        c.self = self;
+        for (int i = 0; i < 16; ++i) c.args[i] = win64_arg(s, com_method ? i + 1 : i);
+        for (int i = 0; i < 3; ++i) std::memcpy(&c.xmm[i], s.xmm[i + 1], 4);
+        run();
+        c.ret = s.gpr[0];
+        capture_data(c, o);
+        on_call(c);
+    }
 
     // --- helpers ---------------------------------------------------------------------------
     // Gives a parsed effect its handles (unique across effects) and starting values.
@@ -593,14 +782,14 @@ private:
                                          (full + " (not in the recording device yet)").c_str());
                 };
             }
-            rt_.add_callable(va, [this, m](CpuState& s) {
+            rt_.add_callable(va, [this, m, iname = std::string(iface.name), name](CpuState& s) {
                 const std::uint64_t self = s.gpr[1];
                 Obj* o = obj(self);
                 if (o == nullptr) {
                     s.hooks->unsupported(&s, crt_detail::get<std::uint64_t>(s.gpr[4]), "COM call on an unknown object");
                     return;
                 }
-                m(s, *o, self);
+                captured(iname, name, s, o, self, true, [&] { m(s, *o, self); });
             });
         }
         tables_[static_cast<int>(k) * 2 + variant] = std::move(t);
@@ -625,6 +814,7 @@ private:
     mutable std::mutex m_;
     std::map<int, Table> tables_;
     std::map<std::uint64_t, std::unique_ptr<Obj>> objs_;
+    CaptureState capture_;
     std::map<std::uint64_t, std::unique_ptr<DeviceState>> devices_;
     std::vector<std::unique_ptr<std::uint8_t[]>> blocks_;
     std::set<std::string> seen_;

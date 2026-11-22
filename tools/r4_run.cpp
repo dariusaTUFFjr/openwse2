@@ -4,6 +4,7 @@
 //
 //   r4_run <install dir> [--work <dir>] [--retranslate] [--batch <n>] [--opt <0-3>] [--jobs <n>]
 //          [--reuse] [--quiet] [--module <name>] [--frames <n>] [--for-phone <dir>]
+//          [--capture <file> [--capture-frames <n>]]
 //
 // The runner itself is `engine/src/recomp/r4_startup.{h,cpp}` (shared with the phone's Advanced >
 // "R4 startup run"); this tool reads the exe, `lua5164.dll` and the PDB from the install, mounts the
@@ -19,6 +20,11 @@
 // batches are the user's own exe translated on their own PC for their own phone: the app imports
 // them ("Import prepared game files") instead of translating for hours. Wrapped for players by
 // `tools/prepare_for_phone.ps1`.
+//
+// `--capture <file>` (R5a step 3, 2026-11-22): write every D3D9/D3DX call the run makes, with the
+// data its pointers reach, to `<file>` (`wse/recomp/d3d9_capture.h`), up to `--capture-frames`
+// presented frames (default 60). A Windows tool replays it on the real d3d9.dll for reference
+// frames. The file holds retail data: it stays on this PC and is never committed.
 
 #include <sys/stat.h>
 
@@ -29,12 +35,15 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "../engine/src/recomp/r4_startup.h"
 #include "../engine/src/recomp/recomp_llvm.h"
+#include "wse/recomp/d3d9_capture.h"
+#include "wse/recomp/shim_d3d9.h"
 #include "wse/platform/vfs.h"
 
 namespace fs = std::filesystem;
@@ -65,7 +74,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <install dir> [--work <dir>] [--retranslate] [--batch <n>] [--opt <0-3>] [--jobs <n>] "
-                     "[--reuse] [--quiet] [--module <name>] [--frames <n>] [--for-phone <dir>]\n",
+                     "[--reuse] [--quiet] [--module <name>] [--frames <n>] [--for-phone <dir>] [--capture <file> [--capture-frames <n>]]\n",
                      argv[0]);
         return 2;
     }
@@ -73,6 +82,8 @@ int main(int argc, char** argv) {
     fs::path work = "/root/wse/r4";
     wse::recomp::StartupOptions o;
     fs::path for_phone;
+    std::string capture;
+    std::uint64_t capture_frames = 60;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--work" && i + 1 < argc) work = argv[++i];
@@ -85,6 +96,23 @@ int main(int argc, char** argv) {
         else if (a == "--module" && i + 1 < argc) o.module = argv[++i];
         else if (a == "--frames" && i + 1 < argc) o.frame_limit = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--for-phone" && i + 1 < argc) for_phone = argv[++i];
+        else if (a == "--capture" && i + 1 < argc) capture = argv[++i];
+        else if (a == "--capture-frames" && i + 1 < argc) capture_frames = std::strtoull(argv[++i], nullptr, 10);
+    }
+    // The capture is set up through the device's construction hook, so the shared startup code
+    // (and with it the translator fingerprint) is unchanged.
+    static std::unique_ptr<wse::recomp::d3dcap::Writer> writer;
+    if (!capture.empty()) {
+        writer = std::make_unique<wse::recomp::d3dcap::Writer>(capture);
+        if (!writer->ok()) {
+            std::fprintf(stderr, "cannot write the capture %s\n", capture.c_str());
+            return 2;
+        }
+        wse::recomp::shim::D3d9::created_hook() = [capture_frames](wse::recomp::shim::D3d9& d) {
+            d.on_call = [&d, capture_frames](const wse::recomp::d3dcap::Call& c) {
+                if (d.frames() <= capture_frames) writer->write(c);
+            };
+        };
     }
     std::error_code ec;
     fs::create_directories(work / "user", ec);

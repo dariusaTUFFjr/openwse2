@@ -868,7 +868,7 @@ own, and none blocks another.
        measured instructions first, D3D9 rules kept (constant registers, `mova`/relative addressing,
        `texkill`, `dsx`/`dsy`, half-pixel offset, clip-space depth 0..1). Host tests on hand-assembled
        synthetic bytecode; locally, all 776 shaders compile and the per-shader check passes.
-    3. **Capture and PC reference:** `r4_run --capture` and `tools/r5_replay_d3d9.cpp` (above).
+    3. **Capture and PC reference:** `r4_run --capture` and `tools/r5_replay_d3d9.cpp` (above). Capture landed 2026-11-22 (`wse/recomp/d3d9_capture.h`, set up through `D3d9::created_hook` so the startup code and the translator fingerprint stay unchanged).
     4. **The Vulkan D3D9 device:** a new D3D9-shaped Vulkan layer beside `RhiDevice` (which is too
        narrow: RGBA8 textures only, one vertex layout, one pipeline shape) behind `shim_d3d9.h`:
        resources (vertex/index buffers with `D3DLOCK_DISCARD`/`NOOVERWRITE` rings, textures with
