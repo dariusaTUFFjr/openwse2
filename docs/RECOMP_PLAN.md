@@ -916,6 +916,31 @@ own, and none blocks another.
     draw state: orthographic projection and the UI effect techniques), compositing the upscaled scene
     beneath. Until that detection is proven per module, menus and screens without a 3D scene run at
     100% scale and only battles and the map use the render scale.
+  - **R5b as decided on 2026-11-23 (interview; the phone is unavailable for a while, so every part is
+    checked on the PC):**
+    - **Scope: the parts the PC can check now.** Texture conversion and its cache, render-to-texture
+      (the shadow pass's render targets and depth textures), the FSR 1.0 / CAS + FXAA post-pass and
+      the dynamic-resolution controller, each with synthetic host tests and the main-menu replay
+      (which must stay bit-for-bit). Checking shadows, the map and battles against real D3D9 waits
+      for R6 input (captures reach only the main menu without input).
+    - **Textures: ETC2, converted on the phone, optional PC step.** Measured (Native + `Textures` +
+      `CommonRes`): 1,065 DXT1 (287 MiB), 186 DXT5 (100 MiB), 11 DXT3 (32 MiB), 7 uncompressed. DXT1
+      becomes ETC2 RGB (or RGBA1 when it uses 1-bit alpha) and DXT3/5 ETC2 RGBA8 (EAC alpha) at the
+      same bits per pixel, so the cache is about as large as the sources. ETC2 is required of every
+      Android Vulkan driver (ASTC is optional), and etcpak (BSD-3, pinned like glslang) encodes fast
+      enough to convert inline the first time a texture loads; results are cached in app storage by
+      a hash of the source bytes. The PC's "prepare for phone" zip may carry the same cache files
+      (`tools/wse_texcache`), which the import installs.
+    - **Game files: copied to app storage as they are read.** The phone measured 32 ms and 23 MB/s
+      per file through Android's folder access (APK `ca5e3ed`). A read-through cache keeps a copy of
+      each file the game reads in app storage, keyed by path, size and last-modified time from the
+      folder index, so the first load is as now and later loads read local files; only what Native
+      reads is copied (about 0.5-1 GB of the 1.4 GB the module could use; other modules are 0.7-5.4
+      GB each). Advanced shows the space used and can free it.
+    - **Work split:** Gemini 4 Hydrogen (high) workers build the self-contained, test-covered units
+      (etcpak + transcoder + cache format; the read-through cache and its UI; the post-pass shaders
+      and the dynamic-resolution controller; the PC texture tool); Claude writes render-to-texture
+      and wires every unit into `VulkanD3d9Backend`, reviews each diff and runs the gates.
   - **R5c (driver hardening):** PanVK and Turnip already present from R5a; R5c adds clean swapchain
     and `AHardwareBuffer` recreation on rotation, folding and app resume, and the workarounds the
     first phone runs on each driver turn up (fences, latency, format quirks).
