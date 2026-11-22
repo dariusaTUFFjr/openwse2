@@ -191,6 +191,20 @@ class R4StartupRunner private constructor(private val app: Application) {
         false
     }
 
+    fun hasPreviousCrashReport(): Boolean {
+        val f = File(r4Dir, "report.prev.txt")
+        return f.isFile && f.length() > 0
+    }
+
+    fun previousCrashReportToSave(): String? {
+        val f = File(r4Dir, "report.prev.txt")
+        return try {
+            f.takeIf { it.isFile && it.length() > 0 }?.readText()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private val workDir: File get() = File(app.filesDir, "recomp")
     private val r4Dir: File get() = File(workDir, "r4")
     private val copyDir: File get() = File(r4Dir, "install")

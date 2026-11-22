@@ -303,6 +303,31 @@ fun AdvancedScreen(
                     showDivider = true,
                     onClick = { saveReport.launch("wse2-game-test-report.txt") }
                 )
+                val runnerForPrev = remember(saveContext) {
+                    R4StartupRunner.get(saveContext.applicationContext as Application)
+                }
+                val hasPrevCrashReport = remember(r4State) { runnerForPrev.hasPreviousCrashReport() }
+                val savePrevReport = rememberLauncherForActivityResult(
+                    ActivityResultContracts.CreateDocument("text/plain")
+                ) { uri ->
+                    if (uri != null) {
+                        val text = runnerForPrev.previousCrashReportToSave()
+                        val saved = text != null && runnerForPrev.saveReport(uri, text)
+                        Toast.makeText(
+                            saveContext,
+                            if (saved) "Previous report saved." else "There is no previous report to save.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+                if (hasPrevCrashReport) {
+                    WseListRow(
+                        title = "Save the previous report",
+                        supporting = "Saves the report from the run before this one as a text file.",
+                        showDivider = true,
+                        onClick = { savePrevReport.launch("wse2-previous-report.txt") }
+                    )
+                }
                 SwitchListItem(
                     headline = "Work from a copy of the game folder",
                     supporting = "Copies the game folder (without other modules) into the app " +

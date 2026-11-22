@@ -202,6 +202,16 @@ void test_host_vfs() {
                "case-colliding writes leave a single file");
         expect(!fresh_vfs.write_text("sub/b.txt", "x"),
                "host write still does not create parents below the root");
+
+        // Atomic write: replaces content, leaves no .wse-tmp behind, and failed write leaves target untouched.
+        expect(fresh_vfs.write_text("a.txt", "third") && fresh_vfs.read_text("a.txt", text) &&
+                   text == "third" && !fs::exists(fresh / "a.txt.wse-tmp", ec),
+               "atomic host write replaces content and leaves no .wse-tmp file");
+        fs::create_directories(fresh / "dir_target", ec);
+        expect(!fresh_vfs.write_text("dir_target", "nope") &&
+                   !fs::exists(fresh / "dir_target.wse-tmp", ec) &&
+                   fresh_vfs.is_dir("dir_target"),
+               "failed host write over a directory cleans up temp file and leaves target intact");
     }
     fs::remove_all(fresh.parent_path(), ec);
 }

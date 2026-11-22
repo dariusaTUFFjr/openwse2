@@ -57,6 +57,10 @@ object R4Native {
     @JvmStatic
     external fun nativeSetSurface(surface: Surface?)
 
+    // Pauses or resumes the translated game loop at the next frame boundary (when backgrounded).
+    @JvmStatic
+    external fun nativeSetPaused(paused: Boolean)
+
     // Saves the pipeline cache, detaches the surface, and flushes the final driver + FPS report.
     @JvmStatic
     external fun nativeFinishReport()

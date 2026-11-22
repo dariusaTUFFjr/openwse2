@@ -40,6 +40,12 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace wse::platform {
 
 struct VfsEntry {
@@ -367,13 +373,43 @@ public:
         std::error_code root_ec;
         std::filesystem::create_directories(root_, root_ec);
         const CacheReset reset{*this};
-        const auto real = resolve(path, true);
+        auto real = resolve(path, true);
         if (!real) return false;
-        std::FILE* file = open(*real, "wb");
+        std::error_code ec;
+        if (std::filesystem::is_directory(*real, ec) && !ec) return false;
+        // On case-insensitive volumes `exists()` keeps the caller's case; match the
+        // existing on-disk spelling so atomic rename preserves the original filename.
+        if (std::filesystem::exists(*real, ec) && !ec) {
+            if (auto exact = find_case_insensitive(real->parent_path(), real->filename().string())) {
+                *real = std::move(*exact);
+            }
+        }
+        std::filesystem::path tmp = *real;
+        tmp += ".wse-tmp";
+        if (escapes_root(tmp)) return false;
+        std::FILE* file = open(tmp, "wb");
         if (file == nullptr) return false;
-        const bool wrote = data.empty() ||
-                           std::fwrite(data.data(), 1, data.size(), file) == data.size();
-        return (std::fclose(file) == 0) && wrote;
+        bool ok = data.empty() ||
+                  std::fwrite(data.data(), 1, data.size(), file) == data.size();
+        if (ok && std::fflush(file) != 0) ok = false;
+#ifdef _WIN32
+        if (ok && ::_commit(::_fileno(file)) != 0) ok = false;
+#else
+        if (ok && ::fsync(::fileno(file)) != 0 && errno != EINVAL) ok = false;
+#endif
+        if (std::fclose(file) != 0) ok = false;
+        if (!ok) {
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp, rm_ec);
+            return false;
+        }
+        std::filesystem::rename(tmp, *real, ec);
+        if (ec) {
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp, rm_ec);
+            return false;
+        }
+        return true;
     }
 
     bool remove_file(std::string_view path) override {

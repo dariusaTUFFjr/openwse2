@@ -1244,6 +1244,12 @@ placeholders until each is checked against the v1.1.5.6 disassembly:
   - `shim_memory.h`: `VirtualAlloc`, `VirtualFree`, `VirtualProtect`, and `VirtualQuery` now track `MEM_RESERVE` vs `MEM_COMMIT` state and protection per 4 KiB page; re-reserving an already-reserved base fails with `ERROR_INVALID_ADDRESS (487)`; unaligned `MEM_COMMIT` rounds start down and end up to 4 KiB boundaries; `VirtualProtect` checks `lpflOldProtect == NULL` (`998`) before mutating and rejects reserved-uncommitted pages (`487`); `VirtualFree(..., MEM_DECOMMIT)` resets decommitted pages to `State = MEM_RESERVE, Protect = 0` and rejects non-base `size == 0` (`487`); `VirtualFree(..., MEM_RELEASE)` returns `87` for `size != 0` and `487` for `NULL` or non-base addresses.
   - `shim_files.h`: `CreateFileA`/`W`, `DeleteFileA`/`W`, and `MoveFileExA`/`W` enforce `dwShareMode` (`FILE_SHARE_READ`/`WRITE`/`DELETE`, failing with `ERROR_SHARING_VIOLATION = 32`); trailing path separators on non-directory paths fail with `ERROR_INVALID_NAME (123)` (`FindFirstFile` fails with `ERROR_PATH_NOT_FOUND = 3` on `""`, `ERROR_DIRECTORY = 267` on `"file\\"`, and `ERROR_FILE_NOT_FOUND = 2` on `"dir\\"`); `GetFileAttributesEx` rejects non-zero `fInfoLevelId` (`87`); `OpenFile` tracks 64-bit `logical_size` so `SetEndOfFile`/`GetFileSize`/`GetFileSizeEx`/`SetFilePointer`/`SetFilePointerEx` support sizes > 4 GiB without allocating sparse zeroes in RAM; `GetFileSize` and `SetFilePointer` clear `LastError` to `0` only when the returned low DWORD is `0xFFFFFFFF`, preserving `LastError` otherwise.
 
+- **R5b robustness (`vfs.h`, `r0_inputs.h`, `kernel.h`, `threads.h`, `r4_jni.cpp`, `RecompGameActivity.kt`, `AdvancedScreen.kt`):**
+  - `HostVfs::write_file` writes atomically via a `<name>.wse-tmp` sibling (`fflush` + `fsync`/`_commit` + `fclose` + `rename`, removing the temp file on failure) so mid-write kills cannot truncate saves.
+  - `r4_jni.cpp` rotates non-empty `report.txt` to `report.prev.txt` before opening a new log, and `AdvancedScreen.kt` offers "Save the previous report" when `report.prev.txt` exists.
+  - `RecompGameActivity.kt` / `r4_jni.cpp` pause the game thread at the `on_frame_presented` boundary on `onPause` or surface destruction (excluding paused time from `load: wall=`) and wake cleanly on resume or shutdown.
+  - `GuestStack` (`r0_inputs.h`, used directly and by `threads.h` / `kernel.h` `CreateThread`) allocates via `mmap`/`VirtualAlloc` with a 64 KiB `PROT_NONE`/`PAGE_NOACCESS` guard below the stack.
+
 ## Build and test
 
 Windows:

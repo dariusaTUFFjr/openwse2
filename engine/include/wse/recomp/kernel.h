@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/r0_inputs.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/teb.h"
 
@@ -83,7 +84,7 @@ struct Object {
     std::uint32_t suspend = 0;
     std::int32_t priority = 0;
     std::uint64_t affinity = 0;
-    std::vector<std::uint8_t> stack;  // the guest stack of a thread started by CreateThread
+    std::unique_ptr<GuestStack> stack;  // the guarded guest stack of a thread started by CreateThread
     // file / mapping: the owner's state, released (and a dirty file written back) with the
     // last handle
     std::shared_ptr<void> payload;

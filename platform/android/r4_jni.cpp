@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -277,6 +278,28 @@ std::mutex g_report_m;
 std::FILE* g_report = nullptr;
 std::string g_progress_path;
 
+// Renames an existing non-empty `report.txt` to `report.prev.txt` (replacing an older one)
+// so a crash report from the previous run survives the next launch.
+void rotate_report_file(const std::filesystem::path& work) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path cur = work / "report.txt";
+    const fs::path prev = work / "report.prev.txt";
+    if (fs::is_regular_file(cur, ec) && !ec) {
+        if (fs::file_size(cur, ec) > 0U && !ec) {
+            fs::rename(cur, prev, ec);
+            if (ec) {
+                ec.clear();
+                fs::remove(prev, ec);
+                ec.clear();
+                fs::rename(cur, prev, ec);
+            }
+        } else {
+            fs::remove(cur, ec);
+        }
+    }
+}
+
 void report(const std::string& text) {
     const std::lock_guard<std::mutex> lock(g_report_m);
     if (g_report != nullptr) {
@@ -312,6 +335,15 @@ std::string_view short_present_path(std::string_view p) noexcept {
 std::mutex g_vk_m;
 std::shared_ptr<wse::platform::VulkanD3d9Backend> g_vk_backend;
 ANativeWindow* g_pending_window = nullptr;
+
+// Background pause state: the game thread blocks at the end of `on_frame_presented`
+// while the activity is paused or has no surface, and wakes immediately on resume or shutdown.
+std::mutex g_pause_m;
+std::condition_variable g_pause_cv;
+bool g_activity_paused = false;
+bool g_has_surface = false;
+bool g_shutting_down = false;
+std::chrono::steady_clock::duration g_paused_duration{};
 
 std::mutex g_stats_m;
 std::uint64_t g_frames_presented = 0U;
@@ -417,6 +449,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     fs::create_directories(work / "user", ec);
     {
         const std::lock_guard<std::mutex> lock(g_report_m);
+        rotate_report_file(work);
         g_report = std::fopen((work / "report.txt").c_str(), "w");
     }
     g_progress_path = (work / "progress.txt").string();
@@ -435,6 +468,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     fs::create_directories(work / "user", ec);
     {
         const std::lock_guard<std::mutex> lock(g_report_m);
+        rotate_report_file(work);
         g_report = std::fopen((work / "report.txt").c_str(), "w");
     }
     g_progress_path = (work / "progress.txt").string();
@@ -515,6 +549,13 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
             init_win = g_pending_window;
             g_pending_window = nullptr;
         }
+    }
+    {
+        const std::lock_guard<std::mutex> lock(g_pause_m);
+        g_activity_paused = false;
+        g_has_surface = (init_win != nullptr);
+        g_shutting_down = false;
+        g_paused_duration = std::chrono::steady_clock::duration::zero();
     }
 
     // Widescreen: the game draws at the screen's own shape (e.g. 2412 x 1080 on a 20:9 phone) when
@@ -603,7 +644,14 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
                     app_cpu = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
                               static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
                 }
-                std::string load = "load: wall=" + format_fixed1(std::chrono::duration<double>(now - run_start).count()) +
+                std::chrono::steady_clock::duration paused_dur{};
+                {
+                    const std::lock_guard<std::mutex> lock(g_pause_m);
+                    paused_dur = g_paused_duration;
+                }
+                const double wall_s =
+                    std::max(0.0, std::chrono::duration<double>((now - run_start) - paused_dur).count());
+                std::string load = "load: wall=" + format_fixed1(wall_s) +
                                    "s files=" + format_fixed1(static_cast<double>(g_file_ns.load()) / 1e9) + "s/" +
                                    std::to_string(g_file_count.load()) + "/" +
                                    std::to_string(g_file_bytes.load() >> 20) + "MiB";
@@ -622,6 +670,16 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
                                std::to_string(frame) + " · " + std::string(short_present_path(present_path));
             hud->update(pill);
         }
+        {
+            std::unique_lock<std::mutex> lock(g_pause_m);
+            if ((g_activity_paused || !g_has_surface) && !g_shutting_down) {
+                const auto pause_t0 = std::chrono::steady_clock::now();
+                g_pause_cv.wait(lock, [] {
+                    return (!g_activity_paused && g_has_surface) || g_shutting_down;
+                });
+                g_paused_duration += std::chrono::steady_clock::now() - pause_t0;
+            }
+        }
     };
 
     auto vk_backend = std::make_shared<wse::platform::VulkanD3d9Backend>(loader, std::move(cfg));
@@ -637,6 +695,11 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
         g_pending_window = nullptr;
     }
     if (late_win != nullptr) {
+        {
+            const std::lock_guard<std::mutex> lock(g_pause_m);
+            g_has_surface = true;
+        }
+        g_pause_cv.notify_all();
         vk_backend->set_native_window(late_win);
         ANativeWindow_release(late_win);
     }
@@ -654,6 +717,11 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetSurface(JNIEnv* env, jclass,
                                                                                            jobject jsurface) {
     ANativeWindow* win = (jsurface != nullptr) ? ANativeWindow_fromSurface(env, jsurface) : nullptr;
+    {
+        const std::lock_guard<std::mutex> lock(g_pause_m);
+        g_has_surface = (win != nullptr);
+    }
+    g_pause_cv.notify_all();
     std::shared_ptr<wse::platform::VulkanD3d9Backend> bk;
     {
         const std::lock_guard<std::mutex> lock(g_vk_m);
@@ -673,7 +741,21 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
     }
 }
 
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetPaused(JNIEnv*, jclass,
+                                                                                          jboolean paused) {
+    {
+        const std::lock_guard<std::mutex> lock(g_pause_m);
+        g_activity_paused = (paused == JNI_TRUE);
+    }
+    g_pause_cv.notify_all();
+}
+
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeFinishReport(JNIEnv*, jclass) {
+    {
+        const std::lock_guard<std::mutex> lock(g_pause_m);
+        g_shutting_down = true;
+    }
+    g_pause_cv.notify_all();
     if (g_finished_report.exchange(true)) return;
 
     std::shared_ptr<wse::platform::VulkanD3d9Backend> bk;

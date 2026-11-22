@@ -115,6 +115,21 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    override fun onPause() {
+        super.onPause()
+        if (started.get() && R4Native.loadError == null) {
+            R4Native.nativeSetPaused(true)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        applyImmersiveFullscreen()
+        if (started.get() && R4Native.loadError == null) {
+            R4Native.nativeSetPaused(false)
+        }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) applyImmersiveFullscreen()

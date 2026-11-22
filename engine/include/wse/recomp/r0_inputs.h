@@ -15,8 +15,28 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#ifdef near
+#undef near
+#endif
+#ifdef far
+#undef far
+#endif
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include "wse/recomp/x86_interp.h"
 
@@ -118,15 +138,76 @@ inline std::uint64_t fnv1a_results(const std::vector<std::int32_t>& results) noe
 
 // A Win64 guest stack for one call: at entry `rsp % 16 == 8`, `[rsp]` holds `sentinel` (the
 // return address `ret` pops), and the 32-byte home area above it is writable.
+// Backed by VirtualAlloc (Windows) / mmap (POSIX) with a 64 KiB PAGE_NOACCESS / PROT_NONE
+// guard region below the usable stack so an overflow faults instead of corrupting heap memory.
 class GuestStack {
 public:
     static constexpr std::uint64_t kReturnSentinel = 0x00007FFEDEAD0000ULL;
+    static constexpr std::size_t kGuardBytes = 64 * 1024;
 
-    explicit GuestStack(std::size_t bytes = 64 * 1024) : mem_(bytes + 64, 0) {}
+    explicit GuestStack(std::size_t bytes = 64 * 1024) {
+        const std::size_t page = page_size();
+        const std::size_t min_usable = bytes + 64U;
+        usable_bytes_ = ((min_usable + page - 1U) / page) * page;
+        const std::size_t total = kGuardBytes + usable_bytes_;
+#ifdef _WIN32
+        void* region = ::VirtualAlloc(nullptr, total, MEM_RESERVE, PAGE_NOACCESS);
+        if (region == nullptr) {
+            throw std::bad_alloc();
+        }
+        void* committed = ::VirtualAlloc(static_cast<std::uint8_t*>(region) + kGuardBytes,
+                                         usable_bytes_, MEM_COMMIT, PAGE_READWRITE);
+        if (committed == nullptr) {
+            ::VirtualFree(region, 0, MEM_RELEASE);
+            throw std::bad_alloc();
+        }
+        alloc_ = region;
+#else
+        void* region = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) {
+            throw std::bad_alloc();
+        }
+        if (::mprotect(region, kGuardBytes, PROT_NONE) != 0) {
+            ::munmap(region, total);
+            throw std::bad_alloc();
+        }
+        alloc_ = region;
+#endif
+    }
+
+    ~GuestStack() { release(); }
+
+    GuestStack(const GuestStack&) = delete;
+    GuestStack& operator=(const GuestStack&) = delete;
+
+    GuestStack(GuestStack&& other) noexcept
+        : alloc_(other.alloc_), usable_bytes_(other.usable_bytes_) {
+        other.alloc_ = nullptr;
+        other.usable_bytes_ = 0;
+    }
+
+    GuestStack& operator=(GuestStack&& other) noexcept {
+        if (this != &other) {
+            release();
+            alloc_ = other.alloc_;
+            usable_bytes_ = other.usable_bytes_;
+            other.alloc_ = nullptr;
+            other.usable_bytes_ = 0;
+        }
+        return *this;
+    }
+
+    std::uint8_t* data() noexcept {
+        return alloc_ != nullptr ? static_cast<std::uint8_t*>(alloc_) + kGuardBytes : nullptr;
+    }
+    const std::uint8_t* data() const noexcept {
+        return alloc_ != nullptr ? static_cast<const std::uint8_t*>(alloc_) + kGuardBytes : nullptr;
+    }
+    std::size_t usable_size() const noexcept { return usable_bytes_; }
 
     void prepare(CpuState& s) {
         s = CpuState{};
-        auto top = reinterpret_cast<std::uintptr_t>(mem_.data() + mem_.size() - 64);
+        auto top = reinterpret_cast<std::uintptr_t>(data() + usable_bytes_ - 64);
         top &= ~static_cast<std::uintptr_t>(15);
         const std::uintptr_t rsp = top - 8;
         std::memcpy(reinterpret_cast<void*>(rsp), &kReturnSentinel, 8);
@@ -134,7 +215,30 @@ public:
     }
 
 private:
-    std::vector<std::uint8_t> mem_;
+    static std::size_t page_size() noexcept {
+#ifdef _WIN32
+        SYSTEM_INFO si{};
+        ::GetSystemInfo(&si);
+        return si.dwPageSize != 0 ? static_cast<std::size_t>(si.dwPageSize) : 4096U;
+#else
+        const long sz = ::sysconf(_SC_PAGESIZE);
+        return sz > 0 ? static_cast<std::size_t>(sz) : 4096U;
+#endif
+    }
+
+    void release() noexcept {
+        if (alloc_ == nullptr) return;
+#ifdef _WIN32
+        ::VirtualFree(alloc_, 0, MEM_RELEASE);
+#else
+        ::munmap(alloc_, kGuardBytes + usable_bytes_);
+#endif
+        alloc_ = nullptr;
+        usable_bytes_ = 0;
+    }
+
+    void* alloc_ = nullptr;
+    std::size_t usable_bytes_ = 0;
 };
 
 }  // namespace wse::recomp
