@@ -24,6 +24,10 @@ struct VulkanD3d9Config {
     bool prefer_bgra_vertex_format = true; // use B8G8R8A8_UNORM vertex fetch when supported (false forces shader swizzle)
     bool eager_shader_compile = false;     // false: compile shaders lazily on first draw; true: compile at create_shader
     void* native_window = nullptr;         // Android ANativeWindow* (non-owning; null = offscreen)
+    // Custom drivers (PanVK/Turnip) show frames through a CPU copy unless this is set: on the
+    // reference phone (Mali-G68, PanVK FristOneRR v3.7.0) the zero-copy AHardwareBuffer path drew
+    // grey static and stalled the GPU for seconds per frame (2026-11-22).
+    bool custom_driver_shared_buffers = false;
     // Optional callback invoked once per presented frame (outside internal locks).
     std::function<void(std::uint64_t frame, double inst_fps, double avg_fps,
                        std::string_view presentation_path)>

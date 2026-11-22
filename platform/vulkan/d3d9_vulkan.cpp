@@ -1514,8 +1514,11 @@ struct VulkanD3d9Backend::Impl {
             }
         }
 
-        // Tier 2: Zero-copy AHardwareBuffer + ASurfaceControl (PanVK / Turnip).
-        if (h.ahb_external_memory && vk.get_ahb_props != nullptr) {
+        // Tier 2: Zero-copy AHardwareBuffer + ASurfaceControl (PanVK / Turnip), opt-in: see
+        // `VulkanD3d9Config::custom_driver_shared_buffers`.
+        if (!config.custom_driver_shared_buffers && h.ahb_external_memory) {
+            report.missing_features.push_back("shared AHardwareBuffer frames off for custom drivers -> ANativeWindow_lock");
+        } else if (h.ahb_external_memory && vk.get_ahb_props != nullptr) {
             if (setup_ahb_surface_control_locked()) {
                 android_path = AndroidPresentPath::ahb_surface_control;
                 report.presentation_path = "offscreen_hardware_buffer_bridge(ahb+ASurfaceControl)";
