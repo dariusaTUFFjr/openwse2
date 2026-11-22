@@ -4582,7 +4582,7 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const Impl::TexTimer timer{*impl_};
     impl_->tex_bytes += dds_bytes.size();
-    if (!impl_->gpu_ready || dds_bytes.empty()) return;
+    if (!impl_->initialized || dds_bytes.empty()) return;
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
 
@@ -4610,7 +4610,7 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
     }
 
     Impl::TextureObj& t = it->second;
-    impl_->retire_texture_image_locked(t);  // a new image replaces one queued frames may sample
+    if (impl_->gpu_ready) impl_->retire_texture_image_locked(t);  // a new image replaces one queued frames may sample
     std::uint32_t out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
     std::uint32_t out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
     std::uint32_t out_levels = view.mip_count - first_mip;
@@ -4715,14 +4715,17 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
                                                     ? VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK
                                                     : VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK);
             std::uint32_t etc_mip_start = 0U;
-            bool img_ok = impl_->create_texture_image_gpu(t, etc2_vk_fmt, out_w, out_h, out_levels, kind);
-            while (!img_ok && impl_->config.simulate_etc2 && first_mip + 1U < view.mip_count) {
-                ++first_mip;
-                ++etc_mip_start;
-                out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
-                out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
-                out_levels = view.mip_count - first_mip;
+            bool img_ok = true;
+            if (impl_->gpu_ready) {
                 img_ok = impl_->create_texture_image_gpu(t, etc2_vk_fmt, out_w, out_h, out_levels, kind);
+                while (!img_ok && impl_->config.simulate_etc2 && first_mip + 1U < view.mip_count) {
+                    ++first_mip;
+                    ++etc_mip_start;
+                    out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
+                    out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
+                    out_levels = view.mip_count - first_mip;
+                    img_ok = impl_->create_texture_image_gpu(t, etc2_vk_fmt, out_w, out_h, out_levels, kind);
+                }
             }
             if (img_ok) {
                 if (first_mip > 0U && impl_->last_error.find("vkAllocateMemory") != std::string::npos) {
@@ -4771,6 +4774,10 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
     }
 
     if (!used_etc2) {
+        if (!impl_->gpu_ready) {
+            if (!use_bc) ++impl_->rgba8_fallbacks;
+            return;
+        }
         const VkFormat vk_fmt = use_bc ? bc_fmt : VK_FORMAT_R8G8B8A8_UNORM;
         bool img_ok = impl_->create_texture_image_gpu(t, vk_fmt, out_w, out_h, out_levels, kind);
         // On RGBA8 fallback, gracefully drop top mip(s) if device memory runs tight instead of dropping the texture.
@@ -4813,6 +4820,7 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
             }
         }
     }
+    if (!impl_->gpu_ready) return;
     VkBuffer sbuf = VK_NULL_HANDLE;
     VkDeviceSize soff = 0;
     if (copies.empty() || !impl_->stage_bytes(packed, sbuf, soff)) return;
