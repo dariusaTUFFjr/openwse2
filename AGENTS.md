@@ -4,6 +4,16 @@ This repository builds a clean-room, evidence-backed C++20 reconstruction of the
 
 Start here, then read `STATUS.md` (where things stand) and `ROADMAP.md` (what comes next).
 
+## 0. Always look for blind spots (the user's standing rule, 2026-11-23)
+
+Before you report work as done, and whenever you plan, stop and look for what was missed: the
+cases nobody tested, the assumptions nobody checked, the side effects on other parts of the app or
+on the user's phone, and the things the user would not have known to ask about (performance,
+storage, battery and heat, what only fails on the phone or in CI, what a change breaks elsewhere,
+what is unverified because it cannot run here). Tell the user about them in plain words, even when
+nobody asked, with what each one risks and what would settle it. Prefer raising a concern that turns
+out harmless over staying quiet about one that does not.
+
 ## 1. Evidence & Clean-Room Rules
 
 - **Baseline version:** Official **WSE2 v1.1.5.6** (`mb_warband_wse2_x64.exe`, PDB + PE + Ghidra 12.1.4 REA analysis).
