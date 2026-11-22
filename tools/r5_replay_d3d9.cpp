@@ -4,7 +4,8 @@
 // compared with. Never run in CI; the capture and the frames hold retail data and are never
 // committed.
 //
-//   r5_replay_d3d9 <capture> <install dir> <out dir> [--frames 1,30,60]   (default: every 10th
+//   r5_replay_d3d9 <capture> <install dir> <out dir> [--frames 1,30,60] [--screen <w>x<h>]
+//                                                     (frames default: every 10th
 //                                                                           frame and the last)
 //
 // Calls are made by vtable slot (`com_vtables.h`), so no DirectX SDK headers are needed.
@@ -36,6 +37,8 @@ namespace com = wse::recomp::com;
 using u64 = std::uint64_t;
 
 namespace {
+
+int g_screen_w = 1920, g_screen_h = 1080;  // --screen: the screen the captured run reported
 
 const com::Interface* interfaces[] = {
     &com::kIDirect3D9, &com::kIDirect3DDevice9, &com::kIDirect3DSwapChain9, &com::kIDirect3DTexture9, &com::kIDirect3DCubeTexture9,
@@ -236,9 +239,9 @@ struct Replay {
             std::memcpy(&w, pp, 4);
             std::memcpy(&h, pp + 4, 4);
             // As the recording device sized it (shim_d3d9.h reset_buffers): a zero field takes the
-            // device's default, 1920 x 1080.
-            if (w == 0) w = 1920;
-            if (h == 0) h = 1080;
+            // screen size the run had (--screen, default 1920 x 1080).
+            if (w == 0) w = static_cast<std::uint32_t>(g_screen_w);
+            if (h == 0) h = static_cast<std::uint32_t>(g_screen_h);
             std::memcpy(pp, &w, 4);
             std::memcpy(pp + 4, &h, 4);
             SetWindowPos(hwnd, nullptr, 0, 0, static_cast<int>(w), static_cast<int>(h), SWP_NOMOVE | SWP_NOZORDER);
@@ -377,7 +380,7 @@ struct Replay {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: %s <capture> <install dir> <out dir> [--frames 1,30,60]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <capture> <install dir> <out dir> [--frames 1,30,60] [--screen <w>x<h>]\n", argv[0]);
         return 2;
     }
     std::ifstream in(argv[1], std::ios::binary);
@@ -389,6 +392,14 @@ int main(int argc, char** argv) {
     r.out_dir = std::filesystem::absolute(argv[3]).string();  // before the working directory moves to the install
     std::filesystem::create_directories(r.out_dir);
     for (int i = 4; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--screen") {  // the r4_run --screen of the captured run
+            int sw = 0, sh = 0;
+            if (std::sscanf(argv[++i], "%dx%d", &sw, &sh) == 2 && sw > 0 && sh > 0) {
+                g_screen_w = sw;
+                g_screen_h = sh;
+            }
+            continue;
+        }
         if (std::string(argv[i]) == "--frames") {
             r.save_all_tenth = false;
             std::string list = argv[++i];

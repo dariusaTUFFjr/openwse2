@@ -26,6 +26,7 @@
 #include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/d3d9_shader.h"
 #include "wse/recomp/fx_effect.h"
+#include "wse/recomp/screen.h"
 
 namespace wse::recomp {
 
@@ -522,8 +523,11 @@ public:
                 std::memcpy(&fmt, d->bytes.data() + 8, 4);
                 std::memcpy(&dfmt, d->bytes.data() + 48, 4);
             }
-            if (w == 0) w = 1920;
-            if (h == 0) h = 1080;
+            // A zero size (windowed: "the window's size") is the screen the recording device
+            // reported (`screen.h`; replay tools take it as --screen, since a capture of a
+            // widescreen run has 0 here).
+            if (w == 0) w = static_cast<std::uint32_t>(wse::recomp::shim::screen_size().width);
+            if (h == 0) h = static_cast<std::uint32_t>(wse::recomp::shim::screen_size().height);
             if (fmt == 0) fmt = 22;
             if (dfmt == 0) dfmt = 75;
             state_.reset_defaults();

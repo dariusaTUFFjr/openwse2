@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s <capture> <install dir> <out dir> [--frames 250,1000,1250,3000] "
                      "[--ref <ref_dir>] [--save-diff] [--no-bc] [--max-tex <px>] "
-                     "[--pipeline-cache <file>] [--driver system|mock|panvk|turnip] [--driver-path <path>]\n",
+                     "[--pipeline-cache <file>] [--driver system|mock|panvk|turnip] [--driver-path <path>] [--screen <w>x<h>]\n",
                      argv[0]);
         return 2;
     }
@@ -255,6 +255,9 @@ int main(int argc, char** argv) {
             driver_kind = argv[++i];
         } else if (arg == "--driver-path" && i + 1 < argc) {
             driver_path = argv[++i];
+        } else if (arg == "--screen" && i + 1 < argc) {  // the r4_run --screen of the captured run
+            int sw = 0, sh = 0;
+            if (std::sscanf(argv[++i], "%dx%d", &sw, &sh) == 2) wse::recomp::shim::set_screen_size(sw, sh);
         }
     }
 
