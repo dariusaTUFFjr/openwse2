@@ -286,23 +286,6 @@ jobs:
 
           gradle -p android assembleDebug --no-daemon "${extra_props[@]}"
 
-      - name: Render launcher screenshots
-        env:
-          WSE_NDK_VERSION: '30.0.16248370'
-          WSE_CMAKE_VERSION: '3.31.6'
-        run: |
-          set -euo pipefail
-          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          export ANDROID_HOME="${sdk_root}"
-          export ANDROID_SDK_ROOT="${sdk_root}"
-          extra_props=(
-            "-Pwse.ndkVersion=${WSE_NDK_VERSION}"
-            "-Pwse.cmakeVersion=${WSE_CMAKE_VERSION}"
-            "-Pwse.llvmPrefix=${HOME}/llvm-android"
-          )
-
-          gradle -p android recordRoborazziDebug --no-daemon "${extra_props[@]}"
-
       - name: Check debug APK contents
         run: |
           set -euo pipefail
@@ -331,6 +314,26 @@ jobs:
           name: wse2-android-selftest-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # After the APK upload: the screenshot tests download Robolectric's android-all jar from
+      # Maven Central, and a failed download (2026-11-22, three runs in a row) must not withhold the
+      # APK; the job still fails.
+      - name: Render launcher screenshots
+        env:
+          WSE_NDK_VERSION: '30.0.16248370'
+          WSE_CMAKE_VERSION: '3.31.6'
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="${sdk_root}"
+          export ANDROID_SDK_ROOT="${sdk_root}"
+          extra_props=(
+            "-Pwse.ndkVersion=${WSE_NDK_VERSION}"
+            "-Pwse.cmakeVersion=${WSE_CMAKE_VERSION}"
+            "-Pwse.llvmPrefix=${HOME}/llvm-android"
+          )
+
+          gradle -p android recordRoborazziDebug --no-daemon "${extra_props[@]}"
 
       - name: Upload launcher screenshots
         uses: actions/upload-artifact@v4
