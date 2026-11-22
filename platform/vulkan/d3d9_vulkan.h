@@ -32,6 +32,10 @@ struct VulkanD3d9Config {
     std::function<void(std::uint64_t frame, double inst_fps, double avg_fps,
                        std::string_view presentation_path)>
         on_frame_presented{};
+    std::string texture_cache_dir{};       // optional on-disk ETC2 cache directory (empty = no disk cache)
+    bool prefer_etc2 = true;               // transcode DDS to ETC2 when BC is not used and ETC2 is supported
+    bool simulate_etc2 = false;            // PC check: transcode to ETC2, decode back to RGBA8 and upload RGBA8
+    unsigned etc2_threads = 0U;            // 0 = min(4, hardware_concurrency)
 };
 
 class VulkanD3d9Backend final : public wse::recomp::D3d9Backend {
@@ -103,6 +107,13 @@ public:
         double seconds = 0.0;
         std::uint64_t textures = 0;
         std::uint64_t bytes = 0;  // uploaded
+        std::uint64_t etc2_textures = 0;
+        std::uint64_t etc2_cached = 0;
+        double etc2_transcode_ms = 0.0;
+        std::uint64_t etc2_cache_read_failures = 0;
+        std::uint64_t etc2_cache_write_failures = 0;
+        std::uint64_t rgba8_fallbacks = 0;
+        std::uint64_t level_rgba8_fallbacks = 0;
     };
     [[nodiscard]] TextureTimings texture_timings() const;
     [[nodiscard]] std::size_t failed_shader_count() const noexcept;

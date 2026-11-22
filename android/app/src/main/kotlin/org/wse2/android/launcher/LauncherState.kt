@@ -324,7 +324,8 @@ data class R4UiState(
     val useCopy: Boolean = false,
     val status: String = "",
     val report: String? = null,
-    val installCacheBytes: Long = 0L
+    val installCacheBytes: Long = 0L,
+    val textureCacheBytes: Long = 0L
 )
 
 data class AdvancedUiState(

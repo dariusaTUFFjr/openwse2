@@ -172,6 +172,7 @@ struct D3d9DriverReport {
     std::uint32_t max_per_stage_samplers = 0;
     std::uint32_t max_vertex_output_components = 0;
     bool texture_compression_bc = false;
+    bool texture_compression_etc2 = false;
     bool bgra_vertex_format = false;
     bool pipeline_cache_active = false;
     std::vector<std::string> missing_features;
@@ -185,6 +186,7 @@ struct D3d9DriverReport {
              " samplers/stage=" + std::to_string(max_per_stage_samplers) +
              " vs_out_comp=" + std::to_string(max_vertex_output_components);
         s += std::string("\n  features: BC=") + (texture_compression_bc ? "yes" : "no(RGBA8)") +
+             " ETC2=" + (texture_compression_etc2 ? "yes" : "no") +
              " bgra_vtx=" + (bgra_vertex_format ? "yes" : "no(swizzle)") +
              " pipeline_cache=" + (pipeline_cache_active ? "yes" : "no");
         if (!missing_features.empty()) {

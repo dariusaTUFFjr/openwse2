@@ -1850,9 +1850,10 @@ bool VulkanDriverLoader::probe_and_create_device(VulkanDriverProbeResult& out) {
     if (get_phys_features != nullptr) {
         get_phys_features(impl_->physical_device, &features);
     }
-    // Enable BC sampling, anisotropy, and wireframe when present so R5 D3D9 can use them directly.
+    // Enable BC/ETC2 sampling, anisotropy, and wireframe when present so R5 D3D9 can use them directly.
     VkPhysicalDeviceFeatures enabled{};
     enabled.textureCompressionBC = features.textureCompressionBC;
+    enabled.textureCompressionETC2 = features.textureCompressionETC2;
     enabled.samplerAnisotropy = features.samplerAnisotropy;
     enabled.fillModeNonSolid = features.fillModeNonSolid;
     impl_->sampler_anisotropy = (features.samplerAnisotropy == VK_TRUE);

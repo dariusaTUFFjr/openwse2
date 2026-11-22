@@ -196,6 +196,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         _selectedTab.value = tab
         if (tab == LauncherTab.ADVANCED) {
             r4Runner.refreshInstallCacheSize()
+            r4Runner.refreshTextureCacheSize()
         }
     }
 
@@ -359,6 +360,8 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     fun setR4UseCopy(useCopy: Boolean) = r4Runner.setUseCopy(useCopy)
 
     fun clearInstallCache() = r4Runner.clearInstallCache()
+
+    fun clearTextureCache() = r4Runner.clearTextureCache()
 
     fun dismissR4Report() = r4Runner.dismissReport()
 

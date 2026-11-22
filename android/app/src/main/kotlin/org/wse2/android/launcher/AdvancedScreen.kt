@@ -62,6 +62,7 @@ fun AdvancedScreen(
     onLaunchRecompVulkan: () -> Unit = {},
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onClearInstallCache: () -> Unit = {},
+    onClearTextureCache: () -> Unit = {},
     onDismissR4Report: () -> Unit = {}
 ) {
     val colors = LocalWseColors.current
@@ -300,6 +301,26 @@ fun AdvancedScreen(
                     showDivider = true,
                     enabled = clearCacheEnabled,
                     onClick = onClearInstallCache
+                )
+                val texCacheMb = r4State.textureCacheBytes / (1024L * 1024L)
+                WseListRow(
+                    title = "Converted textures",
+                    supporting = "$texCacheMb MB. Textures converted for your phone's graphics chip. " +
+                        "Cleared files are converted again on the next load.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) {
+                                colors.primary
+                            } else {
+                                colors.onSurfaceVariant.copy(alpha = 0.45f)
+                            }
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = onClearTextureCache
                 )
                 // Saves the report as a file the player picks, during a run too (the user's
                 // request, 2026-11-21: keep the phone's report when finishing on the PC).

@@ -66,6 +66,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         // "Work from a copy" is remembered across app starts, not only across interrupted runs.
         state = state.copy(useCopy = prefs.getBoolean(PREF_USE_COPY, false))
         refreshInstallCacheSize()
+        refreshTextureCacheSize()
     }
 
     fun addListener(listener: (R4UiState) -> Unit) {
@@ -102,6 +103,7 @@ class R4StartupRunner private constructor(private val app: Application) {
     // even if this process was restarted since the run (the report is in app storage).
     fun showLastReport(force: Boolean = false) {
         refreshInstallCacheSize()
+        refreshTextureCacheSize()
         if (state.running || (!force && state.report != null)) return
         val file = File(r4Dir, "report.txt")
         if (!file.isFile) return
@@ -142,6 +144,43 @@ class R4StartupRunner private constructor(private val app: Application) {
     private fun updateInstallCacheBytes(bytes: Long) {
         if (state.installCacheBytes != bytes) {
             update(state.copy(installCacheBytes = bytes))
+        }
+    }
+
+    fun refreshTextureCacheSize() {
+        Thread({
+            val bytes = readTextureCacheBytes()
+            updateTextureCacheBytes(bytes)
+        }, "wse-r4-texcache-size").start()
+    }
+
+    fun clearTextureCache() {
+        if (state.running) return
+        Thread({
+            if (R4Native.loadError == null) {
+                try {
+                    R4Native.clearTextureCache(workDir.absolutePath)
+                } catch (_: Throwable) {
+                }
+            }
+            val bytes = readTextureCacheBytes()
+            updateTextureCacheBytes(bytes)
+        }, "wse-r4-texcache-clear").start()
+    }
+
+    private fun readTextureCacheBytes(): Long {
+        if (R4Native.loadError != null) return 0L
+        return try {
+            R4Native.textureCacheBytes(workDir.absolutePath).coerceAtLeast(0L)
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    @Synchronized
+    private fun updateTextureCacheBytes(bytes: Long) {
+        if (state.textureCacheBytes != bytes) {
+            update(state.copy(textureCacheBytes = bytes))
         }
     }
 
@@ -607,6 +646,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         update(state.copy(running = false, status = "", report = report))
         R4ForegroundService.finish(app, report.substringBefore("\n\n"))
         refreshInstallCacheSize()
+        refreshTextureCacheSize()
     }
 
     // The headline (the given error, or the report's RESULT line) and the report.

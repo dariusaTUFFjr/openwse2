@@ -178,6 +178,7 @@ fun LauncherApp(
         onLaunchRecompVulkan = viewModel::launchRecompVulkan,
         onR4UseCopyChange = viewModel::setR4UseCopy,
         onClearInstallCache = viewModel::clearInstallCache,
+        onClearTextureCache = viewModel::clearTextureCache,
         onDismissR4Report = viewModel::dismissR4Report
     )
 
@@ -283,6 +284,7 @@ fun LauncherAppContent(
     onLaunchRecompVulkan: () -> Unit = {},
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onClearInstallCache: () -> Unit = {},
+    onClearTextureCache: () -> Unit = {},
     onDismissR4Report: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -401,6 +403,7 @@ fun LauncherAppContent(
                 onLaunchRecompVulkan = onLaunchRecompVulkan,
                 onR4UseCopyChange = onR4UseCopyChange,
                 onClearInstallCache = onClearInstallCache,
+                onClearTextureCache = onClearTextureCache,
                 onDismissR4Report = onDismissR4Report
             )
         }

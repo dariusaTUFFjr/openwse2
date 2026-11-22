@@ -559,6 +559,12 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
 
     wse::platform::VulkanD3d9Config cfg{};
     cfg.pipeline_cache_path = (work / "r5_pipeline_cache.bin").string();
+    {
+        const std::filesystem::path tex_cache_dir = work / "texcache";
+        std::error_code tex_ec;
+        std::filesystem::create_directories(tex_cache_dir, tex_ec);
+        cfg.texture_cache_dir = tex_cache_dir.string();
+    }
     cfg.max_texture_size = static_cast<std::uint32_t>(std::max<jint>(0, max_texture_size));
     cfg.native_window = init_win;
     cfg.on_frame_presented = [hud, drv_label](std::uint64_t frame, double inst_fps, double avg_fps,
@@ -654,7 +660,10 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
                 if (bk) {
                     const auto tt = bk->texture_timings();
                     load += " textures=" + format_fixed1(tt.seconds) + "s/" + std::to_string(tt.textures) + "/" +
-                            std::to_string(tt.bytes >> 20) + "MiB";
+                            std::to_string(tt.bytes >> 20) + "MiB" +
+                            " etc2=" + std::to_string(tt.etc2_textures) + "/" +
+                            std::to_string(tt.etc2_cached) + "/" +
+                            format_fixed1(tt.etc2_transcode_ms / 1000.0) + "s";
                 }
                 load += " game_cpu=" + format_fixed1(game_cpu) + "s app_cpu=" + format_fixed1(app_cpu) + "s\n";
                 line += load;
@@ -809,5 +818,21 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_wse2_android_launcher_R4Native_cl
     const std::string raw = jstring_to_utf8(env, jwork_dir);
     if (raw.empty()) return JNI_FALSE;
     const std::filesystem::path cache_root = std::filesystem::path(raw) / "r4" / "install-cache";
+    return wse::platform::CachingVfs::clear(cache_root) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_org_wse2_android_launcher_R4Native_textureCacheBytes(
+    JNIEnv* env, jclass, jstring jwork_dir) {
+    const std::string raw = jstring_to_utf8(env, jwork_dir);
+    if (raw.empty()) return 0;
+    const std::filesystem::path cache_root = std::filesystem::path(raw) / "r4" / "texcache";
+    return static_cast<jlong>(wse::platform::CachingVfs::disk_usage(cache_root));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_org_wse2_android_launcher_R4Native_clearTextureCache(
+    JNIEnv* env, jclass, jstring jwork_dir) {
+    const std::string raw = jstring_to_utf8(env, jwork_dir);
+    if (raw.empty()) return JNI_FALSE;
+    const std::filesystem::path cache_root = std::filesystem::path(raw) / "r4" / "texcache";
     return wse::platform::CachingVfs::clear(cache_root) ? JNI_TRUE : JNI_FALSE;
 }

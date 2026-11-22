@@ -72,4 +72,12 @@ object R4Native {
     // Deletes the copied game files under `<workDir>/r4/install-cache`.
     @JvmStatic
     external fun clearInstallCache(workDir: String): Boolean
+
+    // Size in bytes of the converted ETC2 textures under `<workDir>/r4/texcache`.
+    @JvmStatic
+    external fun textureCacheBytes(workDir: String): Long
+
+    // Deletes the converted ETC2 textures under `<workDir>/r4/texcache`.
+    @JvmStatic
+    external fun clearTextureCache(workDir: String): Boolean
 }

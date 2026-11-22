@@ -11,6 +11,8 @@
 //       [--ref <d3d9_ref_dir>]
 //       [--save-diff]
 //       [--no-bc]
+//       [--etc2]
+//       [--texcache <dir>]
 //       [--max-tex <px>]
 //       [--pipeline-cache <path>]
 //       [--driver system|mock|panvk|turnip]
@@ -220,10 +222,12 @@ int main(int argc, char** argv) {
     fs::path ref_dir;
     bool save_diff = false;
     bool no_bc = false;
+    bool sim_etc2 = false;
     bool no_bgra_vtx = false;
     bool eager_shaders = false;
     std::uint32_t max_tex = 0;
     std::string pipeline_cache;
+    std::string texcache_dir;
     std::string driver_kind = "system";
     std::string driver_path;
 
@@ -243,6 +247,11 @@ int main(int argc, char** argv) {
             save_diff = true;
         } else if (arg == "--no-bc") {
             no_bc = true;
+        } else if (arg == "--etc2") {
+            sim_etc2 = true;
+            no_bc = true;
+        } else if (arg == "--texcache" && i + 1 < argc) {
+            texcache_dir = argv[++i];
         } else if (arg == "--no-bgra-vtx") {
             no_bgra_vtx = true;
         } else if (arg == "--eager-shaders") {
@@ -305,6 +314,8 @@ int main(int argc, char** argv) {
 
     wse::platform::VulkanD3d9Config cfg{};
     cfg.prefer_bc_compression = !no_bc;
+    cfg.simulate_etc2 = sim_etc2;
+    cfg.texture_cache_dir = texcache_dir;
     cfg.prefer_bgra_vertex_format = !no_bgra_vtx;
     cfg.eager_shader_compile = eager_shaders;
     cfg.max_texture_size = max_tex;

@@ -1312,3 +1312,10 @@ To run the headless Phase 2H validator against a local Warband install:
 ```
 
 The Android NDK (`aarch64-linux-android29`) header checks, cross-compile build, and `arm64-v8a` SDL3 debug APK (`gradle -p android assembleDebug` -> `libwse2.so` + `libSDL3.so`) also run in `.github/workflows/ci.yml`; see [`STATUS.md`](../STATUS.md) §2 for current gate results.
+
+- **R5b ETC2 textures + disk cache (`wse/asset/etc2_decode.h`, `platform/vulkan/d3d9_vulkan.{h,cpp}`, `platform/android/r4_jni.cpp`):**
+  - `wse/asset/etc2_decode.h` provides the header-only Khronos ETC2 RGB8 + EAC alpha reference decoder (`wse::asset::etc2::decode_to_rgba8`) with no `etcpak` dependency.
+  - `VulkanDriverLoader` enables `VkPhysicalDeviceFeatures::textureCompressionETC2` when present; `VulkanD3d9Backend` probes `VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK` and `VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK` for `VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT` at init and records `texture_compression_etc2` (`ETC2=yes/no` in `D3d9DriverReport::format_summary()`).
+  - `upload_texture_dds` transcodes DDS textures to ETC2 (respecting `max_texture_size` via `first_mip`) when BC is unavailable/disabled and ETC2 is supported (`prefer_etc2`) or `simulate_etc2` is enabled (which decodes ETC2 back to RGBA8 for PC visual verification), falling back to RGBA8 on any failure.
+  - When `texture_cache_dir` is set, transcoded `etc2::Image` payloads are cached on disk under `<dir>/<cache_key>` via atomic `.tmp` + rename; unreadable/corrupt cache files are deleted and re-transcoded.
+  - `VulkanD3d9Backend::texture_timings()` tracks `etc2_textures`, `etc2_cached`, `etc2_transcode_ms`, `etc2_cache_read_failures`, `etc2_cache_write_failures`, `rgba8_fallbacks`, and `level_rgba8_fallbacks`; `r4_jni.cpp` appends `etc2=<n>/<cached>/<transcode s>` to the `load:` line, uses `<work>/texcache`, and exposes `textureCacheBytes` / `clearTextureCache` to the launcher.

@@ -328,7 +328,7 @@ $tests = @(
     @{ Name = "native_world"; Source = Join-Path $here "tests\native_world_test.cpp" },
     @{ Name = "native_m5"; Source = Join-Path $here "tests\native_m5_test.cpp" },
     @{ Name = "wse_m6"; Source = Join-Path $here "tests\wse_m6_test.cpp" },
-    @{ Name = "platform"; Source = Join-Path $here "tests\platform_test.cpp"; LinkDriverLoader = $true; LinkShader = $true },
+    @{ Name = "platform"; Source = Join-Path $here "tests\platform_test.cpp"; LinkDriverLoader = $true; LinkShader = $true; LinkTexture = $true },
     @{ Name = "module_loaders"; Source = Join-Path $here "tests\module_loaders_test.cpp" },
     @{ Name = "headless"; Source = Join-Path $here "tests\headless_test.cpp" },
     @{ Name = "lua"; Source = Join-Path $here "tests\lua_test.cpp"; LinkLua = $true },
@@ -444,7 +444,7 @@ $replayVulkanTool = Join-Path $out "r5_replay_vulkan.exe"
 Write-Host "building     r5_replay_vulkan"
 & $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Werror `
     -I $include -I $vulkanInclude -o $replayVulkanTool (Join-Path $here "..\tools\r5_replay_vulkan.cpp") `
-    $driverLoaderObj $d3d9VulkanObj $wseShaderLib $glslangLib
+    $driverLoaderObj $d3d9VulkanObj $wseShaderLib $glslangLib $wseTextureLib $etcpakLib
 if ($LASTEXITCODE -ne 0) {
     throw "r5_replay_vulkan build failed"
 }

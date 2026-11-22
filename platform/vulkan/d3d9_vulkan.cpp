@@ -8,8 +8,11 @@
 #include "driver_loader_internal.h"
 
 #include "wse/asset/dds.h"
+#include "wse/asset/etc2.h"
+#include "wse/asset/etc2_decode.h"
 #include "wse/asset/shader.h"
 #include "wse/asset/shader_compiler.h"
+#include "wse/asset/texture_cache.h"
 #include "wse/recomp/d3d9_shader.h"
 
 #include <algorithm>
@@ -19,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -26,6 +30,8 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1000,6 +1006,9 @@ struct VulkanD3d9Backend::Impl {
 
     // Load-time breakdown (`texture_timings()`).
     std::uint64_t tex_ns = 0, tex_count = 0, tex_bytes = 0;
+    std::uint64_t etc2_textures = 0, etc2_cached = 0, etc2_transcode_ns = 0;
+    std::uint64_t etc2_cache_read_failures = 0, etc2_cache_write_failures = 0;
+    std::uint64_t rgba8_fallbacks = 0, level_rgba8_fallbacks = 0;
     struct TexTimer {
         Impl& impl;
         std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -3096,6 +3105,7 @@ struct VulkanD3d9Backend::Impl {
 
         // Mock / non-executing device: record capability report and return ok without allocating GPU resources.
         if (h.is_mock || !h.can_execute_gpu || !vk.has_core_gpu()) {
+            report.texture_compression_etc2 = (phys_features.textureCompressionETC2 == VK_TRUE);
             if (!report.texture_compression_bc) report.missing_features.push_back("textureCompressionBC -> RGBA8");
             if (!h.is_mock && !vk.has_core_gpu()) report.missing_features.push_back("missing core Vulkan GPU procs");
             report.ok = true;
@@ -3137,6 +3147,17 @@ struct VulkanD3d9Backend::Impl {
         } else if (!config.prefer_bc_compression) {
             report.missing_features.push_back("textureCompressionBC disabled -> RGBA8");
         }
+
+        // Probe ETC2 RGB8/RGBA8 sampling support.
+        bool etc2_ok = (phys_features.textureCompressionETC2 == VK_TRUE);
+        if (etc2_ok) {
+            for (VkFormat f : {VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK}) {
+                VkFormatProperties fp{};
+                vk.get_phys_format_props(h.physical_device, f, &fp);
+                if ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) == 0U) etc2_ok = false;
+            }
+        }
+        report.texture_compression_etc2 = etc2_ok;
 
         // Probe BGRA8 vertex attribute support (D3DDECLTYPE_D3DCOLOR).
         {
@@ -4502,6 +4523,9 @@ void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t fac
 
     const bool use_bc = impl_->config.prefer_bc_compression && impl_->report.texture_compression_bc &&
                         is_dxt_d3dfmt(t.d3d_fmt);
+    if (is_dxt_d3dfmt(t.d3d_fmt) && !use_bc) {
+        ++impl_->level_rgba8_fallbacks;
+    }
     const VkFormat vk_fmt = use_bc ? dxt_d3dfmt_to_vk(t.d3d_fmt) : VK_FORMAT_R8G8B8A8_UNORM;
     if (t.img == VK_NULL_HANDLE) {
         if (!impl_->create_texture_image_gpu(t, vk_fmt, t.width, t.height, t.levels, t.kind)) return;
@@ -4576,7 +4600,7 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
     const bool use_bc = impl_->config.prefer_bc_compression && impl_->report.texture_compression_bc &&
                         bc_fmt != VK_FORMAT_UNDEFINED;
 
-    // Optional P10.7 mip cap when decoding to RGBA8 fallback.
+    // Optional P10.7 mip cap when decoding to RGBA8 or transcoding to ETC2.
     std::uint32_t first_mip = 0U;
     if (!use_bc && impl_->config.max_texture_size > 0U) {
         while (first_mip + 1U < view.mip_count &&
@@ -4584,53 +4608,209 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
             ++first_mip;
         }
     }
-    const VkFormat vk_fmt = use_bc ? bc_fmt : VK_FORMAT_R8G8B8A8_UNORM;
 
     Impl::TextureObj& t = it->second;
     impl_->retire_texture_image_locked(t);  // a new image replaces one queued frames may sample
     std::uint32_t out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
     std::uint32_t out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
     std::uint32_t out_levels = view.mip_count - first_mip;
-    bool img_ok = impl_->create_texture_image_gpu(t, vk_fmt, out_w, out_h, out_levels, kind);
-    // On RGBA8 fallback, gracefully drop top mip(s) if device memory runs tight instead of dropping the texture.
-    while (!img_ok && !use_bc && first_mip + 1U < view.mip_count) {
-        ++first_mip;
-        out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
-        out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
-        out_levels = view.mip_count - first_mip;
-        img_ok = impl_->create_texture_image_gpu(t, vk_fmt, out_w, out_h, out_levels, kind);
-    }
-    if (!img_ok) return;
-    if (first_mip > 0U && impl_->last_error.find("vkAllocateMemory") != std::string::npos) {
-        impl_->last_error.clear();
-    }
 
-    // Pack all faces and mip levels into one staging upload.
     std::vector<std::uint8_t> packed;
     std::vector<VkBufferImageCopy> copies;
-    copies.reserve(static_cast<std::size_t>(layers) * out_levels);
     std::vector<std::uint8_t> rgba_tmp;
-    for (std::uint32_t face = 0; face < layers; ++face) {
-        for (std::uint32_t m = 0; m < out_levels; ++m) {
-            const std::uint32_t src_mip = first_mip + m;
-            const std::size_t sidx = static_cast<std::size_t>(face) * view.mip_count + src_mip;
-            if (sidx >= view.slices.size()) continue;
-            const wse::asset::DdsMipSlice& sl = view.slices[sidx];
-            const std::size_t aligned_off = static_cast<std::size_t>(align_up(packed.size(), 16U));
-            packed.resize(aligned_off, 0U);
-            if (use_bc) {
-                const auto* src_p = reinterpret_cast<const std::uint8_t*>(sl.data.data());
-                packed.insert(packed.end(), src_p, src_p + sl.data.size());
-            } else {
-                rgba_tmp.clear();
-                if (!wse::asset::decode_dds_mip_rgba8(view, src_mip, face, rgba_tmp, &dds_err)) continue;
-                packed.insert(packed.end(), rgba_tmp.begin(), rgba_tmp.end());
+    bool used_etc2 = false;
+
+    const bool want_etc2 = !use_bc &&
+                           ((impl_->config.prefer_etc2 && impl_->report.texture_compression_etc2) ||
+                            impl_->config.simulate_etc2);
+    if (want_etc2) {
+        wse::asset::etc2::Image etc_img;
+        bool from_cache = false;
+        std::filesystem::path cache_path;
+        if (!impl_->config.texture_cache_dir.empty()) {
+            namespace fs = std::filesystem;
+            cache_path = fs::path(impl_->config.texture_cache_dir) / wse::asset::cache_key(dds_bytes, first_mip);
+            std::error_code ec;
+            if (fs::is_regular_file(cache_path, ec)) {
+                std::vector<std::uint8_t> cached_bytes;
+                std::ifstream in(cache_path, std::ios::binary);
+                bool read_ok = false;
+                if (in) {
+                    in.seekg(0, std::ios::end);
+                    const std::streamoff sz = in.tellg();
+                    if (sz > 0) {
+                        in.seekg(0, std::ios::beg);
+                        cached_bytes.resize(static_cast<std::size_t>(sz));
+                        read_ok = static_cast<bool>(
+                            in.read(reinterpret_cast<char*>(cached_bytes.data()), sz));
+                    }
+                }
+                std::string cache_err;
+                if (read_ok && wse::asset::decode(cached_bytes, etc_img, &cache_err) &&
+                    etc_img.faces >= layers && etc_img.levels == out_levels &&
+                    etc_img.data.size() == static_cast<std::size_t>(etc_img.faces) * etc_img.levels) {
+                    from_cache = true;
+                } else {
+                    ++impl_->etc2_cache_read_failures;
+                    etc_img = {};
+                    fs::remove(cache_path, ec);
+                }
             }
-            VkBufferImageCopy cpy{};
-            cpy.bufferOffset = aligned_off;
-            cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, face, 1U};
-            cpy.imageExtent = {std::max<std::uint32_t>(1U, sl.width), std::max<std::uint32_t>(1U, sl.height), 1U};
-            copies.push_back(cpy);
+        }
+
+        if (!from_cache) {
+            unsigned threads = impl_->config.etc2_threads;
+            if (threads == 0U) {
+                const unsigned hc = std::thread::hardware_concurrency();
+                threads = (hc > 0U) ? std::min(4U, hc) : 1U;
+            }
+            std::string etc_err;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool transcode_ok =
+                wse::asset::etc2::transcode_dds(view, first_mip, etc_img, &etc_err, threads);
+            impl_->etc2_transcode_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+            if (!transcode_ok || etc_img.faces < layers || etc_img.levels != out_levels ||
+                etc_img.data.size() != static_cast<std::size_t>(etc_img.faces) * etc_img.levels) {
+                etc_img = {};
+            } else if (!cache_path.empty()) {
+                namespace fs = std::filesystem;
+                const std::vector<std::uint8_t> encoded = wse::asset::encode(etc_img);
+                bool write_ok = false;
+                if (!encoded.empty()) {
+                    std::error_code ec;
+                    fs::create_directories(cache_path.parent_path(), ec);
+                    const fs::path tmp_path = fs::path(cache_path.string() + ".tmp");
+                    {
+                        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+                        if (out) {
+                            out.write(reinterpret_cast<const char*>(encoded.data()),
+                                      static_cast<std::streamsize>(encoded.size()));
+                            out.flush();
+                            write_ok = static_cast<bool>(out);
+                        }
+                    }
+                    if (write_ok) {
+                        fs::rename(tmp_path, cache_path, ec);
+                        if (ec) {
+                            write_ok = false;
+                            fs::remove(tmp_path, ec);
+                        }
+                    } else {
+                        fs::remove(tmp_path, ec);
+                    }
+                }
+                if (!write_ok) {
+                    ++impl_->etc2_cache_write_failures;
+                }
+            }
+        }
+
+        if (!etc_img.data.empty()) {
+            const VkFormat etc2_vk_fmt = impl_->config.simulate_etc2
+                                             ? VK_FORMAT_R8G8B8A8_UNORM
+                                             : ((etc_img.format == wse::asset::etc2::Format::rgba8)
+                                                    ? VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK
+                                                    : VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK);
+            std::uint32_t etc_mip_start = 0U;
+            bool img_ok = impl_->create_texture_image_gpu(t, etc2_vk_fmt, out_w, out_h, out_levels, kind);
+            while (!img_ok && impl_->config.simulate_etc2 && first_mip + 1U < view.mip_count) {
+                ++first_mip;
+                ++etc_mip_start;
+                out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
+                out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
+                out_levels = view.mip_count - first_mip;
+                img_ok = impl_->create_texture_image_gpu(t, etc2_vk_fmt, out_w, out_h, out_levels, kind);
+            }
+            if (img_ok) {
+                if (first_mip > 0U && impl_->last_error.find("vkAllocateMemory") != std::string::npos) {
+                    impl_->last_error.clear();
+                }
+                copies.reserve(static_cast<std::size_t>(layers) * out_levels);
+                bool pack_ok = true;
+                for (std::uint32_t face = 0; face < layers && pack_ok; ++face) {
+                    for (std::uint32_t m = 0; m < out_levels; ++m) {
+                        const std::uint32_t src_etc_mip = etc_mip_start + m;
+                        const std::size_t eidx =
+                            static_cast<std::size_t>(face) * etc_img.levels + src_etc_mip;
+                        const wse::asset::etc2::Level& lvl = etc_img.data[eidx];
+                        const std::size_t aligned_off =
+                            static_cast<std::size_t>(align_up(packed.size(), 16U));
+                        packed.resize(aligned_off, 0U);
+                        if (impl_->config.simulate_etc2) {
+                            rgba_tmp.clear();
+                            if (!wse::asset::etc2::decode_to_rgba8(etc_img, face, src_etc_mip, rgba_tmp)) {
+                                pack_ok = false;
+                                break;
+                            }
+                            packed.insert(packed.end(), rgba_tmp.begin(), rgba_tmp.end());
+                        } else {
+                            packed.insert(packed.end(), lvl.blocks.begin(), lvl.blocks.end());
+                        }
+                        VkBufferImageCopy cpy{};
+                        cpy.bufferOffset = aligned_off;
+                        cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, face, 1U};
+                        cpy.imageExtent = {std::max<std::uint32_t>(1U, lvl.width),
+                                           std::max<std::uint32_t>(1U, lvl.height), 1U};
+                        copies.push_back(cpy);
+                    }
+                }
+                if (pack_ok && !copies.empty()) {
+                    used_etc2 = true;
+                    ++impl_->etc2_textures;
+                    if (from_cache) ++impl_->etc2_cached;
+                } else {
+                    packed.clear();
+                    copies.clear();
+                }
+            }
+            etc_img = {};
+        }
+    }
+
+    if (!used_etc2) {
+        const VkFormat vk_fmt = use_bc ? bc_fmt : VK_FORMAT_R8G8B8A8_UNORM;
+        bool img_ok = impl_->create_texture_image_gpu(t, vk_fmt, out_w, out_h, out_levels, kind);
+        // On RGBA8 fallback, gracefully drop top mip(s) if device memory runs tight instead of dropping the texture.
+        while (!img_ok && !use_bc && first_mip + 1U < view.mip_count) {
+            ++first_mip;
+            out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
+            out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
+            out_levels = view.mip_count - first_mip;
+            img_ok = impl_->create_texture_image_gpu(t, vk_fmt, out_w, out_h, out_levels, kind);
+        }
+        if (!img_ok) return;
+        if (first_mip > 0U && impl_->last_error.find("vkAllocateMemory") != std::string::npos) {
+            impl_->last_error.clear();
+        }
+        if (!use_bc) ++impl_->rgba8_fallbacks;
+
+        // Pack all faces and mip levels into one staging upload.
+        copies.reserve(static_cast<std::size_t>(layers) * out_levels);
+        for (std::uint32_t face = 0; face < layers; ++face) {
+            for (std::uint32_t m = 0; m < out_levels; ++m) {
+                const std::uint32_t src_mip = first_mip + m;
+                const std::size_t sidx = static_cast<std::size_t>(face) * view.mip_count + src_mip;
+                if (sidx >= view.slices.size()) continue;
+                const wse::asset::DdsMipSlice& sl = view.slices[sidx];
+                const std::size_t aligned_off = static_cast<std::size_t>(align_up(packed.size(), 16U));
+                packed.resize(aligned_off, 0U);
+                if (use_bc) {
+                    const auto* src_p = reinterpret_cast<const std::uint8_t*>(sl.data.data());
+                    packed.insert(packed.end(), src_p, src_p + sl.data.size());
+                } else {
+                    rgba_tmp.clear();
+                    if (!wse::asset::decode_dds_mip_rgba8(view, src_mip, face, rgba_tmp, &dds_err)) continue;
+                    packed.insert(packed.end(), rgba_tmp.begin(), rgba_tmp.end());
+                }
+                VkBufferImageCopy cpy{};
+                cpy.bufferOffset = aligned_off;
+                cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, face, 1U};
+                cpy.imageExtent = {std::max<std::uint32_t>(1U, sl.width), std::max<std::uint32_t>(1U, sl.height), 1U};
+                copies.push_back(cpy);
+            }
         }
     }
     VkBuffer sbuf = VK_NULL_HANDLE;
@@ -5043,7 +5223,18 @@ std::string VulkanD3d9Backend::active_presentation_path() const {
 
 VulkanD3d9Backend::TextureTimings VulkanD3d9Backend::texture_timings() const {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
-    return {static_cast<double>(impl_->tex_ns) / 1e9, impl_->tex_count, impl_->tex_bytes};
+    return {
+        static_cast<double>(impl_->tex_ns) / 1e9,
+        impl_->tex_count,
+        impl_->tex_bytes,
+        impl_->etc2_textures,
+        impl_->etc2_cached,
+        static_cast<double>(impl_->etc2_transcode_ns) / 1e6,
+        impl_->etc2_cache_read_failures,
+        impl_->etc2_cache_write_failures,
+        impl_->rgba8_fallbacks,
+        impl_->level_rgba8_fallbacks,
+    };
 }
 
 std::size_t VulkanD3d9Backend::compiled_shader_count() const noexcept {

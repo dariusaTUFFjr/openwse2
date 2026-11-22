@@ -52,6 +52,7 @@
 #include "wse/platform/saf_vfs.h"
 #include "wse/platform/sleep.h"
 #include "wse/platform/vfs.h"
+#include "wse/asset/texture_cache.h"
 
 namespace {
 
@@ -3144,6 +3145,128 @@ void test_r5a_vulkan_d3d9_backend() {
                    after.leaked_at_device_destroy == before.leaked_at_device_destroy &&
                    after.invalid_destroys == before.invalid_destroys,
                "R5a VulkanD3d9Backend: zero leaked mock Vulkan objects on teardown");
+    }
+
+    // 1a. R5b simulate_etc2 + disk texture cache + corrupt cache replacement on Mock PanVK ICD.
+    {
+        auto make_synthetic_dds = [](std::uint32_t fourcc, std::uint32_t block_bytes) {
+            std::vector<std::uint8_t> dds(128U, 0U);
+            auto put_u32 = [&](std::size_t off, std::uint32_t v) {
+                dds[off + 0U] = static_cast<std::uint8_t>(v & 0xFFU);
+                dds[off + 1U] = static_cast<std::uint8_t>((v >> 8U) & 0xFFU);
+                dds[off + 2U] = static_cast<std::uint8_t>((v >> 16U) & 0xFFU);
+                dds[off + 3U] = static_cast<std::uint8_t>((v >> 24U) & 0xFFU);
+            };
+            dds[0] = 'D'; dds[1] = 'D'; dds[2] = 'S'; dds[3] = ' ';
+            put_u32(4U, 124U);
+            put_u32(8U, 0x000A1007U);  // CAPS | HEIGHT | WIDTH | PIXELFORMAT | MIPMAPCOUNT
+            put_u32(12U, 8U);          // height
+            put_u32(16U, 8U);          // width
+            put_u32(28U, 2U);          // mipMapCount = 2 (8x8, 4x4)
+            put_u32(76U, 32U);         // ddspf.dwSize
+            put_u32(80U, 0x4U);        // DDPF_FOURCC
+            put_u32(84U, fourcc);
+            // 8x8 = 4 blocks, 4x4 = 1 block => 5 blocks total
+            const std::size_t payload_bytes = 5U * block_bytes;
+            dds.resize(128U + payload_bytes, 0U);
+            for (std::size_t i = 0; i < payload_bytes; ++i) {
+                dds[128U + i] = static_cast<std::uint8_t>((i * 37U + 13U) & 0xFFU);
+            }
+            return dds;
+        };
+        const std::vector<std::uint8_t> dxt1_dds = make_synthetic_dds(0x31545844U, 8U);   // 'DXT1'
+        const std::vector<std::uint8_t> dxt5_dds = make_synthetic_dds(0x35545844U, 16U);  // 'DXT5'
+
+        std::error_code ec;
+        const std::filesystem::path tex_cache =
+            std::filesystem::temp_directory_path() / "wse_platform_test_etc2_cache";
+        std::filesystem::remove_all(tex_cache, ec);
+        std::filesystem::create_directories(tex_cache, ec);
+
+        auto run_etc2_pass = [&](std::vector<std::uint8_t>& out_rgba,
+                                 VulkanD3d9Backend::TextureTimings& out_tt,
+                                 std::string& out_summary) {
+            auto loader = std::make_shared<VulkanDriverLoader>();
+            VulkanMockConfig mc{};
+            mc.mode = DriverMode::panvk;
+            mc.direct_icd = true;
+            mc.device_name = "Mock PanVK ETC2";
+            VulkanDriverProbeResult probe{};
+            if (!loader->load_mock_icd(mc) || !loader->probe_and_create_device(probe)) {
+                return false;
+            }
+            VulkanD3d9Config cfg{};
+            cfg.prefer_bc_compression = false;
+            cfg.simulate_etc2 = true;
+            cfg.texture_cache_dir = tex_cache.string();
+            VulkanD3d9Backend bk(loader, cfg);
+            std::string err;
+            if (!bk.init(32, 32, 22, 75, &err)) {
+                return false;
+            }
+            out_summary = bk.report().format_summary();
+            bk.create_shader(1, false, vs_bytes);
+            bk.create_shader(2, true, ps_bytes);
+            bk.create_vertex_decl(3, decl);
+            bk.create_buffer(4, false, sizeof(verts), false, 100);
+            bk.update_buffer(4, 0,
+                             std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)),
+                             0U);
+            bk.create_buffer(5, true, sizeof(indices), false, 101);
+            bk.update_buffer(5, 0,
+                             std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)),
+                             0U);
+            bk.create_texture(6, 0, 8, 8, 1, 2, 0x31545844U, 0);
+            bk.upload_texture_dds(6, dxt1_dds);
+            bk.create_texture(7, 0, 8, 8, 1, 2, 0x35545844U, 0);
+            bk.upload_texture_dds(7, dxt5_dds);
+
+            D3d9DrawState st;
+            st.vs = 1; st.ps = 2; st.decl = 3; st.indices = 5;
+            st.streams[0] = {4, 0, sizeof(QuadVtx), 1};
+            st.viewport = {0, 0, 32, 32, 0.0F, 1.0F};
+            bk.clear(st, 3, 0xFF102030U, 1.0F, 0, {});
+            st.textures[0] = 6;
+            bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+            st.textures[0] = 7;
+            bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+
+            std::uint32_t rw = 0, rh = 0;
+            const bool ok = bk.present(&out_rgba, &rw, &rh) && rw == 32U && rh == 32U;
+            out_tt = bk.texture_timings();
+            return ok;
+        };
+
+        std::vector<std::uint8_t> rgba1, rgba2, rgba3, rgba4;
+        VulkanD3d9Backend::TextureTimings tt1{}, tt2{}, tt3{}, tt4{};
+        std::string summary1;
+        const bool p1 = run_etc2_pass(rgba1, tt1, summary1);
+        expect(p1 && tt1.etc2_textures == 2U && tt1.etc2_cached == 0U &&
+                   summary1.find("ETC2=") != std::string::npos,
+               "R5b VulkanD3d9Backend: simulate_etc2 uploads DXT1+DXT5 (etc2=2, cached=0, ETC2= in report)");
+
+        const bool p2 = run_etc2_pass(rgba2, tt2, summary1);
+        expect(p2 && tt2.etc2_textures == 2U && tt2.etc2_cached == 2U && rgba2 == rgba1,
+               "R5b VulkanD3d9Backend: second run loads both ETC2 textures from disk cache with identical pixels");
+
+        // Corrupt the DXT1 cache file and verify it is replaced without crashing.
+        const std::filesystem::path dxt1_cache = tex_cache / wse::asset::cache_key(dxt1_dds, 0U);
+        {
+            std::ofstream bad(dxt1_cache, std::ios::binary | std::ios::trunc);
+            const char junk[] = "CORRUPTED_CACHE";
+            bad.write(junk, sizeof(junk));
+        }
+        const bool p3 = run_etc2_pass(rgba3, tt3, summary1);
+        expect(p3 && tt3.etc2_textures == 2U && tt3.etc2_cached == 1U &&
+                   tt3.etc2_cache_read_failures == 1U && rgba3 == rgba1,
+               "R5b VulkanD3d9Backend: corrupted cache file is replaced and falls back cleanly");
+
+        const bool p4 = run_etc2_pass(rgba4, tt4, summary1);
+        expect(p4 && tt4.etc2_textures == 2U && tt4.etc2_cached == 2U &&
+                   tt4.etc2_cache_read_failures == 0U,
+               "R5b VulkanD3d9Backend: replaced cache file is valid on subsequent run");
+
+        std::filesystem::remove_all(tex_cache, ec);
     }
 
     // 1b. Direct-ICD Mock PanVK / Turnip AHB presentation extension negotiation & fallback (R5a step 5).
