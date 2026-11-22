@@ -4,9 +4,8 @@
 // Port infrastructure, not a reconstruction: mirrors no retail v1.1.5.6 layout
 // and carries no PE/PDB citations. Standard library only.
 //
-// Note: `wse::platform::ThermalStatus` is also defined with PascalCase
-// enumerators (`None..Shutdown`) in `wse/platform/performance.h`; avoid
-// including both headers in the same translation unit until wired together.
+// Thermal levels are `wse::platform::ThermalStatus` from `wse/platform/performance.h`
+// (Android `PowerManager.THERMAL_STATUS_*`).
 
 #pragma once
 
@@ -14,6 +13,8 @@
 #include <cmath>
 #include <cstdint>
 #include <utility>
+
+#include "wse/platform/performance.h"
 
 namespace wse::platform {
 
@@ -24,17 +25,6 @@ struct DynResConfig {
     double target_frame_ms = 33.3;
     double headroom = 0.85;  // aim for 85% of budget
     int frames_to_decide = 30;
-};
-
-// Matches Android PowerManager.THERMAL_STATUS_* levels (0..6).
-enum class ThermalStatus {
-    none,
-    light,
-    moderate,
-    severe,
-    critical,
-    emergency,
-    shutdown,
 };
 
 // Dynamic resolution scale controller with hysteresis and thermal capping.
@@ -53,11 +43,11 @@ enum class ThermalStatus {
 //   below `recover_ms` increases `scale` by `cfg.step` (clamped at the active
 //   thermal cap).
 // - Thermal capping (applied immediately on `update()`):
-//   * `none` / `light`: cap = `cfg.max_scale` (lifts any prior thermal cap so
+//   * `None` / `Light`: cap = `cfg.max_scale` (lifts any prior thermal cap so
 //     subsequent under-budget frames can recover upward)
-//   * `moderate`: cap = `clamp(0.85, cfg.min_scale, cfg.max_scale)`
-//   * `severe`: cap = `clamp(0.75, cfg.min_scale, cfg.max_scale)`
-//   * `critical` / `emergency` / `shutdown`: cap = `cfg.min_scale`
+//   * `Moderate`: cap = `clamp(0.85, cfg.min_scale, cfg.max_scale)`
+//   * `Severe`: cap = `clamp(0.75, cfg.min_scale, cfg.max_scale)`
+//   * `Critical` / `Emergency` / `Shutdown`: cap = `cfg.min_scale`
 // - `render_size(out_w, out_h, scale)` clamps `scale` to `[0, 1]`, multiplies
 //   each output dimension by `scale`, rounds to the nearest multiple of 8, and
 //   clamps to `[8, out_dim]` (or `out_dim` itself when `out_dim < 8`).
@@ -161,16 +151,16 @@ private:
 
     [[nodiscard]] float thermal_cap(ThermalStatus thermal) const noexcept {
         switch (thermal) {
-            case ThermalStatus::none:
-            case ThermalStatus::light:
+            case ThermalStatus::None:
+            case ThermalStatus::Light:
                 return cfg_.max_scale;
-            case ThermalStatus::moderate:
+            case ThermalStatus::Moderate:
                 return std::clamp(0.85F, cfg_.min_scale, cfg_.max_scale);
-            case ThermalStatus::severe:
+            case ThermalStatus::Severe:
                 return std::clamp(0.75F, cfg_.min_scale, cfg_.max_scale);
-            case ThermalStatus::critical:
-            case ThermalStatus::emergency:
-            case ThermalStatus::shutdown:
+            case ThermalStatus::Critical:
+            case ThermalStatus::Emergency:
+            case ThermalStatus::Shutdown:
                 return cfg_.min_scale;
         }
         return cfg_.max_scale;

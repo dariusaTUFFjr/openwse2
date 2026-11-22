@@ -2760,7 +2760,7 @@ void test_r5b_postfx_and_dynres() {
             DynamicResolution dr;
             expect(near_s(dr.scale(), 1.0F), "dynres starts at max_scale");
             for (int i = 0; i < 200; ++i) {
-                (void)dr.update(20.0, ThermalStatus::none);
+                (void)dr.update(20.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 1.0F), "dynres steady under-budget load stays at max_scale");
         }
@@ -2769,19 +2769,19 @@ void test_r5b_postfx_and_dynres() {
         {
             DynamicResolution dr;
             for (int i = 0; i < 29; ++i) {
-                (void)dr.update(35.0, ThermalStatus::none);
+                (void)dr.update(35.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 1.0F), "dynres waits frames_to_decide before first step down");
-            (void)dr.update(35.0, ThermalStatus::none);
+            (void)dr.update(35.0, ThermalStatus::None);
             expect(near_s(dr.scale(), 0.95F), "dynres steps down 1 step at frame 30");
-            (void)dr.update(35.0, ThermalStatus::none);
+            (void)dr.update(35.0, ThermalStatus::None);
             expect(near_s(dr.scale(), 0.95F), "dynres resets window after stepping down");
             for (int i = 1; i < 30; ++i) {
-                (void)dr.update(35.0, ThermalStatus::none);
+                (void)dr.update(35.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 0.90F), "dynres steps down 2nd step at frame 60");
             for (int i = 0; i < 300; ++i) {
-                (void)dr.update(35.0, ThermalStatus::none);
+                (void)dr.update(35.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 0.50F), "dynres clamps at min_scale under sustained overload");
         }
@@ -2790,15 +2790,15 @@ void test_r5b_postfx_and_dynres() {
         {
             DynamicResolution dr;
             for (int i = 0; i < 30; ++i) {
-                (void)dr.update(35.0, ThermalStatus::none);
+                (void)dr.update(35.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 0.95F), "dynres drops to 0.95 before recovery test");
             for (int i = 0; i < 59; ++i) {
-                (void)dr.update(15.0, ThermalStatus::none);
+                (void)dr.update(15.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 0.95F),
                    "dynres does not recover before 2 * frames_to_decide frames");
-            (void)dr.update(15.0, ThermalStatus::none);
+            (void)dr.update(15.0, ThermalStatus::None);
             expect(near_s(dr.scale(), 1.0F),
                    "dynres steps up 1 step at 2 * frames_to_decide frames well below budget");
         }
@@ -2810,7 +2810,7 @@ void test_r5b_postfx_and_dynres() {
             const double threshold_ms = 33.3 * 0.85;
             bool changed = false;
             for (int i = 0; i < 300; ++i) {
-                const float s = dr.update(threshold_ms, ThermalStatus::none);
+                const float s = dr.update(threshold_ms, ThermalStatus::None);
                 if (!near_s(s, 1.0F)) {
                     changed = true;
                 }
@@ -2819,12 +2819,12 @@ void test_r5b_postfx_and_dynres() {
 
             // Step down to 0.85, then run at exact threshold: stays at 0.85 without oscillating.
             for (int i = 0; i < 90; ++i) {
-                (void)dr.update(35.0, ThermalStatus::none);
+                (void)dr.update(35.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 0.85F), "dynres stepped to 0.85 for deadband test");
             bool oscillated = false;
             for (int i = 0; i < 300; ++i) {
-                const float s = dr.update(threshold_ms, ThermalStatus::none);
+                const float s = dr.update(threshold_ms, ThermalStatus::None);
                 if (!near_s(s, 0.85F)) {
                     oscillated = true;
                 }
@@ -2836,27 +2836,27 @@ void test_r5b_postfx_and_dynres() {
         // and lifting thermal back to none/light allows recovery; reset() returns to max_scale.
         {
             DynamicResolution dr;
-            expect(near_s(dr.update(15.0, ThermalStatus::light), 1.0F),
+            expect(near_s(dr.update(15.0, ThermalStatus::Light), 1.0F),
                    "dynres thermal light allows max_scale");
-            expect(near_s(dr.update(15.0, ThermalStatus::moderate), 0.85F),
+            expect(near_s(dr.update(15.0, ThermalStatus::Moderate), 0.85F),
                    "dynres thermal moderate caps at 0.85");
-            expect(near_s(dr.update(15.0, ThermalStatus::severe), 0.75F),
+            expect(near_s(dr.update(15.0, ThermalStatus::Severe), 0.75F),
                    "dynres thermal severe caps at 0.75");
-            expect(near_s(dr.update(15.0, ThermalStatus::critical), 0.50F),
+            expect(near_s(dr.update(15.0, ThermalStatus::Critical), 0.50F),
                    "dynres thermal critical caps at min_scale");
-            expect(near_s(dr.update(15.0, ThermalStatus::emergency), 0.50F),
+            expect(near_s(dr.update(15.0, ThermalStatus::Emergency), 0.50F),
                    "dynres thermal emergency caps at min_scale");
-            expect(near_s(dr.update(15.0, ThermalStatus::shutdown), 0.50F),
+            expect(near_s(dr.update(15.0, ThermalStatus::Shutdown), 0.50F),
                    "dynres thermal shutdown caps at min_scale");
 
             // Lifting cap to none allows recovery over 2 * frames_to_decide per 0.05 step.
             for (int i = 0; i < 600; ++i) {
-                (void)dr.update(15.0, ThermalStatus::none);
+                (void)dr.update(15.0, ThermalStatus::None);
             }
             expect(near_s(dr.scale(), 1.0F),
                    "dynres lifting thermal to none allows recovery back to max_scale");
 
-            (void)dr.update(15.0, ThermalStatus::critical);
+            (void)dr.update(15.0, ThermalStatus::Critical);
             expect(near_s(dr.scale(), 0.50F), "dynres drops to 0.50 on critical before reset");
             dr.reset();
             expect(near_s(dr.scale(), 1.0F), "dynres reset restores max_scale");
