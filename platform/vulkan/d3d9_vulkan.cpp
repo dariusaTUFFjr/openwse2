@@ -1087,7 +1087,38 @@ struct VulkanD3d9Backend::Impl {
         VkImageView view = VK_NULL_HANDLE;
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
         std::uint64_t last_used_frame = 0;  // the frame whose draws last sampled it
+        bool render_target = false;  // created with D3DUSAGE_RENDERTARGET: drawn into, then sampled
     };
+
+    // Render targets (R5b): `IDirect3DSurface9` objects the game draws into. A surface is a level
+    // (and cube face) of a render-target texture, or a standalone render target / depth-stencil
+    // surface with its own image (CreateRenderTarget / CreateDepthStencilSurface).
+    struct SurfaceObj {
+        std::uint64_t parent_tex = 0;
+        std::uint32_t face = 0, level = 0;
+        std::uint32_t width = 0, height = 0, d3d_fmt = 0, usage = 0;
+        bool depth = false;
+        VkFormat vk_fmt = VK_FORMAT_UNDEFINED;
+        VkImage img = VK_NULL_HANDLE;  // own image (standalone surfaces only)
+        MemAlloc mem{};
+        VkImageView view = VK_NULL_HANDLE;  // attachment view: the own image, or one level/face of the parent
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;  // own image only (a texture level uses the texture's)
+    };
+    std::unordered_map<std::uint64_t, SurfaceObj> surfaces;
+    // What the current (or next) render pass draws into: `D3d9DrawState::render_target` and
+    // `depth_stencil` (0 = backbuffer / auto depth, `kNoDepthStencil` = none).
+    std::uint64_t active_rt = 0, active_ds = 0;
+    // The open render pass's attachment formats and size (pipelines, viewports and clears use them).
+    VkFormat rp_color_fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat rp_depth_fmt = VK_FORMAT_UNDEFINED;
+    std::uint32_t rp_width = 0, rp_height = 0;
+    struct FbEntry {
+        VkImageView color = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
+        std::uint32_t width = 0, height = 0;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+    };
+    std::vector<FbEntry> target_fbs;  // framebuffers for targets other than the backbuffer
+    std::unordered_map<std::uint32_t, bool> blendable_formats;  // VkFormat -> COLOR_ATTACHMENT_BLEND support
     std::unordered_map<std::uint64_t, TextureObj> textures;
 
     struct VertexDeclObj {
@@ -2147,6 +2178,12 @@ struct VulkanD3d9Backend::Impl {
             sampler_cache.clear();
             default_sampler = VK_NULL_HANDLE;
 
+            destroy_target_framebuffers();
+            for (auto& [sid, s] : surfaces) {
+                (void)sid;
+                destroy_surface_gpu(s);
+            }
+            surfaces.clear();
             for (auto& [id, buf] : buffers) {
                 (void)id;
                 destroy_buffer_gpu(buf);
@@ -2411,6 +2448,18 @@ struct VulkanD3d9Backend::Impl {
         wait_all_locked();
         sampler_set_cache.clear();
         for (VkDescriptorPool p : sampler_desc_pools) (void)vk.reset_desc_pool(h.device, p, 0U);
+        if (t.render_target) {
+            destroy_target_framebuffers();
+            for (auto& [sid, s] : surfaces) {
+                (void)sid;
+                if (s.parent_tex == 0U || s.view == VK_NULL_HANDLE) continue;
+                const auto pt = textures.find(s.parent_tex);
+                if (pt != textures.end() && pt->second.img == t.img) {
+                    vk.destroy_image_view(h.device, s.view, nullptr);
+                    s.view = VK_NULL_HANDLE;
+                }
+            }
+        }
         destroy_texture_gpu(t);
     }
 
@@ -3360,14 +3409,342 @@ struct VulkanD3d9Backend::Impl {
         return true;
     }
 
+    // --- render targets -------------------------------------------------------------------------
+    struct Target {
+        VkImage img = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkFormat fmt = VK_FORMAT_UNDEFINED;
+        std::uint32_t width = 0, height = 0, levels = 1, layers = 1;
+        VkImageLayout* layout = nullptr;
+    };
+
+    // D3DFORMAT of a render target or depth-stencil surface -> Vulkan format (`depth` set for depth).
+    VkFormat target_format(std::uint32_t fmt, bool& depth) const {
+        depth = false;
+        switch (fmt) {
+        case 111: return VK_FORMAT_R16_SFLOAT;           // D3DFMT_R16F
+        case 112: return VK_FORMAT_R16G16_SFLOAT;        // D3DFMT_G16R16F
+        case 113: return VK_FORMAT_R16G16B16A16_SFLOAT;  // D3DFMT_A16B16G16R16F
+        case 114: return VK_FORMAT_R32_SFLOAT;           // D3DFMT_R32F
+        case 115: return VK_FORMAT_R32G32_SFLOAT;        // D3DFMT_G32R32F
+        case 116: return VK_FORMAT_R32G32B32A32_SFLOAT;  // D3DFMT_A32B32G32R32F
+        case 70: case 71: case 73: case 75: case 77: case 79: case 80: case 82: case 83:  // D3DFMT_D*
+        case 0x5A544E49U:  // 'INTZ'
+            depth = true;
+            return default_depth_fmt;
+        default: return VK_FORMAT_R8G8B8A8_UNORM;  // A8R8G8B8, X8R8G8B8 and the rest, as the backbuffer
+        }
+    }
+    // Sampling view swizzle: D3D9 returns 1 for the channels a format lacks (R16F reads (r, 1, 1, 1)).
+    static VkComponentMapping sample_swizzle(std::uint32_t fmt) {
+        VkComponentMapping m{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+        if (fmt == 111 || fmt == 114) m.g = m.b = m.a = VK_COMPONENT_SWIZZLE_ONE;
+        if (fmt == 112 || fmt == 115) m.b = m.a = VK_COMPONENT_SWIZZLE_ONE;
+        if (fmt == 22) m.a = VK_COMPONENT_SWIZZLE_ONE;  // X8R8G8B8
+        return m;
+    }
+
+    void image_barrier(VkImage img, VkImageAspectFlags aspect, std::uint32_t levels, std::uint32_t layers,
+                       VkImageLayout from, VkImageLayout to, VkPipelineStageFlags src_stage, VkAccessFlags src_access,
+                       VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+        VkImageMemoryBarrier bar{};
+        bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        bar.oldLayout = from;
+        bar.newLayout = to;
+        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.image = img;
+        bar.subresourceRange = {aspect, 0U, levels, 0U, layers};
+        bar.srcAccessMask = src_access;
+        bar.dstAccessMask = dst_access;
+        vk.cmd_pipeline_barrier(frame_cmd, src_stage, dst_stage, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+    }
+
+    // Gives a D3DUSAGE_RENDERTARGET texture its image now (drawn into before any upload), cleared to
+    // zero and ready to sample. Depth textures (INTZ) are not supported yet: they sample as the dummy.
+    bool make_target_texture(TextureObj& t) {
+        bool depth = false;
+        const VkFormat fmt = target_format(t.d3d_fmt, depth);
+        if (depth) return false;
+        destroy_texture_gpu(t);
+        const std::uint32_t layers = (t.kind == 1) ? 6U : 1U;
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.flags = (t.kind == 1) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0U;
+        ici.format = fmt;
+        ici.extent = {t.width, t.height, 1U};
+        ici.mipLevels = t.levels;
+        ici.arrayLayers = layers;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vk.create_image(h.device, &ici, nullptr, &t.img) != VK_SUCCESS) {
+            t.img = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements reqs{};
+        vk.get_image_mem_reqs(h.device, t.img, &reqs);
+        if (!alloc.alloc(reqs, true, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0U, t.mem, &last_error) ||
+            vk.bind_image_memory(h.device, t.img, t.mem.memory, t.mem.offset) != VK_SUCCESS) {
+            destroy_texture_gpu(t);
+            return false;
+        }
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = t.img;
+        ivci.viewType = (t.kind == 1) ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = fmt;
+        ivci.components = sample_swizzle(t.d3d_fmt);
+        ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, t.levels, 0U, layers};
+        if (vk.create_image_view(h.device, &ivci, nullptr, &t.view) != VK_SUCCESS) {
+            destroy_texture_gpu(t);
+            return false;
+        }
+        t.vk_fmt = fmt;
+        t.is_bc = false;
+        t.render_target = true;
+        // Cleared with the frame's uploads, before its draws.
+        const VkCommandBuffer cmd = begin_upload_locked(false);
+        if (cmd == VK_NULL_HANDLE) return false;
+        VkImageMemoryBarrier bar{};
+        bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.image = t.img;
+        bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, t.levels, 0U, layers};
+        bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vk.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr,
+                                0U, nullptr, 1U, &bar);
+        const VkClearColorValue zero{};
+        vk.cmd_clear_color_image(cmd, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1U, &bar.subresourceRange);
+        bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vk.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+        t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        return true;
+    }
+
+    bool create_surface_image(SurfaceObj& s) {
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = s.vk_fmt;
+        ici.extent = {std::max<std::uint32_t>(1U, s.width), std::max<std::uint32_t>(1U, s.height), 1U};
+        ici.mipLevels = 1U;
+        ici.arrayLayers = 1U;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = s.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                            : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_SAMPLED_BIT);
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vk.create_image(h.device, &ici, nullptr, &s.img) != VK_SUCCESS) {
+            s.img = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements reqs{};
+        vk.get_image_mem_reqs(h.device, s.img, &reqs);
+        if (!alloc.alloc(reqs, true, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0U, s.mem, &last_error) ||
+            vk.bind_image_memory(h.device, s.img, s.mem.memory, s.mem.offset) != VK_SUCCESS) {
+            vk.destroy_image(h.device, s.img, nullptr);
+            s.img = VK_NULL_HANDLE;
+            alloc.free(s.mem);
+            return false;
+        }
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = s.img;
+        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = s.vk_fmt;
+        ivci.subresourceRange = {static_cast<VkImageAspectFlags>(s.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
+                                 0U, 1U, 0U, 1U};
+        if (vk.create_image_view(h.device, &ivci, nullptr, &s.view) != VK_SUCCESS) {
+            s.view = VK_NULL_HANDLE;
+            return false;
+        }
+        s.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        return true;
+    }
+
+    void destroy_surface_gpu(SurfaceObj& s) noexcept {
+        if (s.view != VK_NULL_HANDLE) vk.destroy_image_view(h.device, s.view, nullptr);
+        s.view = VK_NULL_HANDLE;
+        if (s.img != VK_NULL_HANDLE) vk.destroy_image(h.device, s.img, nullptr);
+        s.img = VK_NULL_HANDLE;
+        alloc.free(s.mem);
+    }
+
+    void destroy_target_framebuffers() noexcept {
+        for (FbEntry& e : target_fbs) {
+            if (e.fb != VK_NULL_HANDLE) vk.destroy_framebuffer(h.device, e.fb, nullptr);
+        }
+        target_fbs.clear();
+    }
+
+    // Color target `id` (0 = backbuffer). False when it cannot be drawn into.
+    bool color_target(std::uint64_t id, Target& out) {
+        if (id == 0U) {
+            out = {bb_img, bb_view, VK_FORMAT_R8G8B8A8_UNORM, bb_width, bb_height, 1U, 1U, &bb_layout};
+            return bb_img != VK_NULL_HANDLE;
+        }
+        const auto it = surfaces.find(id);
+        if (it == surfaces.end() || it->second.depth) return false;
+        SurfaceObj& s = it->second;
+        if (s.parent_tex == 0U) {
+            if (s.view == VK_NULL_HANDLE) return false;
+            out = {s.img, s.view, s.vk_fmt, s.width, s.height, 1U, 1U, &s.layout};
+            return true;
+        }
+        const auto tex = textures.find(s.parent_tex);
+        if (tex == textures.end() || !tex->second.render_target || tex->second.img == VK_NULL_HANDLE) return false;
+        TextureObj& t = tex->second;
+        const std::uint32_t layers = (t.kind == 1) ? 6U : 1U;
+        if (s.level >= t.levels || s.face >= layers) return false;
+        if (s.view == VK_NULL_HANDLE) {
+            VkImageViewCreateInfo ivci{};
+            ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            ivci.image = t.img;
+            ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            ivci.format = t.vk_fmt;
+            ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, s.level, 1U, s.face, 1U};
+            if (vk.create_image_view(h.device, &ivci, nullptr, &s.view) != VK_SUCCESS) {
+                s.view = VK_NULL_HANDLE;
+                return false;
+            }
+        }
+        out = {t.img, s.view, t.vk_fmt, std::max<std::uint32_t>(1U, t.width >> s.level),
+               std::max<std::uint32_t>(1U, t.height >> s.level), t.levels, layers, &t.layout};
+        return true;
+    }
+
+    // Depth target `id` (0 = the automatic depth surface, `kNoDepthStencil` = none).
+    bool depth_target(std::uint64_t id, Target& out) {
+        if (id == wse::recomp::kNoDepthStencil) return false;
+        if (id == 0U) {
+            out = {depth_img, depth_view, default_depth_fmt, bb_width, bb_height, 1U, 1U, &depth_layout};
+            return depth_img != VK_NULL_HANDLE;
+        }
+        const auto it = surfaces.find(id);
+        if (it == surfaces.end() || !it->second.depth || it->second.view == VK_NULL_HANDLE) return false;
+        SurfaceObj& s = it->second;
+        out = {s.img, s.view, s.vk_fmt, s.width, s.height, 1U, 1U, &s.layout};
+        return true;
+    }
+
+    VkFramebuffer target_framebuffer(const Target& c, const Target* d) {
+        const VkImageView dv = d != nullptr ? d->view : VK_NULL_HANDLE;
+        for (const FbEntry& e : target_fbs) {
+            if (e.color == c.view && e.depth == dv && e.width == c.width && e.height == c.height) return e.fb;
+        }
+        VkRenderPass compat = get_render_pass({c.fmt, d != nullptr ? d->fmt : VK_FORMAT_UNDEFINED, true, true});
+        if (compat == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+        std::array<VkImageView, 2> views{c.view, dv};
+        VkFramebufferCreateInfo fbci{};
+        fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbci.renderPass = compat;
+        fbci.attachmentCount = d != nullptr ? 2U : 1U;
+        fbci.pAttachments = views.data();
+        fbci.width = c.width;
+        fbci.height = c.height;
+        fbci.layers = 1U;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        if (vk.create_framebuffer(h.device, &fbci, nullptr, &fb) != VK_SUCCESS) return VK_NULL_HANDLE;
+        target_fbs.push_back({c.view, dv, c.width, c.height, fb});
+        return fb;
+    }
+
+    // A render-target texture the game stops drawing into goes back to being sampled.
+    void leave_target(std::uint64_t id) {
+        if (id == 0U) return;
+        const auto it = surfaces.find(id);
+        if (it == surfaces.end() || it->second.parent_tex == 0U) return;
+        const auto tex = textures.find(it->second.parent_tex);
+        if (tex == textures.end() || tex->second.img == VK_NULL_HANDLE ||
+            tex->second.layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL || !ensure_frame_recording()) {
+            return;
+        }
+        TextureObj& t = tex->second;
+        image_barrier(t.img, VK_IMAGE_ASPECT_COLOR_BIT, t.levels, (t.kind == 1) ? 6U : 1U,
+                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT);
+        t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    // Points the next render pass at the draw state's targets, closing the current one (and
+    // running a pending clear on the old target first) when they change.
+    void select_targets(const wse::recomp::D3d9DrawState& st) {
+        if (st.render_target == active_rt && st.depth_stencil == active_ds) return;
+        if (!render_pass_active && (pending_clear_color || pending_clear_depth)) (void)ensure_render_pass_active();
+        if (render_pass_active) {
+            vk.cmd_end_render_pass(frame_cmd);
+            render_pass_active = false;
+        }
+        leave_target(active_rt);
+        active_rt = st.render_target;
+        active_ds = st.depth_stencil;
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_sampler_set = VK_NULL_HANDLE;
+    }
+
+    bool format_blendable(VkFormat f) {
+        if (const auto it = blendable_formats.find(static_cast<std::uint32_t>(f)); it != blendable_formats.end()) {
+            return it->second;
+        }
+        VkFormatProperties fp{};
+        vk.get_phys_format_props(h.physical_device, f, &fp);
+        const bool ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0U;
+        blendable_formats.emplace(static_cast<std::uint32_t>(f), ok);
+        return ok;
+    }
+
     bool ensure_render_pass_active() {
         if (!ensure_frame_recording()) return false;
         if (render_pass_active) return true;
 
-        const bool do_clear_c = pending_clear_color || bb_layout == VK_IMAGE_LAYOUT_UNDEFINED;
-        const bool do_clear_d = pending_clear_depth || depth_layout == VK_IMAGE_LAYOUT_UNDEFINED;
-        VkRenderPass rp = get_render_pass({VK_FORMAT_R8G8B8A8_UNORM, default_depth_fmt, do_clear_c, do_clear_d});
+        Target ct{};
+        if (!color_target(active_rt, ct)) {
+            active_rt = 0U;  // a target that cannot be drawn into: draw to the backbuffer instead
+            if (!color_target(0U, ct)) return false;
+        }
+        Target dt{};
+        bool has_depth = depth_target(active_ds, dt);
+        if (has_depth && (dt.width < ct.width || dt.height < ct.height)) has_depth = false;  // D3D9 needs depth >= target
+
+        const bool do_clear_c = pending_clear_color || *ct.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+        const bool do_clear_d = has_depth && (pending_clear_depth || *dt.layout == VK_IMAGE_LAYOUT_UNDEFINED);
+        // A target that was sampled (or freshly cleared) becomes an attachment, keeping its contents.
+        if (!do_clear_c && *ct.layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+            image_barrier(ct.img, VK_IMAGE_ASPECT_COLOR_BIT, ct.levels, ct.layers, *ct.layout,
+                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0U, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+            *ct.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        }
+        const VkFormat depth_fmt = has_depth ? dt.fmt : VK_FORMAT_UNDEFINED;
+        VkRenderPass rp = get_render_pass({ct.fmt, depth_fmt, do_clear_c, do_clear_d});
         if (rp == VK_NULL_HANDLE) return false;
+        VkFramebuffer fb = (active_rt == 0U && has_depth && active_ds == 0U)
+                               ? bb_fb
+                               : target_framebuffer(ct, has_depth ? &dt : nullptr);
+        if (fb == VK_NULL_HANDLE) return false;
 
         std::array<VkClearValue, 2> cv{};
         cv[0].color.float32[0] = clear_color_val[0];
@@ -3379,17 +3756,21 @@ struct VulkanD3d9Backend::Impl {
         VkRenderPassBeginInfo rpbi{};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = rp;
-        rpbi.framebuffer = bb_fb;
-        rpbi.renderArea = {{0, 0}, {bb_width, bb_height}};
-        rpbi.clearValueCount = 2U;
+        rpbi.framebuffer = fb;
+        rpbi.renderArea = {{0, 0}, {ct.width, ct.height}};
+        rpbi.clearValueCount = has_depth ? 2U : 1U;
         rpbi.pClearValues = cv.data();
         vk.cmd_begin_render_pass(frame_cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
         render_pass_active = true;
-        frame_touched_rt = true;
+        if (active_rt == 0U) frame_touched_rt = true;
         pending_clear_color = false;
         pending_clear_depth = false;
-        bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        depth_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        *ct.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        if (has_depth) *dt.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        rp_color_fmt = ct.fmt;
+        rp_depth_fmt = depth_fmt;
+        rp_width = ct.width;
+        rp_height = ct.height;
         bound_pipeline = VK_NULL_HANDLE;
         bound_sampler_set = VK_NULL_HANDLE;
         return true;
@@ -3720,6 +4101,7 @@ struct VulkanD3d9Backend::Impl {
     bool prepare_draw(const D3d9DrawState& st, std::uint32_t prim_type,
                       std::uint32_t& out_instance_count) {
         if (!gpu_ready) return false;
+        select_targets(st);
         const auto vs_hid = shader_id_to_hash.find(st.vs);
         const auto ps_hid = shader_id_to_hash.find(st.ps);
         if (vs_hid == shader_id_to_hash.end() || ps_hid == shader_id_to_hash.end()) return false;
@@ -3782,8 +4164,8 @@ struct VulkanD3d9Backend::Impl {
         for (std::uint32_t s = 0; s < 16U; ++s) pkey.stream_strides[s] = st.streams[s].stride;
         pkey.instance_mask = inst_mask;
         pkey.stream_present_mask = present_mask;
-        pkey.color_fmt = VK_FORMAT_R8G8B8A8_UNORM;
-        pkey.depth_fmt = default_depth_fmt;
+        pkey.color_fmt = rp_color_fmt;
+        pkey.depth_fmt = rp_depth_fmt;
         pkey.prim_type = static_cast<std::uint8_t>(prim_type);
         pkey.cull_mode = static_cast<std::uint8_t>(st.rs[22]);
         pkey.fill_mode = static_cast<std::uint8_t>(st.rs[8]);
@@ -3800,6 +4182,7 @@ struct VulkanD3d9Backend::Impl {
         pkey.dst_alpha = static_cast<std::uint8_t>(st.rs[208]);
         pkey.op_alpha = static_cast<std::uint8_t>(st.rs[209]);
         pkey.color_mask = static_cast<std::uint8_t>(st.rs[168] & 0xFU);
+        if (pkey.blend_enable != 0U && !format_blendable(rp_color_fmt)) pkey.blend_enable = 0U;  // e.g. R32F
 
         VkPipeline pip = get_pipeline(pkey, vs, ps, decl);
         if (pip == VK_NULL_HANDLE) return false;
@@ -3809,8 +4192,8 @@ struct VulkanD3d9Backend::Impl {
         }
 
         // Dynamic viewport, scissor, depth bias, blend constants.
-        const std::uint32_t vpw = st.viewport.width != 0U ? st.viewport.width : bb_width;
-        const std::uint32_t vph = st.viewport.height != 0U ? st.viewport.height : bb_height;
+        const std::uint32_t vpw = st.viewport.width != 0U ? st.viewport.width : rp_width;
+        const std::uint32_t vph = st.viewport.height != 0U ? st.viewport.height : rp_height;
         VkViewport vvp{};
         vvp.x = static_cast<float>(st.viewport.x);
         vvp.y = static_cast<float>(st.viewport.y);
@@ -3822,10 +4205,10 @@ struct VulkanD3d9Backend::Impl {
 
         VkRect2D sci{};
         if (st.rs[174] != 0U) {  // D3DRS_SCISSORTESTENABLE
-            const std::int32_t l = std::clamp<std::int32_t>(st.scissor.left, 0, static_cast<std::int32_t>(bb_width));
-            const std::int32_t t = std::clamp<std::int32_t>(st.scissor.top, 0, static_cast<std::int32_t>(bb_height));
-            const std::int32_t r = std::clamp<std::int32_t>(st.scissor.right, l, static_cast<std::int32_t>(bb_width));
-            const std::int32_t b = std::clamp<std::int32_t>(st.scissor.bottom, t, static_cast<std::int32_t>(bb_height));
+            const std::int32_t l = std::clamp<std::int32_t>(st.scissor.left, 0, static_cast<std::int32_t>(rp_width));
+            const std::int32_t t = std::clamp<std::int32_t>(st.scissor.top, 0, static_cast<std::int32_t>(rp_height));
+            const std::int32_t r = std::clamp<std::int32_t>(st.scissor.right, l, static_cast<std::int32_t>(rp_width));
+            const std::int32_t b = std::clamp<std::int32_t>(st.scissor.bottom, t, static_cast<std::int32_t>(rp_height));
             sci = {{l, t}, {static_cast<std::uint32_t>(r - l), static_cast<std::uint32_t>(b - t)}};
         } else {
             sci = {{static_cast<std::int32_t>(st.viewport.x), static_cast<std::int32_t>(st.viewport.y)}, {vpw, vph}};
@@ -4025,7 +4408,8 @@ void VulkanD3d9Backend::create_texture(std::uint64_t id, int kind, std::uint32_t
     t.levels = std::max<std::uint32_t>(1U, levels);
     t.d3d_fmt = fmt;
     t.usage = usage;
-    impl_->textures.emplace(id, std::move(t));
+    auto& stored = impl_->textures.emplace(id, std::move(t)).first->second;
+    if ((usage & 1U) != 0U && impl_->gpu_ready) (void)impl_->make_target_texture(stored);  // D3DUSAGE_RENDERTARGET
 }
 
 void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t face, std::uint32_t level,
@@ -4037,7 +4421,7 @@ void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t fac
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
     Impl::TextureObj& t = it->second;
-    if (level >= t.levels) return;
+    if (level >= t.levels || t.render_target) return;
     const std::uint32_t layers = (t.kind == 1) ? 6U : 1U;
     if (face >= layers) return;
 
@@ -4217,10 +4601,46 @@ void VulkanD3d9Backend::destroy_texture(std::uint64_t id) {
 void VulkanD3d9Backend::create_surface(std::uint64_t id, std::uint32_t width, std::uint32_t height,
                                        std::uint32_t fmt, std::uint32_t usage,
                                        std::uint64_t parent_tex, std::uint32_t face, std::uint32_t level) {
-    (void)id; (void)width; (void)height; (void)fmt; (void)usage; (void)parent_tex; (void)face; (void)level;
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    if (const auto old = impl_->surfaces.find(id); old != impl_->surfaces.end()) {
+        if (impl_->gpu_ready && old->second.view != VK_NULL_HANDLE) {
+            impl_->wait_all_locked();
+            impl_->destroy_target_framebuffers();
+            impl_->destroy_surface_gpu(old->second);
+        }
+        impl_->surfaces.erase(old);
+    }
+    Impl::SurfaceObj s{};
+    s.parent_tex = parent_tex;
+    s.face = face;
+    s.level = level;
+    s.width = std::max<std::uint32_t>(1U, width);
+    s.height = std::max<std::uint32_t>(1U, height);
+    s.d3d_fmt = fmt;
+    s.usage = usage;
+    bool depth_fmt = false;
+    s.vk_fmt = impl_->target_format(fmt, depth_fmt);
+    s.depth = depth_fmt || (usage & 2U) != 0U;
+    if (s.depth && !depth_fmt) s.vk_fmt = impl_->default_depth_fmt;
+    // Standalone render targets and depth-stencil surfaces get their own image; a texture level
+    // uses its texture's (its attachment view is made on first use); offscreen plain surfaces none.
+    if (parent_tex == 0U && (usage & 3U) != 0U && impl_->gpu_ready) (void)impl_->create_surface_image(s);
+    impl_->surfaces.emplace(id, std::move(s));
 }
 
-void VulkanD3d9Backend::destroy_surface(std::uint64_t id) { (void)id; }
+void VulkanD3d9Backend::destroy_surface(std::uint64_t id) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    const auto it = impl_->surfaces.find(id);
+    if (it == impl_->surfaces.end()) return;
+    if (impl_->gpu_ready && it->second.view != VK_NULL_HANDLE) {
+        impl_->wait_all_locked();
+        impl_->destroy_target_framebuffers();
+        impl_->destroy_surface_gpu(it->second);
+    }
+    if (impl_->active_rt == id) impl_->active_rt = 0U;
+    if (impl_->active_ds == id) impl_->active_ds = 0U;
+    impl_->surfaces.erase(it);
+}
 
 void VulkanD3d9Backend::create_vertex_decl(std::uint64_t id, std::span<const D3d9VertexElement> elems) {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
@@ -4269,21 +4689,28 @@ void VulkanD3d9Backend::clear(const D3d9DrawState& state, std::uint32_t flags, s
                               float z, std::uint32_t stencil, std::span<const D3d9Rect> rects) {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     if (!impl_->gpu_ready || flags == 0U) return;
+    impl_->select_targets(state);
+    // The size of what this clear hits (the active render target).
+    Impl::Target ct{};
+    if (!impl_->color_target(impl_->active_rt, ct)) (void)impl_->color_target(0U, ct);
+    Impl::Target dt{};
+    const bool has_depth = impl_->depth_target(impl_->active_ds, dt) && dt.width >= ct.width && dt.height >= ct.height;
+    const std::uint32_t tw = ct.width, th = ct.height;
     const float r = static_cast<float>((argb >> 16) & 0xFFU) / 255.0F;
     const float g = static_cast<float>((argb >> 8) & 0xFFU) / 255.0F;
     const float b = static_cast<float>(argb & 0xFFU) / 255.0F;
     const float a = static_cast<float>((argb >> 24) & 0xFFU) / 255.0F;
     const bool clr_c = (flags & 1U) != 0U;
-    const bool clr_d = (flags & 2U) != 0U;
-    const bool clr_s = (flags & 4U) != 0U && has_stencil_aspect(impl_->default_depth_fmt);
+    const bool clr_d = (flags & 2U) != 0U && has_depth;
+    const bool clr_s = (flags & 4U) != 0U && has_depth && has_stencil_aspect(dt.fmt);
 
-    const std::uint32_t vpw = state.viewport.width != 0U ? state.viewport.width : impl_->bb_width;
-    const std::uint32_t vph = state.viewport.height != 0U ? state.viewport.height : impl_->bb_height;
+    const std::uint32_t vpw = state.viewport.width != 0U ? state.viewport.width : tw;
+    const std::uint32_t vph = state.viewport.height != 0U ? state.viewport.height : th;
     const bool full_area = rects.empty() && state.rs[174] == 0U &&
                            state.viewport.x == 0U && state.viewport.y == 0U &&
-                           vpw == impl_->bb_width && vph == impl_->bb_height;
+                           vpw == tw && vph == th;
 
-    if (!impl_->render_pass_active && full_area && !impl_->frame_touched_rt) {
+    if (!impl_->render_pass_active && full_area && (impl_->active_rt != 0U || !impl_->frame_touched_rt)) {
         if (clr_c) {
             impl_->clear_color_val = {r, g, b, a};
             impl_->pending_clear_color = true;
@@ -4320,17 +4747,17 @@ void VulkanD3d9Backend::clear(const D3d9DrawState& state, std::uint32_t flags, s
     if (rects.empty()) {
         VkClearRect cr{};
         cr.rect = {{static_cast<std::int32_t>(state.viewport.x), static_cast<std::int32_t>(state.viewport.y)},
-                   {std::min(vpw, impl_->bb_width - std::min(state.viewport.x, impl_->bb_width)),
-                    std::min(vph, impl_->bb_height - std::min(state.viewport.y, impl_->bb_height))}};
+                   {std::min(vpw, tw - std::min(state.viewport.x, tw)),
+                    std::min(vph, th - std::min(state.viewport.y, th))}};
         cr.baseArrayLayer = 0U;
         cr.layerCount = 1U;
         if (cr.rect.extent.width > 0U && cr.rect.extent.height > 0U) vk_rects.push_back(cr);
     } else {
         for (const D3d9Rect& rc : rects) {
-            const std::int32_t l = std::clamp<std::int32_t>(rc.left, 0, static_cast<std::int32_t>(impl_->bb_width));
-            const std::int32_t t = std::clamp<std::int32_t>(rc.top, 0, static_cast<std::int32_t>(impl_->bb_height));
-            const std::int32_t ri = std::clamp<std::int32_t>(rc.right, l, static_cast<std::int32_t>(impl_->bb_width));
-            const std::int32_t bt = std::clamp<std::int32_t>(rc.bottom, t, static_cast<std::int32_t>(impl_->bb_height));
+            const std::int32_t l = std::clamp<std::int32_t>(rc.left, 0, static_cast<std::int32_t>(tw));
+            const std::int32_t t = std::clamp<std::int32_t>(rc.top, 0, static_cast<std::int32_t>(th));
+            const std::int32_t ri = std::clamp<std::int32_t>(rc.right, l, static_cast<std::int32_t>(tw));
+            const std::int32_t bt = std::clamp<std::int32_t>(rc.bottom, t, static_cast<std::int32_t>(th));
             if (ri > l && bt > t) {
                 vk_rects.push_back({{{l, t}, {static_cast<std::uint32_t>(ri - l), static_cast<std::uint32_t>(bt - t)}}, 0U, 1U});
             }

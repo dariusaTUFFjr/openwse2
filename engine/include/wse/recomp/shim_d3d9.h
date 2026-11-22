@@ -640,6 +640,10 @@ private:
         const std::uint64_t s = create(Kind::surface, 0, d, parent, true);
         Obj* so = obj(s);
         so->memory_index = index;
+        if (backend != nullptr) {
+            const std::uint32_t face = static_cast<std::uint32_t>(index / std::max<std::uint32_t>(1U, p->desc.levels));
+            backend->create_surface(s, d.width, d.height, p->desc.format, p->desc.usage, parent, face, level);
+        }
         const std::lock_guard<std::mutex> lock(m_);
         p->children[index] = s;
         return s;
@@ -1179,24 +1183,45 @@ inline void D3d9::build_vtables() {
         {"CreateOffscreenPlainSurface", [this, ret](CpuState& s, Obj&, std::uint64_t self) { ret(s, plain_surface(s, self, 5, 0)); }},
         {"GetRenderTargetData", [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 0); }},
         {"GetFrontBufferData", [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 0); }},
+        // GetRenderTarget / GetDepthStencilSurface: the surfaces currently set (games save and restore them).
         {"GetRenderTarget", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
-             put_ref(*this, win64_arg(s, 2), win64_arg(s, 1) == 0 ? dev(self)->backbuffer : 0);
+             DeviceState* st = dev(self);
+             const std::uint64_t rt = st->draw.render_target != 0 ? st->draw.render_target : st->backbuffer;
+             put_ref(*this, win64_arg(s, 2), win64_arg(s, 1) == 0 ? rt : 0);
              ret(s, win64_arg(s, 1) == 0 ? 0 : kD3dErrNotAvailable);
          }},
         {"GetDepthStencilSurface", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
-             put_ref(*this, win64_arg(s, 1), dev(self)->depth);
-             ret(s, dev(self)->depth != 0 ? 0 : kD3dErrNotAvailable);
+             DeviceState* st = dev(self);
+             const std::uint64_t ds = st->draw.depth_stencil == kNoDepthStencil ? 0
+                                      : st->draw.depth_stencil != 0      ? st->draw.depth_stencil
+                                                                         : st->depth;
+             put_ref(*this, win64_arg(s, 1), ds);
+             ret(s, ds != 0 ? 0 : kD3dErrNotAvailable);
          }},
         {"SetRenderTarget", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
              first_call("IDirect3DDevice9::SetRenderTarget");
              DeviceState* st = dev(self);
-             if (win64_arg(s, 1) == 0) st->draw.render_target = (win64_arg(s, 2) == st->backbuffer) ? 0 : win64_arg(s, 2);
+             if (win64_arg(s, 1) == 0) {
+                 const std::uint64_t surf = win64_arg(s, 2);
+                 if (surf == 0) return ret(s, kD3dErrInvalidCall);  // render target 0 cannot be NULL
+                 st->draw.render_target = (surf == st->backbuffer) ? 0 : surf;
+                 // D3D9 resets the viewport (and the scissor rectangle) to the new target's size.
+                 if (Obj* so = obj(surf); so != nullptr) {
+                     st->viewport = {0, 0, so->desc.width, so->desc.height, 0, 0};
+                     const float one = 1.0F;
+                     std::memcpy(&st->viewport[5], &one, 4);
+                     st->scissor = {0, 0, static_cast<std::int32_t>(so->desc.width), static_cast<std::int32_t>(so->desc.height)};
+                     st->draw.viewport = {0, 0, so->desc.width, so->desc.height, 0.0F, 1.0F};
+                     st->draw.scissor = {0, 0, static_cast<std::int32_t>(so->desc.width), static_cast<std::int32_t>(so->desc.height)};
+                 }
+             }
              ret(s, 0);
          }},
         {"SetDepthStencilSurface", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
              first_call("IDirect3DDevice9::SetDepthStencilSurface");
              DeviceState* st = dev(self);
-             st->draw.depth_stencil = (win64_arg(s, 1) == st->depth) ? 0 : win64_arg(s, 1);
+             const std::uint64_t surf = win64_arg(s, 1);
+             st->draw.depth_stencil = surf == 0 ? kNoDepthStencil : (surf == st->depth) ? 0 : surf;
              ret(s, 0);
          }},
         {"SetRenderState", [this, ret](CpuState& s, Obj&, std::uint64_t self) {

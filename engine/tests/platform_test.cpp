@@ -3090,6 +3090,24 @@ void test_r5a_vulkan_d3d9_backend() {
             expect(bk.present(&rgba, &rw, &rh) && rw == 64 && rh == 64 && rgba.size() == 64U * 64U * 4U &&
                        bk.compiled_shader_count() == 2U && bk.failed_shader_count() == 0U,
                    "R5a VulkanD3d9Backend: mock shaders compile cleanly and present succeeds");
+
+            // R5b render-to-texture: an R32F render-target texture, a standalone depth surface, a
+            // draw into them, then back to the backbuffer sampling the texture (paths + teardown).
+            bk.create_texture(10, 0, 32, 32, 1, 1, 114, 1);
+            bk.create_surface(11, 32, 32, 114, 1, 10, 0, 0);
+            bk.create_surface(12, 32, 32, 75, 2, 0, 0, 0);
+            D3d9DrawState rt = st;
+            rt.render_target = 11;
+            rt.depth_stencil = 12;
+            rt.viewport = {0, 0, 32, 32, 0.0F, 1.0F};
+            bk.clear(rt, 3, 0xFF800000U, 1.0F, 0, {});
+            bk.draw_indexed(rt, 4, 0, 0, 4, 0, 2);
+            st.textures[0] = 10;
+            bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+            expect(bk.present(&rgba, &rw, &rh) && bk.failed_shader_count() == 0U,
+                   "R5b VulkanD3d9Backend: render-to-texture paths run on the mock ICD");
+            bk.destroy_surface(11);
+            bk.destroy_texture(10);
         }
         const MockVulkanObjectStats after = mock_vulkan_object_stats();
         expect(after.live_objects == before.live_objects &&
@@ -3230,6 +3248,73 @@ void test_r5a_vulkan_d3d9_backend() {
             expect(px_ok && bk.compiled_shader_count() == 2U && bk.failed_shader_count() == 0U,
                    allow_bgra_vtx ? "R5a VulkanD3d9Backend (system): exact alpha-test + textured D3DCOLOR pixels (native BGRA)"
                                   : "R5a VulkanD3d9Backend (system): exact alpha-test + textured D3DCOLOR pixels (shader BGRA swizzle)");
+        }
+
+        // R5b render-to-texture on a real GPU: draw into an R32F render-target texture (cleared to
+        // 128/255, the quad writes 220/255 into red), then sample it on the backbuffer. R32F reads
+        // back as (r, 1, 1, 1) as in D3D9, so the backbuffer gets R = r * 220, G = 50, B = 20.
+        {
+            auto loader = std::make_shared<VulkanDriverLoader>();
+            std::string err;
+            VulkanDriverProbeResult probe{};
+            if (!loader->load_system(&err) || !loader->probe_and_create_device(probe)) {
+                expect(false, "R5b render-to-texture (system): open real Vulkan device");
+            } else {
+                VulkanD3d9Backend bk(loader);
+                expect(bk.init(64, 64, 22, 75, &err), "R5b render-to-texture (system): init");
+                bk.create_shader(1, false, vs_bytes);
+                bk.create_shader(2, true, ps_bytes);
+                bk.create_vertex_decl(3, decl);
+                bk.create_buffer(4, false, sizeof(verts), false, 100);
+                bk.update_buffer(4, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)), 0U);
+                bk.create_buffer(5, true, sizeof(indices), false, 101);
+                bk.update_buffer(5, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)), 0U);
+                const std::array<std::uint8_t, 16> white{255, 255, 255, 255, 255, 255, 255, 255,
+                                                         255, 255, 255, 255, 255, 255, 255, 255};
+                bk.create_texture(6, 0, 2, 2, 1, 1, 21, 0);
+                bk.upload_texture_level(6, 0, 0, white, 8);
+                bk.create_texture(10, 0, 32, 32, 1, 1, 114, 1);  // R32F, D3DUSAGE_RENDERTARGET
+                bk.create_surface(11, 32, 32, 114, 1, 10, 0, 0);
+
+                D3d9DrawState st;
+                st.vs = 1; st.ps = 2; st.decl = 3; st.indices = 5;
+                st.streams[0] = {4, 0, sizeof(QuadVtx), 1};
+                st.samplers[0].address_u = 3;
+                st.samplers[0].address_v = 3;
+                st.samplers[0].mag_filter = 1;
+                st.samplers[0].min_filter = 1;
+                st.rs[7] = 0;   // no depth test
+                st.rs[22] = 1;  // no culling
+
+                D3d9DrawState rt = st;
+                rt.render_target = 11;
+                rt.depth_stencil = kNoDepthStencil;
+                rt.textures[0] = 6;
+                rt.viewport = {0, 0, 32, 32, 0.0F, 1.0F};
+                bk.clear(rt, 1, 0xFF800000U, 1.0F, 0, {});
+                bk.draw_indexed(rt, 4, 0, 0, 4, 0, 2);
+
+                st.textures[0] = 10;
+                st.viewport = {0, 0, 64, 64, 0.0F, 1.0F};
+                bk.clear(st, 3, 0xFF102040U, 1.0F, 0, {});
+                bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+                std::vector<std::uint8_t> rgba;
+                std::uint32_t rw = 0, rh = 0;
+                const bool pok = bk.present(&rgba, &rw, &rh) && rgba.size() == 64U * 64U * 4U;
+                // Backbuffer pixel (32, 32): u = v = 0.5 -> inside the quad drawn into the target (r = 220/255).
+                // Backbuffer pixel (10, 32): u ~ 0.05 -> the target's cleared border (r = 128/255).
+                auto near = [](int a, int b) { return a - b <= 1 && b - a <= 1; };
+                const std::size_t mid = (32U * 64U + 32U) * 4U;
+                const std::size_t edge = (32U * 64U + 10U) * 4U;
+                const bool px_ok = pok && near(rgba[mid + 0], 190) && rgba[mid + 1] == 50 && rgba[mid + 2] == 20 &&
+                                   near(rgba[edge + 0], 110) && rgba[edge + 1] == 50 && rgba[edge + 2] == 20;
+                if (!px_ok && pok) {
+                    std::printf("  render-to-texture pixels: mid %d,%d,%d edge %d,%d,%d\n", rgba[mid], rgba[mid + 1],
+                                rgba[mid + 2], rgba[edge], rgba[edge + 1], rgba[edge + 2]);
+                }
+                expect(px_ok && bk.failed_shader_count() == 0U,
+                       "R5b render-to-texture (system): R32F target drawn, then sampled as (r, 1, 1, 1)");
+            }
         }
     }
 }

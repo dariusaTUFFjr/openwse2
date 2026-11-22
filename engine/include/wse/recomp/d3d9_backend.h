@@ -99,6 +99,10 @@ struct D3d9Rect {
     std::int32_t bottom = 0;
 };
 
+// `D3d9DrawState::depth_stencil` when the game set no depth-stencil surface
+// (`SetDepthStencilSurface(NULL)`); 0 means the device's automatic one.
+inline constexpr std::uint64_t kNoDepthStencil = ~0ULL;
+
 struct D3d9DrawState {
     std::uint64_t vs = 0;
     std::uint64_t ps = 0;
@@ -525,6 +529,7 @@ public:
             state_.reset_defaults();
             state_.viewport = {0, 0, w, h, 0.0F, 1.0F};
             state_.scissor = {0, 0, static_cast<std::int32_t>(w), static_cast<std::int32_t>(h)};
+            bb_size_ = {w, h};
             if (m == "CreateDevice") {
                 if (!backend_.init(w, h, fmt, dfmt, error_out)) return false;
             } else {
@@ -799,7 +804,7 @@ public:
                     const auto lv = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(c.args[2]));
                     const auto usg = static_cast<std::uint32_t>(c.args[3]);
                     const auto fmt = static_cast<std::uint32_t>(c.args[4]);
-                    tex_meta_[id] = {w, h, lv, fmt};
+                    tex_meta_[id] = {w, h, lv, fmt, usg};
                     backend_.create_texture(id, 0, w, h, 1, lv, fmt, usg);
                 }
             } else if (m == "CreateCubeTexture") {
@@ -809,16 +814,30 @@ public:
                     const auto lv = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(c.args[1]));
                     const auto usg = static_cast<std::uint32_t>(c.args[2]);
                     const auto fmt = static_cast<std::uint32_t>(c.args[3]);
-                    tex_meta_[id] = {e, e, lv, fmt};
+                    tex_meta_[id] = {e, e, lv, fmt, usg};
                     backend_.create_texture(id, 1, e, e, 1, lv, fmt, usg);
                 }
             } else if (m == "CreateRenderTarget" || m == "CreateDepthStencilSurface") {
                 const std::uint64_t id = u64_out(6);
                 if (id != 0) {
+                    surface_size_[id] = {static_cast<std::uint32_t>(c.args[0]), static_cast<std::uint32_t>(c.args[1])};
                     backend_.create_surface(id, static_cast<std::uint32_t>(c.args[0]),
                                             static_cast<std::uint32_t>(c.args[1]),
                                             static_cast<std::uint32_t>(c.args[2]),
                                             m == "CreateRenderTarget" ? 1U : 2U, 0, 0, 0);
+                }
+            } else if (m == "GetSurfaceLevel" || m == "GetCubeMapSurface") {
+                // A texture level (or cube face) as a surface the game may draw into.
+                const bool cube = m == "GetCubeMapSurface";
+                const std::uint64_t id = u64_out(cube ? 2 : 1);
+                const auto tm = tex_meta_.find(c.self);
+                if (id != 0 && tm != tex_meta_.end()) {
+                    const auto face = cube ? static_cast<std::uint32_t>(c.args[0]) : 0U;
+                    const auto level = static_cast<std::uint32_t>(c.args[cube ? 1 : 0]);
+                    const std::uint32_t w = std::max<std::uint32_t>(1U, tm->second.width >> level);
+                    const std::uint32_t hh = std::max<std::uint32_t>(1U, tm->second.height >> level);
+                    surface_size_[id] = {w, hh};
+                    backend_.create_surface(id, w, hh, tm->second.format, tm->second.usage, c.self, face, level);
                 }
             } else if (m == "CreateVertexDeclaration") {
                 const std::uint64_t id = u64_out(1);
@@ -885,9 +904,18 @@ public:
                     state_.scissor = r;
                 }
             } else if (m == "SetRenderTarget") {
-                if (c.args[0] == 0) state_.render_target = (c.args[1] == backbuffer_id_) ? 0 : c.args[1];
+                if (c.args[0] == 0) {
+                    state_.render_target = (c.args[1] == backbuffer_id_) ? 0 : c.args[1];
+                    // D3D9 resets the viewport (and the scissor rectangle) to the new target.
+                    auto size = bb_size_;
+                    if (const auto it = surface_size_.find(state_.render_target); state_.render_target != 0 && it != surface_size_.end()) {
+                        size = it->second;
+                    }
+                    state_.viewport = {0, 0, size.first, size.second, 0.0F, 1.0F};
+                    state_.scissor = {0, 0, static_cast<std::int32_t>(size.first), static_cast<std::int32_t>(size.second)};
+                }
             } else if (m == "SetDepthStencilSurface") {
-                state_.depth_stencil = (c.args[0] == depth_id_) ? 0 : c.args[0];
+                state_.depth_stencil = c.args[0] == 0 ? kNoDepthStencil : (c.args[0] == depth_id_) ? 0 : c.args[0];
             } else if (m == "GetBackBuffer") {
                 const std::uint64_t id = u64_out(3);
                 if (id != 0) backbuffer_id_ = id;
@@ -989,8 +1017,10 @@ private:
         std::uint64_t obj = 0;
     };
     struct TexMeta {
-        std::uint32_t width = 1, height = 1, levels = 1, format = 21;
+        std::uint32_t width = 1, height = 1, levels = 1, format = 21, usage = 0;
     };
+    std::map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> surface_size_;  // surface -> width, height
+    std::pair<std::uint32_t, std::uint32_t> bb_size_{1920U, 1080U};
 
     static bool is_dxt(std::uint32_t f) noexcept {
         return f >= 0x31545844U && f <= 0x35545844U && (f & 0xFFFFFFU) == 0x545844U;
