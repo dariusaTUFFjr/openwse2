@@ -1,7 +1,7 @@
 # STATUS
 
 Last updated: 2026-11-22.
-Phase: **2 — Core Data Structures & Module System VM** (Phase 1 triage is complete; see `ROADMAP.md`).
+Phase: **5 — Recompilation of the user's own WSE2 exe** (slice R5b: phone rendering performance, `docs/RECOMP_PLAN.md`). Earlier phases: `ROADMAP.md`.
 
 This file is the **only** place that holds live numbers (gate results, coverage counts). Other
 documents link here instead of repeating them — see the ownership table in `AGENTS.md` §4.

@@ -306,7 +306,7 @@ fun AdvancedScreen(
                 SwitchListItem(
                     headline = "Work from a copy of the game folder",
                     supporting = "Copies the game folder (without other modules) into the app " +
-                        "first. Needs that much free space.",
+                        "first. Needs that much free space; turning this off deletes the copy.",
                     checked = r4State.useCopy,
                     enabled = !r4State.running,
                     onCheckedChange = onR4UseCopyChange

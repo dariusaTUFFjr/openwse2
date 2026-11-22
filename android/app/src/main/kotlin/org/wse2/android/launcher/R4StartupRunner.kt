@@ -62,6 +62,11 @@ class R4StartupRunner private constructor(private val app: Application) {
     @Volatile
     private var r5Preparing = false
 
+    init {
+        // "Work from a copy" is remembered across app starts, not only across interrupted runs.
+        state = state.copy(useCopy = prefs.getBoolean(PREF_USE_COPY, false))
+    }
+
     fun addListener(listener: (R4UiState) -> Unit) {
         listeners.add(listener)
         val now = state
@@ -205,8 +210,26 @@ class R4StartupRunner private constructor(private val app: Application) {
         }
     }
 
+    // Turning the copy off removes it: it is a whole game folder (1.5-4 GB) in app storage.
     fun setUseCopy(useCopy: Boolean) {
-        if (!state.running) update(state.copy(useCopy = useCopy))
+        if (state.running) return
+        update(state.copy(useCopy = useCopy))
+        prefs.edit().putBoolean(PREF_USE_COPY, useCopy).apply()
+        if (!useCopy && copyDir.exists()) {
+            Thread({
+                val freed = copyDir.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
+                val removed = copyDir.deleteRecursively()
+                main.post {
+                    if (!state.running) {
+                        update(state.copy(status = if (removed) {
+                            "Removed the copied game files (${freed / (1024 * 1024)} MB freed)."
+                        } else {
+                            "Some copied game files could not be removed. Clearing the app's storage removes them."
+                        }))
+                    }
+                }
+            }, "wse-r4-remove-copy").start()
+        }
     }
 
     fun dismissReport() = update(state.copy(report = null))
@@ -635,6 +658,13 @@ class R4StartupRunner private constructor(private val app: Application) {
                 }
                 val out = File(dest, name)
                 if (size >= 0 && out.isFile && out.length() == size) continue
+                // Stop before the storage runs full (the phone needs room for itself and for the
+                // translated game too) rather than fail halfway with a cryptic error.
+                if (size > 0 && copyDir.usableSpace - size < COPY_RESERVE_BYTES) {
+                    throw IllegalStateException(
+                        "there is not enough free space on the phone. Free up some space, or turn off \"Work from a copy of the game folder\""
+                    )
+                }
                 val doc = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
                 app.contentResolver.openInputStream(doc)?.use { input ->
                     out.outputStream().use { output -> bytes += input.copyTo(output, 1 shl 16) }
@@ -658,6 +688,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         private const val PREF_WANTED = "running"
         private const val PREF_TREE = "tree_uri"
         private const val PREF_USE_COPY = "use_copy"
+        private const val COPY_RESERVE_BYTES = 1024L * 1024L * 1024L
         private const val PREF_JOBS = "jobs"
         private const val PREVIOUS_REPORT = "report.previous.txt"
         private const val IMPORT_NOTE = "import.txt"
