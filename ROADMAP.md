@@ -191,6 +191,7 @@ Newest first. One line per landed milestone; details belong in the commit and in
 
 | Date | Commit | Milestone |
 | --- | --- | --- |
+| 2026-11-23 | — | R5b: ETC2 textures with an on-disk cache and FSR 1.0 upscaling, sharpening, FXAA and dynamic resolution wired into the Vulkan device, with an Advanced > Picture section; checked on the PC against real D3D9 (ETC2 38.7 dB; 100 % still bit-for-bit) |
 | 2026-11-23 | — | R5b batch: widescreen at the phone's screen size, render-to-texture, swapchain/semaphore/dynamic-buffer/alpha-test fixes, released D3D9 objects freed, atomic saves, background pause, guarded guest stacks; ETC2 transcoding, FSR/CAS/FXAA shaders and dynamic resolution built and tested (not yet used by the device) |
 | 2026-11-22 | — | R5a on the phone: with System Vulkan the recompiled game reaches Warband's main menu on screen (OPPO Reno 11, Mali-G68); PanVK's shared-buffer path drew static, so custom drivers present through a CPU copy for now |
 | 2026-11-22 | `de5669d` | Engine CI run #1 in this repository green (7/7 jobs, 32m48s) and the first arm64 APK built (`wse2-android-selftest-debug-apk`, SHA-256 `47aaccb8…`); Windows host gate on the same commit PASS (`STATUS.md` §2) |
