@@ -461,6 +461,11 @@ Phase 5 D3D9 device (`wse/recomp/shim_d3d9.h`, `wse/recomp/d3d9_shader.h`, 2026-
 
 - `IDirect3DDevice9::Clear` copies at most 4096 of the game's rectangles (the count is the game's;
   more is not a real use and would only size an allocation).
+- `Release` reaching zero queues a texture, buffer or stand-alone surface; the next `Present` frees
+  its CPU copy and backend resource unless a texture stage, stream, index buffer, render target,
+  state block or effect still names it, or the game still holds one of its level surfaces (D3D9
+  keeps bound objects alive internally). The 64-byte guest object stays, so a stray call on a freed
+  pointer reaches a known object instead of crashing.
 - Preshader (`FXLC`) results and register indices convert float to integer with
   `preshader_to_i32`: NaN gives 0 and out-of-range values saturate instead of the undefined
   plain cast.
