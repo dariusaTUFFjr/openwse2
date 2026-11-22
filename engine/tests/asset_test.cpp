@@ -2,12 +2,14 @@
 // (engine/include/wse/asset/brf.h and engine/include/wse/asset/dds.h).
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,8 +22,10 @@
 
 #include "wse/asset/brf.h"
 #include "wse/asset/dds.h"
+#include "wse/asset/etc2.h"
 #include "wse/asset/shader.h"
 #include "wse/asset/shader_compiler.h"
+#include "wse/asset/texture_cache.h"
 #include "wse/game/module_loader_common.h"
 #include "wse/io/binary_stream.h"
 #include "wse/platform/vfs.h"
@@ -2554,6 +2558,846 @@ void test_d3d9_shader_translation() {
     }
 }
 
+// Reference ETC2 RGB8 + EAC alpha decoder (Khronos / OpenGL ES 3.0 spec:
+// Individual, Differential, T, H, and Planar RGB modes + 16-table EAC alpha).
+namespace etc2_ref {
+
+inline std::uint8_t clamp_u8(int v) noexcept {
+    if (v < 0) return 0U;
+    if (v > 255) return 255U;
+    return static_cast<std::uint8_t>(v);
+}
+
+inline int sign_extend_3(std::uint32_t v) noexcept {
+    return (v & 0x4U) != 0U ? static_cast<int>(v) - 8 : static_cast<int>(v);
+}
+
+inline std::uint8_t expand4(std::uint32_t v) noexcept {
+    return static_cast<std::uint8_t>((v << 4U) | v);
+}
+
+inline std::uint8_t expand5(std::uint32_t v) noexcept {
+    return static_cast<std::uint8_t>((v << 3U) | (v >> 2U));
+}
+
+inline std::uint8_t expand6(std::uint32_t v) noexcept {
+    return static_cast<std::uint8_t>((v << 2U) | (v >> 4U));
+}
+
+inline std::uint8_t expand7(std::uint32_t v) noexcept {
+    return static_cast<std::uint8_t>((v << 1U) | (v >> 6U));
+}
+
+inline void decode_etc2_rgb8_block(const std::uint8_t* blk,
+                                   std::uint8_t out_rgb[4][4][3]) noexcept {
+    static constexpr int kModifier[8][4] = {
+        {2, 8, -2, -8},
+        {5, 17, -5, -17},
+        {9, 29, -9, -29},
+        {13, 42, -13, -42},
+        {18, 60, -18, -60},
+        {24, 80, -24, -80},
+        {33, 106, -33, -106},
+        {47, 183, -47, -183},
+    };
+    static constexpr int kTHDist[8] = {3, 6, 11, 16, 23, 32, 41, 64};
+
+    const bool diff = ((blk[3] >> 1U) & 1U) != 0U;
+    const bool flip = (blk[3] & 1U) != 0U;
+    const std::uint32_t word_lo =
+        (static_cast<std::uint32_t>(blk[4]) << 24U) |
+        (static_cast<std::uint32_t>(blk[5]) << 16U) |
+        (static_cast<std::uint32_t>(blk[6]) << 8U) |
+        static_cast<std::uint32_t>(blk[7]);
+
+    auto read_pixel_index = [&](int x, int y) noexcept -> std::uint32_t {
+        const unsigned p = static_cast<unsigned>(4 * x + y);
+        const std::uint32_t lsb = (word_lo >> p) & 1U;
+        const std::uint32_t msb = (word_lo >> (16U + p)) & 1U;
+        return (msb << 1U) | lsb;
+    };
+
+    if (!diff) {
+        const std::uint8_t r[2] = {expand4((blk[0] >> 4U) & 0xFU), expand4(blk[0] & 0xFU)};
+        const std::uint8_t g[2] = {expand4((blk[1] >> 4U) & 0xFU), expand4(blk[1] & 0xFU)};
+        const std::uint8_t b[2] = {expand4((blk[2] >> 4U) & 0xFU), expand4(blk[2] & 0xFU)};
+        const unsigned t[2] = {(blk[3] >> 5U) & 0x7U, (blk[3] >> 2U) & 0x7U};
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                const unsigned sub = flip ? (y >= 2 ? 1U : 0U) : (x >= 2 ? 1U : 0U);
+                const int mod = kModifier[t[sub]][read_pixel_index(x, y)];
+                out_rgb[y][x][0] = clamp_u8(static_cast<int>(r[sub]) + mod);
+                out_rgb[y][x][1] = clamp_u8(static_cast<int>(g[sub]) + mod);
+                out_rgb[y][x][2] = clamp_u8(static_cast<int>(b[sub]) + mod);
+            }
+        }
+        return;
+    }
+
+    const int r1_5 = static_cast<int>((blk[0] >> 3U) & 0x1FU);
+    const int g1_5 = static_cast<int>((blk[1] >> 3U) & 0x1FU);
+    const int b1_5 = static_cast<int>((blk[2] >> 3U) & 0x1FU);
+    const int r2_5 = r1_5 + sign_extend_3(blk[0] & 0x7U);
+    const int g2_5 = g1_5 + sign_extend_3(blk[1] & 0x7U);
+    const int b2_5 = b1_5 + sign_extend_3(blk[2] & 0x7U);
+
+    if (r2_5 < 0 || r2_5 > 31) {
+        // T-mode
+        const std::uint32_t r1_4 = ((static_cast<std::uint32_t>(blk[0]) >> 3U) & 0x3U) << 2U |
+                                   (static_cast<std::uint32_t>(blk[0]) & 0x3U);
+        const std::uint8_t r1 = expand4(r1_4);
+        const std::uint8_t g1 = expand4((blk[1] >> 4U) & 0xFU);
+        const std::uint8_t b1 = expand4(blk[1] & 0xFU);
+        const std::uint8_t r2 = expand4((blk[2] >> 4U) & 0xFU);
+        const std::uint8_t g2 = expand4(blk[2] & 0xFU);
+        const std::uint8_t b2 = expand4((blk[3] >> 4U) & 0xFU);
+        const unsigned d_idx = (((blk[3] >> 2U) & 0x3U) << 1U) | (blk[3] & 0x1U);
+        const int dist = kTHDist[d_idx];
+        const std::uint8_t paint[4][3] = {
+            {r1, g1, b1},
+            {clamp_u8(r2 + dist), clamp_u8(g2 + dist), clamp_u8(b2 + dist)},
+            {r2, g2, b2},
+            {clamp_u8(r2 - dist), clamp_u8(g2 - dist), clamp_u8(b2 - dist)},
+        };
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                const std::uint32_t idx = read_pixel_index(x, y);
+                out_rgb[y][x][0] = paint[idx][0];
+                out_rgb[y][x][1] = paint[idx][1];
+                out_rgb[y][x][2] = paint[idx][2];
+            }
+        }
+        return;
+    }
+
+    if (g2_5 < 0 || g2_5 > 31) {
+        // H-mode
+        const std::uint8_t r1 = expand4((blk[0] >> 3U) & 0xFU);
+        const std::uint8_t g1 = expand4(((blk[0] & 0x7U) << 1U) | ((blk[1] >> 4U) & 0x1U));
+        const std::uint8_t b1 =
+            expand4((blk[1] & 0x8U) | ((blk[1] & 0x3U) << 1U) | ((blk[2] >> 7U) & 0x1U));
+        const std::uint8_t r2 = expand4((blk[2] >> 3U) & 0xFU);
+        const std::uint8_t g2 = expand4(((blk[2] & 0x7U) << 1U) | ((blk[3] >> 7U) & 0x1U));
+        const std::uint8_t b2 = expand4((blk[3] >> 3U) & 0xFU);
+        const std::uint32_t c1 =
+            (static_cast<std::uint32_t>(r1) << 16U) |
+            (static_cast<std::uint32_t>(g1) << 8U) |
+            static_cast<std::uint32_t>(b1);
+        const std::uint32_t c2 =
+            (static_cast<std::uint32_t>(r2) << 16U) |
+            (static_cast<std::uint32_t>(g2) << 8U) |
+            static_cast<std::uint32_t>(b2);
+        const unsigned d_idx = (((blk[3] >> 2U) & 0x1U) << 2U) |
+                               ((blk[3] & 0x1U) << 1U) |
+                               (c1 >= c2 ? 1U : 0U);
+        const int dist = kTHDist[d_idx];
+        const std::uint8_t paint[4][3] = {
+            {clamp_u8(r1 + dist), clamp_u8(g1 + dist), clamp_u8(b1 + dist)},
+            {clamp_u8(r1 - dist), clamp_u8(g1 - dist), clamp_u8(b1 - dist)},
+            {clamp_u8(r2 + dist), clamp_u8(g2 + dist), clamp_u8(b2 + dist)},
+            {clamp_u8(r2 - dist), clamp_u8(g2 - dist), clamp_u8(b2 - dist)},
+        };
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                const std::uint32_t idx = read_pixel_index(x, y);
+                out_rgb[y][x][0] = paint[idx][0];
+                out_rgb[y][x][1] = paint[idx][1];
+                out_rgb[y][x][2] = paint[idx][2];
+            }
+        }
+        return;
+    }
+
+    if (b2_5 < 0 || b2_5 > 31) {
+        // Planar mode
+        const int ro = expand6((blk[0] >> 1U) & 0x3FU);
+        const int go = expand7(((blk[0] & 0x1U) << 6U) | ((blk[1] >> 1U) & 0x3FU));
+        const int bo = expand6(((blk[1] & 0x1U) << 5U) |
+                               (((blk[2] >> 3U) & 0x3U) << 3U) |
+                               ((blk[2] & 0x3U) << 1U) |
+                               ((blk[3] >> 7U) & 0x1U));
+        const int rh = expand6((((blk[3] >> 2U) & 0x1FU) << 1U) | (blk[3] & 0x1U));
+        const int gh = expand7((blk[4] >> 1U) & 0x7FU);
+        const int bh = expand6(((blk[4] & 0x1U) << 5U) | ((blk[5] >> 3U) & 0x1FU));
+        const int rv = expand6(((blk[5] & 0x7U) << 3U) | ((blk[6] >> 5U) & 0x7U));
+        const int gv = expand7(((blk[6] & 0x1FU) << 2U) | ((blk[7] >> 6U) & 0x3U));
+        const int bv = expand6(blk[7] & 0x3FU);
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                out_rgb[y][x][0] = clamp_u8((x * (rh - ro) + y * (rv - ro) + 4 * ro + 2) >> 2);
+                out_rgb[y][x][1] = clamp_u8((x * (gh - go) + y * (gv - go) + 4 * go + 2) >> 2);
+                out_rgb[y][x][2] = clamp_u8((x * (bh - bo) + y * (bv - bo) + 4 * bo + 2) >> 2);
+            }
+        }
+        return;
+    }
+
+    // Differential mode
+    const std::uint8_t r[2] = {expand5(static_cast<std::uint32_t>(r1_5)),
+                               expand5(static_cast<std::uint32_t>(r2_5))};
+    const std::uint8_t g[2] = {expand5(static_cast<std::uint32_t>(g1_5)),
+                               expand5(static_cast<std::uint32_t>(g2_5))};
+    const std::uint8_t b[2] = {expand5(static_cast<std::uint32_t>(b1_5)),
+                               expand5(static_cast<std::uint32_t>(b2_5))};
+    const unsigned t[2] = {(blk[3] >> 5U) & 0x7U, (blk[3] >> 2U) & 0x7U};
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            const unsigned sub = flip ? (y >= 2 ? 1U : 0U) : (x >= 2 ? 1U : 0U);
+            const int mod = kModifier[t[sub]][read_pixel_index(x, y)];
+            out_rgb[y][x][0] = clamp_u8(static_cast<int>(r[sub]) + mod);
+            out_rgb[y][x][1] = clamp_u8(static_cast<int>(g[sub]) + mod);
+            out_rgb[y][x][2] = clamp_u8(static_cast<int>(b[sub]) + mod);
+        }
+    }
+}
+
+inline void decode_eac_alpha_block(const std::uint8_t* blk, std::uint8_t out_a[4][4]) noexcept {
+    static constexpr int kEacAlpha[16][8] = {
+        {-3, -6, -9, -15, 2, 5, 8, 14},
+        {-3, -7, -10, -13, 2, 6, 9, 12},
+        {-2, -5, -8, -13, 1, 4, 7, 12},
+        {-2, -4, -6, -13, 1, 3, 5, 12},
+        {-3, -6, -8, -12, 2, 5, 7, 11},
+        {-3, -7, -9, -11, 2, 6, 8, 10},
+        {-4, -7, -8, -11, 3, 6, 7, 10},
+        {-3, -5, -8, -11, 2, 4, 7, 10},
+        {-2, -6, -8, -10, 1, 5, 7, 9},
+        {-2, -5, -8, -10, 1, 4, 7, 9},
+        {-2, -4, -8, -10, 1, 3, 7, 9},
+        {-2, -5, -7, -10, 1, 4, 6, 9},
+        {-3, -4, -7, -10, 2, 3, 6, 9},
+        {-1, -2, -3, -10, 0, 1, 2, 9},
+        {-4, -6, -8, -9, 3, 5, 7, 8},
+        {-3, -5, -7, -9, 2, 4, 6, 8},
+    };
+    const int base = static_cast<int>(blk[0]);
+    const int mul = static_cast<int>((blk[1] >> 4U) & 0xFU);
+    const unsigned tbl = blk[1] & 0xFU;
+    const std::uint64_t bits48 =
+        (static_cast<std::uint64_t>(blk[2]) << 40U) |
+        (static_cast<std::uint64_t>(blk[3]) << 32U) |
+        (static_cast<std::uint64_t>(blk[4]) << 24U) |
+        (static_cast<std::uint64_t>(blk[5]) << 16U) |
+        (static_cast<std::uint64_t>(blk[6]) << 8U) |
+        static_cast<std::uint64_t>(blk[7]);
+    for (int x = 0; x < 4; ++x) {
+        for (int y = 0; y < 4; ++y) {
+            const unsigned p = static_cast<unsigned>(4 * x + y);
+            const unsigned idx = static_cast<unsigned>((bits48 >> (45U - 3U * p)) & 0x7ULL);
+            out_a[y][x] = clamp_u8(base + kEacAlpha[tbl][idx] * mul);
+        }
+    }
+}
+
+inline std::vector<std::uint8_t> decode_level_rgba8(const wse::asset::etc2::Level& lvl,
+                                                    wse::asset::etc2::Format fmt) {
+    const std::uint32_t w = lvl.width;
+    const std::uint32_t h = lvl.height;
+    const std::uint32_t bx_count = (w + 3U) / 4U;
+    const std::uint32_t by_count = (h + 3U) / 4U;
+    const std::size_t stride = (fmt == wse::asset::etc2::Format::rgba8) ? 16U : 8U;
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4U, 255U);
+    for (std::uint32_t by = 0; by < by_count; ++by) {
+        for (std::uint32_t bx = 0; bx < bx_count; ++bx) {
+            const std::uint8_t* blk =
+                lvl.blocks.data() + (static_cast<std::size_t>(by) * bx_count + bx) * stride;
+            std::uint8_t rgb[4][4][3]{};
+            std::uint8_t a[4][4]{};
+            if (fmt == wse::asset::etc2::Format::rgba8) {
+                decode_eac_alpha_block(blk, a);
+                decode_etc2_rgb8_block(blk + 8U, rgb);
+            } else {
+                decode_etc2_rgb8_block(blk, rgb);
+            }
+            const std::uint32_t rows = (std::min)(4U, h - by * 4U);
+            const std::uint32_t cols = (std::min)(4U, w - bx * 4U);
+            for (std::uint32_t py = 0; py < rows; ++py) {
+                for (std::uint32_t px = 0; px < cols; ++px) {
+                    const std::size_t dst_idx =
+                        (static_cast<std::size_t>(by * 4U + py) * w + (bx * 4U + px)) * 4U;
+                    rgba[dst_idx + 0U] = rgb[py][px][0];
+                    rgba[dst_idx + 1U] = rgb[py][px][1];
+                    rgba[dst_idx + 2U] = rgb[py][px][2];
+                    rgba[dst_idx + 3U] = (fmt == wse::asset::etc2::Format::rgba8) ? a[py][px] : 255U;
+                }
+            }
+        }
+    }
+    return rgba;
+}
+
+inline double compute_rgb_psnr_db(std::span<const std::uint8_t> ref_rgba,
+                                  std::span<const std::uint8_t> test_rgba) {
+    if (ref_rgba.size() != test_rgba.size() || ref_rgba.empty()) {
+        return 0.0;
+    }
+    double sum_sq = 0.0;
+    const std::size_t pixels = ref_rgba.size() / 4U;
+    for (std::size_t i = 0; i < pixels; ++i) {
+        for (std::size_t c = 0; c < 3U; ++c) {
+            const double d = static_cast<double>(ref_rgba[i * 4U + c]) -
+                             static_cast<double>(test_rgba[i * 4U + c]);
+            sum_sq += d * d;
+        }
+    }
+    const double mse = sum_sq / (3.0 * static_cast<double>(pixels));
+    if (mse == 0.0) {
+        return 99.0;
+    }
+    return 10.0 * std::log10((255.0 * 255.0) / mse);
+}
+
+inline int max_alpha_diff(std::span<const std::uint8_t> ref_rgba,
+                          std::span<const std::uint8_t> test_rgba) {
+    int worst = 0;
+    const std::size_t pixels = ref_rgba.size() / 4U;
+    for (std::size_t i = 0; i < pixels; ++i) {
+        const int d = std::abs(static_cast<int>(ref_rgba[i * 4U + 3U]) -
+                               static_cast<int>(test_rgba[i * 4U + 3U]));
+        if (d > worst) {
+            worst = d;
+        }
+    }
+    return worst;
+}
+
+}  // namespace etc2_ref
+
+void write_bc1_gradient_mip(wse::io::BinaryWriter& w,
+                            std::uint32_t width,
+                            std::uint32_t height,
+                            bool with_alpha,
+                            bool force_transparent_texel) {
+    const std::uint32_t bx_count = (width + 3U) / 4U;
+    const std::uint32_t by_count = (height + 3U) / 4U;
+    for (std::uint32_t by = 0; by < by_count; ++by) {
+        for (std::uint32_t bx = 0; bx < bx_count; ++bx) {
+            const int r0 = static_cast<int>((bx * 200U) / (std::max)(1U, bx_count));
+            const int g0 = static_cast<int>((by * 200U) / (std::max)(1U, by_count));
+            const int b0 = 64 + static_cast<int>(((bx + by) * 64U) / (std::max)(1U, bx_count + by_count));
+            const int r1 = (std::min)(255, r0 + 16);
+            const int g1 = (std::min)(255, g0 + 8);
+            const int b1 = (std::min)(255, b0 + 16);
+            std::uint16_t c0 = pack_rgb565(r0, g0, b0);
+            std::uint16_t c1 = pack_rgb565(r1, g1, b1);
+            // Smooth horizontal ramp across the 4 columns: 0 -> c0, 2 -> 2/3 c0 + 1/3 c1, 3 -> 1/3 c0 + 2/3 c1, 1 -> c1.
+            std::uint32_t idx_bits = 0x78787878U;
+            if (with_alpha) {
+                if (c0 > c1) {
+                    std::swap(c0, c1);
+                }
+                idx_bits = 0x55555555U;  // index 1 everywhere (no index 3)
+                if (force_transparent_texel && bx == 0U && by == 0U) {
+                    idx_bits = 0x55555553U;  // texel (0,0) uses index 3 -> transparent
+                }
+            } else {
+                if (c0 <= c1) {
+                    std::swap(c0, c1);
+                }
+            }
+            push_u16_le(w, c0);
+            push_u16_le(w, c1);
+            push_u32_le(w, idx_bits);
+        }
+    }
+}
+
+void write_bc3_gradient_mip(wse::io::BinaryWriter& w, std::uint32_t width, std::uint32_t height) {
+    const std::uint32_t bx_count = (width + 3U) / 4U;
+    const std::uint32_t by_count = (height + 3U) / 4U;
+    for (std::uint32_t by = 0; by < by_count; ++by) {
+        for (std::uint32_t bx = 0; bx < bx_count; ++bx) {
+            const std::uint8_t a0 = static_cast<std::uint8_t>((by * 200U) / (std::max)(1U, by_count) + 32U);
+            const std::uint8_t a1 = static_cast<std::uint8_t>((std::max)(0, static_cast<int>(a0) - 24));
+            w.write_byte(a0);
+            w.write_byte(a1);
+            // Smooth alpha indices across the 4x4 block (3 bits * 16 = 48 bits).
+            const std::uint64_t abits = 0x765432107654ULL;
+            for (int i = 0; i < 6; ++i) {
+                w.write_byte(static_cast<std::uint8_t>((abits >> (i * 8)) & 0xFFU));
+            }
+            const int r0 = static_cast<int>((bx * 180U) / (std::max)(1U, bx_count));
+            const int g0 = static_cast<int>((by * 180U) / (std::max)(1U, by_count));
+            const std::uint16_t c0 = pack_rgb565(r0 + 16, g0 + 8, 136);
+            const std::uint16_t c1 = pack_rgb565(r0, g0, 120);
+            push_u16_le(w, c0);
+            push_u16_le(w, c1);
+            push_u32_le(w, 0x78787878U);
+        }
+    }
+}
+
+void write_bc2_mip(wse::io::BinaryWriter& w, std::uint32_t width, std::uint32_t height) {
+    const std::uint32_t bx_count = (width + 3U) / 4U;
+    const std::uint32_t by_count = (height + 3U) / 4U;
+    for (std::uint32_t by = 0; by < by_count; ++by) {
+        for (std::uint32_t bx = 0; bx < bx_count; ++bx) {
+            const std::uint32_t a_base = (by * 12U) / (std::max)(1U, by_count);
+            for (int r = 0; r < 4; ++r) {
+                const std::uint32_t a = (std::min)(15U, a_base + static_cast<std::uint32_t>(r));
+                const std::uint16_t row_a = static_cast<std::uint16_t>(
+                    a | (a << 4U) | (a << 8U) | (a << 12U));
+                push_u16_le(w, row_a);
+            }
+            const int r0 = 40 + static_cast<int>(bx * 32U);
+            const int g0 = 80 + static_cast<int>(by * 32U);
+            const std::uint16_t c0 = pack_rgb565(r0 + 16, g0 + 12, 140);
+            const std::uint16_t c1 = pack_rgb565(r0, g0, 120);
+            push_u16_le(w, c0);
+            push_u16_le(w, c1);
+            push_u32_le(w, 0x78787878U);
+        }
+    }
+}
+
+void test_etc2_transcode_and_texture_cache() {
+    using namespace wse::asset;
+    using namespace wse::asset::etc2;
+
+    // 1. Reference decoder check across all 5 ETC2 RGB modes + EAC alpha, plus 4x4 BGRX transcode.
+    {
+        std::uint8_t rgb[4][4][3]{};
+        // Individual mode (diff=0, flip=0): sub0=(0x44,0x88,0xCC), sub1=(0x22,0x66,0xAA), tbl=(0,1)
+        // word_lo = 0: all pixels use index 0 -> +2 on sub0, +5 on sub1.
+        const std::uint8_t ind_blk[8] = {0x42U, 0x86U, 0xCAU, 0x04U, 0U, 0U, 0U, 0U};
+        etc2_ref::decode_etc2_rgb8_block(ind_blk, rgb);
+        expect(rgb[0][0][0] == 0x46U && rgb[0][0][1] == 0x8AU && rgb[0][0][2] == 0xCEU &&
+                   rgb[3][2][0] == 0x27U && rgb[3][2][1] == 0x6BU && rgb[3][2][2] == 0xAFU,
+               "etc2 ref: individual mode decode");
+
+        // Differential mode (diff=1, flip=1): r1=16(132), r2=17(140), g1=10(84), g2=11(92), b1=8(66), b2=9(74)
+        // tbl=(0,0), all indices 0 (+2) -> y<2=(134,86,68), y>=2=(142,94,76).
+        const std::uint8_t diff_blk[8] = {
+            static_cast<std::uint8_t>((16U << 3U) | 1U),
+            static_cast<std::uint8_t>((10U << 3U) | 1U),
+            static_cast<std::uint8_t>((8U << 3U) | 1U),
+            0x03U,
+            0U, 0U, 0U, 0U,
+        };
+        etc2_ref::decode_etc2_rgb8_block(diff_blk, rgb);
+        expect(rgb[0][0][0] == 134U && rgb[0][0][1] == 84U && rgb[0][0][2] == 68U &&
+                   rgb[2][0][0] == 142U && rgb[2][0][1] == 92U && rgb[2][0][2] == 76U,
+               "etc2 ref: differential mode decode");
+
+        // T mode (diff=1, r1_5=0, dr=-4 -> r2_5=-4 overflows): r1=0, g1=0x22, b1=0x44, r2=0x88, g2=0xAA, b2=0xCC, d_idx=0 (dist=3)
+        // px(0,0) idx=0 -> (0,0x22,0x44); px(1,0) idx=1 -> (0x8B,0xAD,0xCF); px(0,1) idx=2 -> (0x88,0xAA,0xCC); px(1,1) idx=3 -> (0x85,0xA7,0xC9)
+        const std::uint8_t t_blk[8] = {0x04U, 0x24U, 0x8AU, 0xC2U, 0x00U, 0x22U, 0x00U, 0x30U};
+        etc2_ref::decode_etc2_rgb8_block(t_blk, rgb);
+        expect(rgb[0][0][0] == 0x00U && rgb[0][0][1] == 0x22U && rgb[0][0][2] == 0x44U &&
+                   rgb[0][1][0] == 0x8BU && rgb[0][1][1] == 0xADU && rgb[0][1][2] == 0xCFU &&
+                   rgb[1][0][0] == 0x88U && rgb[1][0][1] == 0xAAU && rgb[1][0][2] == 0xCCU &&
+                   rgb[1][1][0] == 0x85U && rgb[1][1][1] == 0xA7U && rgb[1][1][2] == 0xC9U,
+               "etc2 ref: T mode decode");
+
+        // H mode (diff=1, r2_5 in 0..31, g1_5=0, dg=-1 -> g2_5=-1 overflows):
+        // c1=(0x22,0x44,0x66), c2=(0x11,0x33,0x55) -> c1>=c2 so dist bit0=1, d_idx=1 (dist=6)
+        // px(0,0) idx=0 -> (0x28,0x4A,0x6C); px(1,0) idx=2 -> (0x17,0x39,0x5B)
+        const std::uint8_t h_blk[8] = {0x12U, 0x07U, 0x09U, 0xAAU, 0x00U, 0x10U, 0x00U, 0x00U};
+        etc2_ref::decode_etc2_rgb8_block(h_blk, rgb);
+        expect(rgb[0][0][0] == 0x28U && rgb[0][0][1] == 0x4AU && rgb[0][0][2] == 0x6CU &&
+                   rgb[0][1][0] == 0x17U && rgb[0][1][1] == 0x39U && rgb[0][1][2] == 0x5BU,
+               "etc2 ref: H mode decode");
+
+        // Planar mode (diff=1, r2/g2 in 0..31, b1_5=0, db=-4 -> b2_5=-4 overflows):
+        // ro=16(65), go=32(64), bo=16(65), rh=32(130), gh=64(129), bh=32(130), rv=16(65), gv=32(64), bv=16(65)
+        const std::uint8_t p_blk[8] = {
+            static_cast<std::uint8_t>((16U << 1U) | 0U),
+            static_cast<std::uint8_t>((32U << 1U) | 0U),
+            static_cast<std::uint8_t>((2U << 3U) | 4U),
+            static_cast<std::uint8_t>((16U << 2U) | 2U),
+            static_cast<std::uint8_t>((64U << 1U) | 1U),
+            static_cast<std::uint8_t>((0U << 3U) | 2U),
+            static_cast<std::uint8_t>((0U << 5U) | 8U),
+            static_cast<std::uint8_t>((0U << 6U) | 16U),
+        };
+        etc2_ref::decode_etc2_rgb8_block(p_blk, rgb);
+        expect(rgb[0][0][0] == 65U && rgb[0][0][1] == 64U && rgb[0][0][2] == 65U &&
+                   rgb[0][2][0] == 98U && rgb[0][2][1] == 97U && rgb[0][2][2] == 98U,
+               "etc2 ref: planar mode decode");
+
+        // EAC alpha (base=128, mul=2, tbl=0 {-3,-6,-9,-15,2,5,8,14}): all indices 4 (+2*2 = 132) except p0=7 (+14*2=156)
+        const std::uint8_t eac_blk[8] = {128U, 0x20U, 0xF2U, 0x49U, 0x24U, 0x92U, 0x49U, 0x24U};
+        std::uint8_t alpha[4][4]{};
+        etc2_ref::decode_eac_alpha_block(eac_blk, alpha);
+        expect(alpha[0][0] == 156U && alpha[1][0] == 132U && alpha[3][3] == 132U,
+               "etc2 ref: EAC alpha decode");
+
+        // Encode via transcode_dds of an uncompressed 4x4 smooth gradient and check PSNR.
+        wse::io::BinaryWriter dds_w;
+        write_dds_header(dds_w, 4U, 4U, 0x100FU, 1U, 0x40U, 0U, 32U,
+                         0x00FF0000U, 0x0000FF00U, 0x000000FFU, 0x00000000U);
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                dds_w.write_byte(static_cast<std::uint8_t>(100 + (x + y) * 3));
+                dds_w.write_byte(static_cast<std::uint8_t>(110 + (x + y) * 3));
+                dds_w.write_byte(static_cast<std::uint8_t>(120 + (x + y) * 3));
+                dds_w.write_byte(255U);
+            }
+        }
+        DdsImageView view;
+        std::string err;
+        expect(parse_dds(dds_w.bytes(), view, &err), "etc2 ref test: parse 4x4 BGRX");
+        Image img;
+        expect(transcode_dds(view, 0U, img, &err), "etc2 ref test: transcode 4x4 BGRX");
+        expect(img.format == Format::rgb8 && img.data.size() == 1U && img.data[0].blocks.size() == 8U,
+               "etc2 ref test: BGRX -> rgb8 8 bytes");
+        std::vector<std::uint8_t> src_rgba;
+        expect(decode_dds_mip_rgba8(view, 0U, 0U, src_rgba, &err), "etc2 ref test: decode source");
+        const auto dec_rgba = etc2_ref::decode_level_rgba8(img.data[0], img.format);
+        expect(etc2_ref::compute_rgb_psnr_db(src_rgba, dec_rgba) >= 30.0,
+               "etc2 ref test: 4x4 planar/diff decode PSNR >= 30 dB");
+    }
+
+    // 2. DXT1 opaque 64x64 with full mip chain (includes 2x2 and 1x1 mips).
+    {
+        wse::io::BinaryWriter w;
+        write_dds_header(w, 64U, 64U, 0x21007U, 7U, 0x4U, dds_detail::fourcc('D', 'X', 'T', '1'),
+                         0U, 0U, 0U, 0U, 0U, 0x401008U);
+        std::uint32_t mw = 64U, mh = 64U;
+        for (int m = 0; m < 7; ++m) {
+            write_bc1_gradient_mip(w, mw, mh, false, false);
+            mw = (std::max)(1U, mw >> 1U);
+            mh = (std::max)(1U, mh >> 1U);
+        }
+        DdsImageView view;
+        std::string err;
+        expect(parse_dds(w.bytes(), view, &err), "etc2: parse opaque DXT1 64x64 mipmap");
+        Image img;
+        expect(transcode_dds(view, 0U, img, &err), "etc2: transcode opaque DXT1 64x64");
+        expect(img.format == Format::rgb8 && img.width == 64U && img.height == 64U &&
+                   img.levels == 7U && img.faces == 1U && img.data.size() == 7U,
+               "etc2: opaque DXT1 -> rgb8, 7 levels");
+        expect(img.data[5].width == 2U && img.data[5].height == 2U && img.data[5].blocks.size() == 8U &&
+                   img.data[6].width == 1U && img.data[6].height == 1U && img.data[6].blocks.size() == 8U,
+               "etc2: 2x2 and 1x1 mips padded to 1 4x4 block (8 bytes)");
+
+        std::vector<std::uint8_t> src_rgba;
+        expect(decode_dds_mip_rgba8(view, 0U, 0U, src_rgba, &err), "etc2: decode DXT1 mip 0");
+        const auto dec_rgba = etc2_ref::decode_level_rgba8(img.data[0], img.format);
+        const double psnr = etc2_ref::compute_rgb_psnr_db(src_rgba, dec_rgba);
+        expect(psnr >= 30.0, "etc2: opaque DXT1 64x64 PSNR >= 30 dB");
+
+        // Edge-replication check on 1x1 mip (every decoded pixel in the 4x4 block matches mip 6).
+        std::vector<std::uint8_t> src_1x1;
+        expect(decode_dds_mip_rgba8(view, 6U, 0U, src_1x1, &err), "etc2: decode DXT1 1x1 mip");
+        const auto dec_1x1 = etc2_ref::decode_level_rgba8(img.data[6], img.format);
+        expect(etc2_ref::compute_rgb_psnr_db(src_1x1, dec_1x1) >= 30.0,
+               "etc2: 1x1 mip edge-replicated PSNR >= 30 dB");
+
+        // first_mip skipping (skip mip 0 -> 32x32, 6 levels)
+        Image skipped;
+        expect(transcode_dds(view, 1U, skipped, &err), "etc2: transcode with first_mip=1");
+        expect(skipped.width == 32U && skipped.height == 32U && skipped.levels == 6U &&
+                   skipped.data.size() == 6U && skipped.data[0].blocks == img.data[1].blocks,
+               "etc2: first_mip=1 skips mip 0 and matches mip 1..6 blocks");
+        expect(!transcode_dds(view, 7U, skipped, &err) && !err.empty(),
+               "etc2: out-of-range first_mip rejected");
+
+        // threads 1 vs 4 produce identical bytes
+        Image mt;
+        expect(transcode_dds(view, 0U, mt, &err, 4U), "etc2: transcode with 4 threads");
+        bool same_mt = (mt.format == img.format && mt.data.size() == img.data.size());
+        for (std::size_t i = 0; same_mt && i < img.data.size(); ++i) {
+            same_mt = (mt.data[i].blocks == img.data[i].blocks);
+        }
+        expect(same_mt, "etc2: threads=1 and threads=4 produce identical bytes");
+    }
+
+    // 3. DXT1 with c0 <= c1 but NO index-3 transparent texel -> still rgb8.
+    //    DXT1 with index-3 transparent texel -> rgba8.
+    {
+        wse::io::BinaryWriter w_no_trans;
+        write_dds_header(w_no_trans, 8U, 8U, 0x1007U, 1U, 0x4U, dds_detail::fourcc('D', 'X', 'T', '1'),
+                         0U, 0U, 0U, 0U, 0U);
+        write_bc1_gradient_mip(w_no_trans, 8U, 8U, true, false);
+        DdsImageView v_no;
+        expect(parse_dds(w_no_trans.bytes(), v_no), "etc2: parse DXT1 c0<=c1 without index 3");
+        Image img_no;
+        expect(transcode_dds(v_no, 0U, img_no) && img_no.format == Format::rgb8,
+               "etc2: DXT1 without transparent texels -> rgb8");
+
+        wse::io::BinaryWriter w_trans;
+        write_dds_header(w_trans, 8U, 8U, 0x1007U, 1U, 0x4U, dds_detail::fourcc('D', 'X', 'T', '1'),
+                         0U, 0U, 0U, 0U, 0U);
+        write_bc1_gradient_mip(w_trans, 8U, 8U, true, true);
+        DdsImageView v_yes;
+        expect(parse_dds(w_trans.bytes(), v_yes), "etc2: parse DXT1 with 1-bit alpha");
+        Image img_yes;
+        expect(transcode_dds(v_yes, 0U, img_yes) && img_yes.format == Format::rgba8 &&
+                   img_yes.data[0].blocks.size() == 4U * 16U,
+               "etc2: DXT1 with transparent texel -> rgba8");
+        std::vector<std::uint8_t> src_rgba;
+        expect(decode_dds_mip_rgba8(v_yes, 0U, 0U, src_rgba), "etc2: decode DXT1 alpha");
+        const auto dec_rgba = etc2_ref::decode_level_rgba8(img_yes.data[0], img_yes.format);
+        expect(etc2_ref::max_alpha_diff(src_rgba, dec_rgba) <= 16,
+               "etc2: DXT1 1-bit alpha EAC error <= 16");
+    }
+
+    // 4. DXT5 with alpha gradient -> rgba8, RGB PSNR >= 30 dB, alpha error <= 16.
+    {
+        wse::io::BinaryWriter w;
+        write_dds_header(w, 32U, 32U, 0x1007U, 1U, 0x4U, dds_detail::fourcc('D', 'X', 'T', '5'),
+                         0U, 0U, 0U, 0U, 0U);
+        write_bc3_gradient_mip(w, 32U, 32U);
+        DdsImageView view;
+        expect(parse_dds(w.bytes(), view), "etc2: parse DXT5 32x32");
+        Image img;
+        expect(transcode_dds(view, 0U, img) && img.format == Format::rgba8 &&
+                   img.data[0].blocks.size() == 64U * 16U,
+               "etc2: DXT5 -> rgba8 (64 blocks * 16 B)");
+        std::vector<std::uint8_t> src_rgba;
+        expect(decode_dds_mip_rgba8(view, 0U, 0U, src_rgba), "etc2: decode DXT5");
+        const auto dec_rgba = etc2_ref::decode_level_rgba8(img.data[0], img.format);
+        expect(etc2_ref::compute_rgb_psnr_db(src_rgba, dec_rgba) >= 30.0 &&
+                   etc2_ref::max_alpha_diff(src_rgba, dec_rgba) <= 16,
+               "etc2: DXT5 RGB PSNR >= 30 dB and EAC alpha within +-16");
+    }
+
+    // 5. DXT3 -> rgba8, block byte count, alpha within +-16.
+    {
+        wse::io::BinaryWriter w;
+        write_dds_header(w, 16U, 16U, 0x1007U, 1U, 0x4U, dds_detail::fourcc('D', 'X', 'T', '3'),
+                         0U, 0U, 0U, 0U, 0U);
+        write_bc2_mip(w, 16U, 16U);
+        DdsImageView view;
+        expect(parse_dds(w.bytes(), view), "etc2: parse DXT3 16x16");
+        Image img;
+        expect(transcode_dds(view, 0U, img) && img.format == Format::rgba8 &&
+                   img.data[0].blocks.size() == 16U * 16U,
+               "etc2: DXT3 -> rgba8 (16 blocks * 16 B)");
+        std::vector<std::uint8_t> src_rgba;
+        expect(decode_dds_mip_rgba8(view, 0U, 0U, src_rgba), "etc2: decode DXT3");
+        const auto dec_rgba = etc2_ref::decode_level_rgba8(img.data[0], img.format);
+        expect(etc2_ref::compute_rgb_psnr_db(src_rgba, dec_rgba) >= 30.0 &&
+                   etc2_ref::max_alpha_diff(src_rgba, dec_rgba) <= 16,
+               "etc2: DXT3 RGB PSNR >= 30 dB and EAC alpha within +-16");
+    }
+
+    // 6. Uncompressed A8R8G8B8 with 2x2 and 1x1 mips -> rgba8, PSNR >= 30 dB, alpha <= 16.
+    {
+        wse::io::BinaryWriter w;
+        write_dds_header(w, 16U, 16U, 0x2100FU, 5U, 0x41U, 0U, 32U,
+                         0x00FF0000U, 0x0000FF00U, 0x000000FFU, 0xFF000000U, 0x401008U);
+        std::uint32_t mw = 16U, mh = 16U;
+        for (int m = 0; m < 5; ++m) {
+            for (std::uint32_t y = 0; y < mh; ++y) {
+                for (std::uint32_t x = 0; x < mw; ++x) {
+                    const std::uint8_t b = static_cast<std::uint8_t>(40U + (x * 96U) / (std::max)(1U, mw));
+                    const std::uint8_t g = static_cast<std::uint8_t>(60U + (y * 96U) / (std::max)(1U, mh));
+                    const std::uint8_t r = static_cast<std::uint8_t>(80U + ((x + y) * 48U) / (std::max)(1U, mw));
+                    const std::uint8_t a = static_cast<std::uint8_t>(64U + ((x * 160U) / (std::max)(1U, mw)));
+                    w.write_byte(b);
+                    w.write_byte(g);
+                    w.write_byte(r);
+                    w.write_byte(a);
+                }
+            }
+            mw = (std::max)(1U, mw >> 1U);
+            mh = (std::max)(1U, mh >> 1U);
+        }
+        DdsImageView view;
+        expect(parse_dds(w.bytes(), view), "etc2: parse A8R8G8B8 16x16 mipmap");
+        Image img;
+        expect(transcode_dds(view, 0U, img) && img.format == Format::rgba8 && img.levels == 5U &&
+                   img.data[3].width == 2U && img.data[3].height == 2U &&
+                   img.data[3].blocks.size() == 16U &&
+                   img.data[4].width == 1U && img.data[4].height == 1U &&
+                   img.data[4].blocks.size() == 16U,
+               "etc2: A8R8G8B8 -> rgba8, 2x2 and 1x1 mips padded to 16 bytes");
+        std::vector<std::uint8_t> src_rgba;
+        expect(decode_dds_mip_rgba8(view, 0U, 0U, src_rgba), "etc2: decode A8R8G8B8 mip 0");
+        const auto dec_rgba = etc2_ref::decode_level_rgba8(img.data[0], img.format);
+        expect(etc2_ref::compute_rgb_psnr_db(src_rgba, dec_rgba) >= 30.0 &&
+                   etc2_ref::max_alpha_diff(src_rgba, dec_rgba) <= 16,
+               "etc2: A8R8G8B8 RGB PSNR >= 30 dB and EAC alpha within +-16");
+    }
+
+    // 7. Cube map (6 faces) + threads 1 vs 4.
+    {
+        wse::io::BinaryWriter w;
+        write_dds_header(w, 8U, 8U, 0x21007U, 2U, 0x4U, dds_detail::fourcc('D', 'X', 'T', '1'),
+                         0U, 0U, 0U, 0U, 0U, 0x401008U, 0xFE00U);
+        for (int f = 0; f < 6; ++f) {
+            write_bc1_gradient_mip(w, 8U, 8U, false, false);
+            write_bc1_gradient_mip(w, 4U, 4U, false, false);
+        }
+        DdsImageView view;
+        expect(parse_dds(w.bytes(), view) && view.face_count == 6U && view.mip_count == 2U,
+               "etc2: parse 6-face DXT1 cubemap");
+        Image img1, img4;
+        expect(transcode_dds(view, 0U, img1, nullptr, 1U) &&
+                   transcode_dds(view, 0U, img4, nullptr, 4U) &&
+                   img1.faces == 6U && img1.levels == 2U && img1.data.size() == 12U,
+               "etc2: cubemap transcodes 6 faces * 2 levels");
+        bool cube_same = (img1.data.size() == img4.data.size());
+        for (std::size_t i = 0; cube_same && i < img1.data.size(); ++i) {
+            cube_same = (img1.data[i].blocks == img4.data[i].blocks);
+        }
+        expect(cube_same, "etc2: cubemap threads=1 and threads=4 give identical bytes");
+
+        // texture_cache.h round-trip + corruption + cache_key tests
+        const std::vector<std::uint8_t> encoded = encode(img1);
+        expect(!encoded.empty(), "texture_cache: encode cubemap");
+        Image decoded;
+        std::string cache_err;
+        expect(decode(encoded, decoded, &cache_err) && decoded.format == img1.format &&
+                   decoded.width == img1.width && decoded.height == img1.height &&
+                   decoded.levels == img1.levels && decoded.faces == img1.faces &&
+                   decoded.data.size() == img1.data.size() &&
+                   decoded.data[11].blocks == img1.data[11].blocks,
+               "texture_cache: encode/decode round-trip");
+
+        auto corrupt_u32 = [&](std::size_t offset, std::uint32_t value) {
+            std::vector<std::uint8_t> bad = encoded;
+            bad[offset + 0] = static_cast<std::uint8_t>(value & 0xFFU);
+            bad[offset + 1] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
+            bad[offset + 2] = static_cast<std::uint8_t>((value >> 16U) & 0xFFU);
+            bad[offset + 3] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
+            return bad;
+        };
+        std::vector<std::uint8_t> bad_magic = encoded;
+        bad_magic[0] = 'X';
+        std::vector<std::uint8_t> truncated(encoded.begin(), encoded.end() - 1);
+        std::vector<std::uint8_t> trailing = encoded;
+        trailing.push_back(0U);
+        const std::vector<std::uint8_t> bad_version = corrupt_u32(8U, 99U);
+        const std::vector<std::uint8_t> bad_format = corrupt_u32(12U, 7U);
+        const std::vector<std::uint8_t> bad_dim = corrupt_u32(16U, 0U);
+        const std::vector<std::uint8_t> huge_levels = corrupt_u32(24U, 0x7FFFFFFFU);
+        const std::vector<std::uint8_t> huge_faces = corrupt_u32(28U, 0x7FFFFFFFU);
+        const std::vector<std::uint8_t> bad_lvl_dim = corrupt_u32(32U, 16U);
+        const std::vector<std::uint8_t> bad_lvl_bytes = corrupt_u32(40U, 999U);
+        Image discard_out;
+        expect(!decode(std::span<const std::uint8_t>(), discard_out) &&
+                   !decode(bad_magic, discard_out) &&
+                   !decode(truncated, discard_out) &&
+                   !decode(trailing, discard_out) &&
+                   !decode(bad_version, discard_out) &&
+                   !decode(bad_format, discard_out) &&
+                   !decode(bad_dim, discard_out) &&
+                   !decode(huge_levels, discard_out) &&
+                   !decode(huge_faces, discard_out) &&
+                   !decode(bad_lvl_dim, discard_out) &&
+                   !decode(bad_lvl_bytes, discard_out),
+               "texture_cache: rejects empty, bad magic, truncation, trailing, version, format, oversized counts, and level mismatches");
+
+        const auto src_u8 = to_u8(w.bytes());
+        const std::string k0 = cache_key(src_u8, 0U);
+        const std::string k0_again = cache_key(src_u8, 0U);
+        const std::string k1 = cache_key(src_u8, 1U);
+        std::vector<std::uint8_t> tweaked = src_u8;
+        tweaked.back() ^= 0x1U;
+        const std::string kt = cache_key(tweaked, 0U);
+        auto is_valid_key = [](const std::string& k) {
+            if (k.size() != 21U || k.substr(16U) != ".etc2") return false;
+            for (std::size_t i = 0; i < 16U; ++i) {
+                const char c = k[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            }
+            return true;
+        };
+        expect(is_valid_key(k0) && k0 == k0_again && k0 != k1 && k0 != kt && k1 != kt,
+               "texture_cache: cache_key is 16 lowercase hex + .etc2, stable, and sensitive to bytes and first_mip");
+    }
+
+    // 8. Retail Warband check (only when WSE_WARBAND_ROOT or default GOG install exists).
+    {
+        std::error_code ec;
+        const char* root_env = std::getenv("WSE_WARBAND_ROOT");
+        const std::filesystem::path retail_root(
+            (root_env != nullptr && root_env[0] != '\0') ? root_env
+                                                          : "C:/GOG Games/Mount and Blade - Warband");
+        if (std::filesystem::exists(retail_root / "Modules/Native/module.ini", ec)) {
+            std::vector<std::filesystem::path> dds_files;
+            for (const std::filesystem::path& dir : {retail_root / "Modules/Native/Textures",
+                                                     retail_root / "Textures"}) {
+                if (!std::filesystem::exists(dir, ec)) {
+                    continue;
+                }
+                for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
+                    if (!entry.is_regular_file(ec)) {
+                        continue;
+                    }
+                    const std::string ext = wse::platform::ascii_lower(entry.path().extension().string());
+                    if (ext == ".dds") {
+                        dds_files.push_back(entry.path());
+                    }
+                }
+            }
+            std::sort(dds_files.begin(), dds_files.end());
+
+            std::size_t count = 0;
+            std::size_t retail_failures = 0;
+            std::uint64_t total_in_bytes = 0;
+            std::uint64_t total_out_bytes = 0;
+            double total_psnr_db = 0.0;
+
+            const unsigned retail_threads =
+                (std::max)(1U, (std::min)(8U, std::thread::hardware_concurrency()));
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<std::byte> file_bytes;
+            std::vector<std::uint8_t> ref_rgba;
+            for (const std::filesystem::path& path : dds_files) {
+                std::ifstream fp(path, std::ios::binary | std::ios::ate);
+                if (!fp) {
+                    ++retail_failures;
+                    continue;
+                }
+                const std::streamsize sz = fp.tellg();
+                if (sz <= 0) {
+                    ++retail_failures;
+                    continue;
+                }
+                file_bytes.resize(static_cast<std::size_t>(sz));
+                fp.seekg(0, std::ios::beg);
+                if (!fp.read(reinterpret_cast<char*>(file_bytes.data()), sz)) {
+                    ++retail_failures;
+                    continue;
+                }
+
+                DdsImageView view;
+                std::string err;
+                if (!parse_dds(file_bytes, view, &err)) {
+                    ++retail_failures;
+                    std::printf("FAIL  retail parse_dds %s: %s\n", path.string().c_str(), err.c_str());
+                    continue;
+                }
+                Image etc_img;
+                if (!transcode_dds(view, 0U, etc_img, &err, retail_threads)) {
+                    ++retail_failures;
+                    std::printf("FAIL  retail transcode_dds %s: %s\n", path.string().c_str(), err.c_str());
+                    continue;
+                }
+                if (!decode_dds_mip_rgba8(view, 0U, 0U, ref_rgba, &err)) {
+                    ++retail_failures;
+                    std::printf("FAIL  retail decode_dds_mip_rgba8 %s: %s\n", path.string().c_str(), err.c_str());
+                    continue;
+                }
+
+                const auto dec_rgba = etc2_ref::decode_level_rgba8(etc_img.data[0], etc_img.format);
+                total_psnr_db += etc2_ref::compute_rgb_psnr_db(ref_rgba, dec_rgba);
+                total_in_bytes += static_cast<std::uint64_t>(file_bytes.size());
+                for (const Level& lvl : etc_img.data) {
+                    total_out_bytes += static_cast<std::uint64_t>(lvl.blocks.size());
+                }
+                ++count;
+            }
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            const double mean_psnr = (count > 0U) ? (total_psnr_db / static_cast<double>(count)) : 0.0;
+            std::printf("retail etc2: count=%zu in=%llu out=%llu time=%.3fs mean_psnr=%.2f dB failures=%zu\n",
+                        count,
+                        static_cast<unsigned long long>(total_in_bytes),
+                        static_cast<unsigned long long>(total_out_bytes),
+                        seconds,
+                        mean_psnr,
+                        retail_failures);
+            expect(count > 0U && retail_failures == 0U && mean_psnr >= 30.0,
+                   "retail Warband DDS -> ETC2 transcoding succeeded with mean PSNR >= 30 dB");
+        }
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -2572,6 +3416,7 @@ int run_asset_suite(const char* fixture_path) {
     test_p5_shader_review_regressions();
     test_p5_lowering_review_regressions();
     test_d3d9_shader_translation();
+    test_etc2_transcode_and_texture_cache();
 
     if (failures == 0) {
         std::printf("asset tests: PASS\n");
