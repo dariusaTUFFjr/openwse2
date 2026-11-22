@@ -6238,6 +6238,26 @@ int run_recomp_suite(const char* fixture_path) {
     test_d3d9_capture();
     test_d3d9_backend_and_preshader();
     test_unwinder();
+    {
+        GuestStack gs(64 * 1024);
+        expect(gs.data() != nullptr && gs.usable_size() >= 64 * 1024 + 64,
+               "GuestStack: allocates guarded usable range");
+        std::memset(gs.data(), 0xA5, 64 * 1024);
+        bool ok = true;
+        for (std::size_t i = 0; i < 64 * 1024; ++i) {
+            if (gs.data()[i] != 0xA5) {
+                ok = false;
+                break;
+            }
+        }
+        CpuState gs_cpu;
+        gs.prepare(gs_cpu);
+        const std::uint64_t rsp = gs_cpu.gpr[static_cast<int>(Reg::rsp)];
+        std::uint64_t ret_word = 0;
+        std::memcpy(&ret_word, reinterpret_cast<const void*>(rsp), 8);
+        expect(ok && (rsp % 16) == 8 && ret_word == GuestStack::kReturnSentinel,
+               "GuestStack: whole usable range is writable and prepare sets aligned sentinel");
+    }
     if (g_failures == 0) {
         std::printf("recomp tests: PASS\n");
         return 0;

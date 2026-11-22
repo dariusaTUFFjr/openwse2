@@ -105,8 +105,8 @@ private:
         auto obj = std::make_shared<kernel::Object>();
         obj->kind = kernel::Kind::thread;
         obj->suspend = (flags & kCreateSuspended) != 0 ? 1 : 0;
-        obj->stack.assign(bytes, 0);
-        const auto bottom = reinterpret_cast<std::uintptr_t>(obj->stack.data());
+        obj->stack = std::make_unique<GuestStack>(bytes);
+        const auto bottom = reinterpret_cast<std::uintptr_t>(obj->stack->data());
         const std::uint64_t top = (bottom + bytes - 64) & ~std::uint64_t{15};
         teb::GuestThread& guest = process_.create_thread(top, bottom);
         obj->tid = guest.id;
