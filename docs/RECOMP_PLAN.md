@@ -37,7 +37,7 @@ there are no CRT DLLs to replace:
 | --- | --- | --- |
 | Shipped x64 DLLs | `lua5164` (103), `fmodex64` (54, delay-loaded) | **Translate `lua5164.dll`** from the user's install (its only imports are 105 `KERNEL32`). **Shim `fmodex64`** directly onto P6's `WseAudioMixer` + SDL3 audio stream (decided with the user, 2026-11-21; avoids translating FMOD and shimming `WINMM`/`MSACM32`/`WSOCK32`). |
 | Core OS | `KERNEL32` (223), `USER32` (40), `ADVAPI32` (10), `GDI32`, `SHELL32`, `SHLWAPI`, `IMM32`, `ole32`, `OLEAUT32`, `PSAPI`, `dbghelp` (8) | Native shims: files go through the SAF `Vfs` (case-insensitive, `\` separators) with a permanent app-private writable layer (`filesDir/wse2/user/`); threads, synchronization, time, memory and TLS are emulated; windows and messages are a fake `HWND` fed from SDL events (including soft-keyboard `WM_CHAR`/`WM_KEYDOWN`) into the exe's own `WndProc`. |
-| Graphics | `d3d9` (1 + COM vtables), `d3dx9_43` (17) | Our own D3D9 subset over the Vulkan RHI (P4 GPU path). Two-step shaders (decided with the user, 2026-11-21): R5a maps `ID3DXEffect` technique/parameter names onto P5's `GLShaders` → SPIR-V pipeline; R5b adds `fx_2_0` / SM2–3 bytecode → SPIR-V for custom mod `.fxo` effects. Textures use native Vulkan BC when supported, else one-time cached ETC2/ASTC transcoding (RGBA8 + mip-cap as temporary R5a bring-up fallback). |
+| Graphics | `d3d9` (1 + COM vtables), `d3dx9_43` (17) | Our own D3D9 subset on Vulkan. Shaders: the game's own `fx_2_0` effects and SM2/SM3 bytecode, translated to GLSL and compiled to SPIR-V with `glslang`, from R5a on (decided with the user, 2026-11-22, replacing the 2026-11-21 `GLShaders` bridge). Textures use native Vulkan BC when supported, else one-time cached ETC2/ASTC transcoding (RGBA8 + mip-cap as temporary R5a bring-up fallback). |
 | Input | `DINPUT8`, `XINPUT1_3` (3), `WINMM` (3) | SDL keyboard, mouse and gamepad; context-gated touch overlay drawn in Vulkan inside `Present()` (`docs/PLATFORM_PLAN.md` "P14"). |
 | Network | `WS2_32` (37), `WINHTTP` (11), `WININET`, `urlmon`, `steam_api64` (10) | Offline stubs through v1 (R4–R11); R12 wires `WS2_32` onto POSIX/BSD sockets and `WINHTTP`/`WININET` onto Android TLS for LAN, direct-IP, and non-Steam WSE2 community servers (`steam_api64` stays stubbed; decided with the user, 2026-11-22). |
 
@@ -69,7 +69,7 @@ there are no CRT DLLs to replace:
 | **R2 Host differential rig** | The same lifter targets **x86-64 on the PC**, so translated and original code run side by side on the real CPU (as the 2026-11 flag rig did). Every function is checked on generated inputs. CI runs the lifter on synthetic test binaries only (no retail code), and an arm64 CI runner (`ubuntu-24.04-arm`) executes the ARM64 output. |
 | **R3 Runtime core** | Guest memory, TEB/TLS, threads, the dispatch table, the import-thunk ABI bridge, memory-ordering lowering, Win64 unwinding and C++ EH. |
 | **R4 OS shims** | All 546 imports listed with an owner; the startup path (`WinMain`, window, configuration, file I/O) runs to the main loop on a recording stub D3D9 device, with `lua5164` translated (see "R4 design"). |
-| **R5 Graphics** | D3D9 subset + D3DX over Vulkan (`R5a` System Vulkan + P5 `GLShaders` → SPIR-V + base forward rendering; `R5b` cached ETC2/ASTC texture transcoding, `fx_2_0` SM2/3 → SPIR-V for custom mod effects, real-time `R16F`/`R32F` shadow maps, Vulkan FSR 1.0/CAS spatial upscaling + FXAA, and live thermal dynamic resolution; `R5c` PanVK/Turnip `AHardwareBuffer` + `ASurfaceControl` bridge); HDR/DOF/water reflections/HDR10 follow in `R11`. |
+| **R5 Graphics** | D3D9 subset + D3DX over Vulkan (`R5a` System Vulkan + `fx_2_0` effects and SM2/SM3 bytecode → SPIR-V + base forward rendering, checked against real D3D9 on the PC; `R5b` cached ETC2/ASTC texture transcoding, real-time `R16F`/`R32F` shadow maps, Vulkan FSR 1.0/CAS spatial upscaling + FXAA, and live thermal dynamic resolution; `R5c` PanVK/Turnip `AHardwareBuffer` + `ASurfaceControl` bridge); HDR/DOF/water reflections/HDR10 follow in `R11`. |
 | **R6 Audio, input, touch & Desktop Mode** | 54 `fmodex64` exports shimmed onto P6 `WseAudioMixer` + SDL3 audio (`lua5164` already translated in R4); DInput/XInput from SDL; Vulkan touch overlay inside `Present()` with per-scene context switching (`ShowCursor` + PDB `g_gameScreen`), combat haptics, soft keyboard `WM_CHAR`, gamepad auto-hide, and raw Pointer Capture mouse + full keyboard support for Desktop Mode / external displays. |
 | **R7 WSL x86-64 bring-up & save oracle** | Whole exe translated for x86-64 running in **WSL Ubuntu** with our shims only (Vulkan via WSLg or Lavapipe frame-dump + scripted input): main menu, campaign map, scene, battle. Savegame oracle: retail Windows saves load, and our saves load in retail Windows Warband. |
 | **R8 Phone bring-up (ambitious v1: `Native` + heavy-mod smoke)** | On-phone translation proven against OOM stalls (the batch memory fix itself lands in the next native update, before R5; cold `-O1` test) + PC-zip import; cross-batch direct call linking + unscalarized 128-bit SSE→NEON; permanent `filesDir/wse2/user/` + Save Manager with auto-sync SAF mirror, live quick-settings drawer, per-module profiles, and branded cache pre-warm loading screen (`docs/PLATFORM_PLAN.md` "P14"); `Native` playable end-to-end on the reference phone (OPPO Reno 11, 12 GB, Mali-G68/PanVK + System Vulkan) hitting 30 FPS sustained for 30+ min in 100-troop battles (~720p/85% + FSR/CAS) and 60 FPS in menus/map, plus `Phantasy Calradia` booting to campaign/battle. |
@@ -834,22 +834,56 @@ own, and none blocks another.
   implementation that delivers crisp, PC-grade forward rendering (UI, campaign map, scenes, skinned
   battles, real-time shadow maps, FSR 1.0/CAS spatial upscaling, FXAA, and live thermal dynamic
   resolution) in v1.
-- **Sub-slices (ambitious v1 scope, decided with the user, 2026-11-22):**
-  - **R5a (System Vulkan + P5 shader bridge + base draws):** Wire `shim_d3d9.h` onto `VulkanRhiDevice`
-    using System Vulkan (`VK_KHR_android_surface` swapchain) first to minimize variables. Implement
-    `IDirect3DStateBlock9` capture/apply, growable dynamic vertex/index and effect constant ring
-    buffers (`D3DLOCK_DISCARD`/`NOOVERWRITE`, sized to scale to 1,000+ troop draw/bone-palette
-    counts without pipeline stalls or per-draw descriptor allocations), `SetStreamSourceFreq`
-    instancing, persistent `VkPipelineCache`, and map `ID3DXEffect` technique/parameter names (`480`
-    queried techniques, `164` parameters in the R5 census) onto the existing P5 `GLShaders` → SPIR-V
-    compiler (`wse_shader` + `SpirvShaderCache`). Decode DXT textures via `dds.h` with native BC
-    when `textureCompressionBC` is present, or temporary RGBA8 + P10.7 mip-budget capping during R5a
-    bring-up. Advertise HDR (`A16B16G16R16F`), DOF, and MSAA (`CheckDeviceMultiSampleType`, `666`
-    probes) as unavailable via `CheckDeviceFormat`/`CheckDeviceMultiSampleType` until R11.
+- **Shaders and testing (decided with the user, 2026-11-22):** the game's own D3D9 shader bytecode
+  is translated from the start (no `GLShaders` bridge), and frames are checked against real D3D9 on
+  the user's PC before the phone.
+  - *Why bytecode:* WSE2's effects are its own files (`mb_wse2_3_0.fxo`: 399 Shader Model 3 shaders,
+    median 158 instructions, max 400; `mb_wse2_2a`/`2b.fxo`: 377 Shader Model 2 shaders), and every
+    effect file in the install uses only **35 distinct instructions** (mostly `mul`, `mad`, `add`,
+    `dp3`, `mov`, `tex`, `rcp`, `rsq`, `nrm`, `cmp`, with `if`/`loop`/`rep` flow control; local
+    census of the user's install, 2026-11-22, counts only). The `GLShaders` folder (157 files) is
+    Warband's original OpenGL set without WSE2's variants, so mapping effects onto it would change the
+    look and miss WSE2-only effects. Translating bytecode is 1:1 by construction and covers mods'
+    custom `.fxo` effects too.
+  - *How:* each shader's bytecode becomes GLSL 450 text and is compiled to SPIR-V by the `glslang`
+    already built into the app (`wse_glslang`), cached like P5's `SpirvShaderCache` (keyed by the
+    bytecode hash and the translator version), so no SPIR-V emitter is written by hand.
+  - *Reference on the PC:* `tools/r4_run --capture <file>` records every D3D9/D3DX call of a run with
+    the data it passes (vertex, index and texture uploads, constants, shader bytecode) to a local file;
+    a Windows tool (`tools/r5_replay_d3d9.cpp`, local only, like `r0_pc_reference.cpp`) replays it on
+    the real `d3d9.dll` and writes reference frames; our Vulkan device replays the same capture on
+    the host (Intel HD 520 Vulkan or Lavapipe in WSL) and the frames are compared with a tolerance.
+    Captures and frames hold retail data, so they stay on the PC and are never committed (`AGENTS.md`
+    §1). A per-shader check does the same for single shaders: each of the 776 shaders draws a test
+    quad with random constants on real D3D9 and through our translation. CI tests use synthetic
+    bytecode only.
+- **Sub-slices (ambitious v1 scope, decided with the user, 2026-11-22; R5a redesigned 2026-11-22):**
+  - **R5a (D3D9 on Vulkan with translated shaders, System Vulkan, main menu):** in order:
+    1. **Effects (`fx_2_0`):** a parser for the `.fxo` container (parameters with their types and
+       annotations, techniques, passes with their render and sampler states and shader blobs) behind
+       our `ID3DXEffect` (`shim_d3dx.h`), so `SetFloat`/`SetMatrix`/`SetTexture` and `BeginPass`
+       resolve to real constants and states. Host test: every effect in the install parses with the
+       census counts (480 techniques queried at startup, 164 parameters).
+    2. **Shader translator:** SM2/SM3 bytecode (`vs`/`ps` 2.0, 2.x, 3.0) to GLSL 450 to SPIR-V, the 35
+       measured instructions first, D3D9 rules kept (constant registers, `mova`/relative addressing,
+       `texkill`, `dsx`/`dsy`, half-pixel offset, clip-space depth 0..1). Host tests on hand-assembled
+       synthetic bytecode; locally, all 776 shaders compile and the per-shader check passes.
+    3. **Capture and PC reference:** `r4_run --capture` and `tools/r5_replay_d3d9.cpp` (above).
+    4. **The Vulkan D3D9 device:** a new D3D9-shaped Vulkan layer beside `RhiDevice` (which is too
+       narrow: RGBA8 textures only, one vertex layout, one pipeline shape) behind `shim_d3d9.h`:
+       resources (vertex/index buffers with `D3DLOCK_DISCARD`/`NOOVERWRITE` rings, textures with
+       native BC when `textureCompressionBC` exists, else RGBA8 + P10.7 mip cap for now, render targets
+       and depth in the census formats), vertex declarations, render/sampler states mapped to cached
+       pipelines (`VkPipelineCache` kept on disk), `IDirect3DStateBlock9`, `SetStreamSourceFreq`
+       instancing, `Clear`/`Draw*`/`Present`; growable rings sized for 1,000+ troop battles and no
+       per-draw descriptor allocation. Host test: replaying captured frames matches the D3D9 reference
+       within tolerance.
+    5. **On the phone:** System Vulkan (`VK_KHR_android_surface` swapchain), the main menu drawn.
+    HDR (`A16B16G16R16F`), DOF and MSAA (`CheckDeviceMultiSampleType`, `666` probes) stay advertised
+    as unavailable until R11.
   - **R5b (Cached ETC2/ASTC, `fx_2_0` SM2/3 → SPIR-V, shadows, FSR/CAS + FXAA & dynamic resolution):**
     Add one-time DXT1/3/5 → ETC2/ASTC transcoding cached on disk (replacing the temporary RGBA8
-    fallback on drivers without native BC); add the `fx_2_0` (`.fxo`) parser + SM2/3 bytecode →
-    SPIR-V translator so custom mod `.fxo` effects run in v1; support the retail renderer's own
+    fallback on drivers without native BC); support the retail renderer's own
     shadow pass (it draws Warband's shadows itself: the `R16F`/`R32F` render targets and depth
     textures the census shows it probing, sampled by its own shaders; no new shadow technique, so
     rendering stays 1:1 with the PC); and add a Vulkan post-pass providing
@@ -865,9 +899,13 @@ own, and none blocks another.
     (`AHardwareBuffer` + `ASurfaceControl`, `docs/PLATFORM_PLAN.md`) so direct-loaded PanVK (Mali-G68)
     and Turnip (Adreno) present frames cleanly alongside System Vulkan, including clean swapchain
     recreation on rotation, folding, and app resume.
-- **Depends on:** R4 green on phone; P4 `VulkanRhiDevice` GPU path; P5 `wse_shader` +
-  `SpirvShaderCache`.
+- **Depends on:** R4 green on phone (done 2026-11-22); P4's Vulkan loader and device setup
+  (`VulkanDriverLoader`); `wse_glslang` and P5's SPIR-V cache. R5 is shim code only, outside the
+  translator fingerprint, so its updates never retranslate the game.
 - **Done when:**
+  - **R5a:** every effect parses and all 776 shaders translate and compile on the PC; the per-shader
+    check and the replayed main-menu frames match real D3D9 within tolerance; the main menu renders
+    on the phone and holds **60 FPS**, measured on the replay workload.
   - Host synthetic D3D9→Vulkan tests pass in CI (`host-linux` + `android-arm64`), including shadow
     render-target, FSR/CAS, and FXAA passes.
   - On the user's phone (System Vulkan in R5a, PanVK in R5c), `Native` renders the main menu,
@@ -875,8 +913,11 @@ own, and none blocks another.
     alpha-test/blend, FSR/CAS upscaling + FXAA, and zero validation/fault crashes; main menu holds
     **60 FPS** and steady-state shader/texture caches hit with zero mid-frame recompiles.
 - **Risks:**
-  - `ID3DXEffect` technique/parameter naming differences between `.fxo` and `GLShaders` XML pairs
-    (mitigated by R5a's census list of 480 techniques + 164 parameters and R5b's `.fxo` SM2/3 path).
+  - D3D9 shader semantics GLSL does not share (constant register files, relative addressing,
+    half-pixel offset, depth range, sampler state living outside the shader) translated wrongly
+    (mitigated by the per-shader check against real D3D9 on the PC for all 776 shaders).
+  - A capture too large for the PC's free space (textures dominate; mitigated by storing each
+    texture once by hash and capturing only a few frames at a time).
   - Shadow-map pass bandwidth on mid-range Mali-G68 (mitigated by keeping shadow resolution and
     toggle configurable in Settings and the live drawer, with conservative mid-range defaults).
   - `AHardwareBuffer` sync-fence / swapchain latency quirks across PanVK and Turnip versions
@@ -1174,7 +1215,7 @@ own, and none blocks another.
 | Android refuses to run generated code | Resolved in R0 (a): `memfd` (`android_dlopen_ext`) with our own ELF loader (`code_loader.h`) as fallback. |
 | On-phone translation OOM / 3.5–4 h runtime | Stalled at 77/80 on the 3 largest batches (memory, most likely; WSL hung on the same batches); the next native update translates the largest batches first, splits oversized batches by instruction/function cap and bounds worker RSS; R8 tests `-O1` on cold batches, and keeps standalone PC prep (R10) as a fast path. |
 | C++ exceptions and SEH | Built in R3 and tested on x86/arm64 CI; R7 verifies live retail throw paths under WSL `gdb`. |
-| D3DX `fx_2_0` effect bytecode vs `GLShaders` | R5a bridges `ID3DXEffect` onto the verified P5 `GLShaders` → SPIR-V path first; R5b adds offline-tested `fx_2_0` SM2/3 → SPIR-V for custom mod effects. |
+| D3DX `fx_2_0` effects and SM2/SM3 shader bytecode | R5a translates the game's own bytecode (35 distinct instructions across the install's effects) to SPIR-V and checks every shader and the replayed frames against real D3D9 on the user's PC (decided with the user, 2026-11-22). |
 | DXT1/3/5 VRAM & bandwidth on mobile GPUs | R5a uses native Vulkan `textureCompressionBC` where present (else temporary RGBA8 + mip cap); R5b caches one-time ETC2/ASTC transcodes on disk. |
 | Custom-ICD (`PanVK`/`Turnip`) presentation sync | R5a proves D3D9→Vulkan on System Vulkan (`VkSurfaceKHR`) first; R5c isolates `AHardwareBuffer` + `ASurfaceControl` fencing. |
 | Sustained 30-min thermal throttling on mid-range SoCs | R8 gates "done" on a 30-minute 100-troop battle log with ADPF, constant-buffer batching, persistent `VkPipelineCache`, and P8 thermal scaling. |
