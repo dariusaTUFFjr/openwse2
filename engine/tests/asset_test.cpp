@@ -2525,9 +2525,10 @@ void test_d3d9_shader_translation() {
                has(v, "layout(location = 0) out vec4 out_oT0;"),
            "d3d9 shader: vs_2_0 inputs by register, BGRA swizzle helper, def literal, saturate, position flip, texcoord varying");
     expect(ps_ok && p.pixel && p.samplers[0] == 2 && has(p, "uniform sampler2D s0;") && has(p, "texture(s0, (t0).xy)") &&
-               has(p, "u.posfix.x") &&
+               has(p, "layout(constant_id = 0) const int wse_alpha_func = 0;") &&
+               has(p, "if (wse_alpha_func != 0)") && has(p, "u.posfix.y") && !has(p, "u.posfix.x") &&
                has(p, "discard;") && has(p, "layout(location = 0) in vec4 t0;") && has(p, "layout(location = 0) out vec4 out_oC0;"),
-           "d3d9 shader: ps_2_0 texcoord input links to the vertex output, texld, texkill, alpha-test epilogue, colour output");
+           "d3d9 shader: ps_2_0 texcoord input links to the vertex output, texld, texkill, spec-constant alpha-test epilogue, colour output");
     expect(!sh::translate(std::span<const std::uint32_t>(unsupported), bad) && bad.error.find("unsupported instruction 25") != std::string::npos,
            "d3d9 shader: an instruction outside the scope is refused by name");
     expect(sh::link_location(sh::kTexCoord, 3) == 3 && sh::link_location(sh::kColor, 1) == 11 && sh::link_location(sh::kFog, 0) == 12,

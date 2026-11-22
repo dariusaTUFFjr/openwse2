@@ -3085,11 +3085,19 @@ void test_r5a_vulkan_d3d9_backend() {
             st.viewport = {0, 0, 64, 64, 0.0F, 1.0F};
             bk.clear(st, 3, 0xFF102040U, 1.0F, 0, {});
             bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+            // Alpha test enabled (GREATEREQUAL -> spec constant 7) and ALWAYS (8 -> spec constant 0).
+            st.rs[15] = 1;
+            st.rs[24] = 128;
+            st.rs[25] = 7;
+            bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+            st.rs[25] = 8;
+            bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+            st.rs[15] = 0;
             std::vector<std::uint8_t> rgba;
             std::uint32_t rw = 0, rh = 0;
             expect(bk.present(&rgba, &rw, &rh) && rw == 64 && rh == 64 && rgba.size() == 64U * 64U * 4U &&
                        bk.compiled_shader_count() == 2U && bk.failed_shader_count() == 0U,
-                   "R5a VulkanD3d9Backend: mock shaders compile cleanly and present succeeds");
+                   "R5a VulkanD3d9Backend: mock shaders compile cleanly and present succeeds (alpha test off and on)");
 
             // R5b render-to-texture: an R32F render-target texture, a standalone depth surface, a
             // draw into them, then back to the backbuffer sampling the texture (paths + teardown).

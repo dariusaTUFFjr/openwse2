@@ -626,6 +626,7 @@ private:
             epilogue += "    gl_Position.y = -gl_Position.y;\n";
             epilogue += "    gl_Position.xy += u.posfix.xy * gl_Position.w;\n";
         } else {
+            g += "layout(constant_id = 0) const int wse_alpha_func = 0;\n";
             for (const Semantic& in : s_.inputs) {
                 const int loc = link_location(in.usage, in.index);
                 if (loc < 0) return fail("pixel input with no link location");
@@ -637,13 +638,13 @@ private:
                 if (written_out_.count((kColorOut << 8) | static_cast<std::uint32_t>(n)) != 0) {
                     g += "layout(location = " + std::to_string(n) + ") out vec4 out_oC" + std::to_string(n) + ";\n";
                     if (n == 0) {
-                        // D3D9 alpha test (D3DRS_ALPHATESTENABLE / ALPHAFUNC / ALPHAREF): u.posfix.x is
-                        // D3DCMPFUNC 1..7 (0 = disabled or ALWAYS), u.posfix.y is the 8-bit reference 0..255.
+                        // D3D9 alpha test (D3DRS_ALPHATESTENABLE / ALPHAFUNC / ALPHAREF): specialization constant
+                        // `wse_alpha_func` is D3DCMPFUNC 1..7 (0 = disabled or ALWAYS), `u.posfix.y` is the 8-bit reference 0..255.
                         epilogue +=
-                            "    { int af = int(u.posfix.x + 0.5); if (af != 0) { float a8 = floor(clamp(oC0.a, 0.0, 1.0) * 255.0 + 0.5); "
-                            "float ar = u.posfix.y; bool ok = true; if (af == 1) ok = false; else if (af == 2) ok = a8 < ar; "
-                            "else if (af == 3) ok = a8 == ar; else if (af == 4) ok = a8 <= ar; else if (af == 5) ok = a8 > ar; "
-                            "else if (af == 6) ok = a8 != ar; else if (af == 7) ok = a8 >= ar; if (!ok) discard; } }\n";
+                            "    if (wse_alpha_func != 0) { float a8 = floor(clamp(oC0.a, 0.0, 1.0) * 255.0 + 0.5); "
+                            "float ar = u.posfix.y; bool ok = true; if (wse_alpha_func == 1) ok = false; else if (wse_alpha_func == 2) ok = a8 < ar; "
+                            "else if (wse_alpha_func == 3) ok = a8 == ar; else if (wse_alpha_func == 4) ok = a8 <= ar; else if (wse_alpha_func == 5) ok = a8 > ar; "
+                            "else if (wse_alpha_func == 6) ok = a8 != ar; else if (wse_alpha_func == 7) ok = a8 >= ar; if (!ok) discard; }\n";
                     }
                     epilogue += "    out_oC" + std::to_string(n) + " = oC" + std::to_string(n) + ";\n";
                 }

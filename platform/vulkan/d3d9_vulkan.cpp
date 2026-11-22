@@ -860,6 +860,7 @@ struct PipelineKey {
     std::uint8_t dst_alpha = 1;
     std::uint8_t op_alpha = 1;
     std::uint8_t color_mask = 0xF;
+    std::uint8_t alpha_func = 0;
     bool operator==(const PipelineKey& o) const noexcept = default;
 };
 
@@ -881,7 +882,8 @@ struct PipelineKeyHash {
             (static_cast<std::uint64_t>(k.src_blend) << 20) | (static_cast<std::uint64_t>(k.dst_blend) << 24) |
             (static_cast<std::uint64_t>(k.blend_op) << 28) | (static_cast<std::uint64_t>(k.sep_alpha) << 32) |
             (static_cast<std::uint64_t>(k.src_alpha) << 33) | (static_cast<std::uint64_t>(k.dst_alpha) << 37) |
-            (static_cast<std::uint64_t>(k.op_alpha) << 41) | (static_cast<std::uint64_t>(k.color_mask) << 45);
+            (static_cast<std::uint64_t>(k.op_alpha) << 41) | (static_cast<std::uint64_t>(k.color_mask) << 45) |
+            (static_cast<std::uint64_t>(k.alpha_func) << 49);
         hash_mix(h, packed);
         return static_cast<std::size_t>(h);
     }
@@ -3972,6 +3974,10 @@ struct VulkanD3d9Backend::Impl {
                             const VertexDeclObj* decl) {
         if (const auto it = pipeline_cache_map.find(key); it != pipeline_cache_map.end()) return it->second;
 
+        const std::int32_t alpha_func_val = static_cast<std::int32_t>(key.alpha_func);
+        const VkSpecializationMapEntry spec_entry{0U, 0U, sizeof(std::int32_t)};
+        const VkSpecializationInfo spec_info{1U, &spec_entry, sizeof(std::int32_t), &alpha_func_val};
+
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -3981,6 +3987,7 @@ struct VulkanD3d9Backend::Impl {
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = ps.mod;
         stages[1].pName = "main";
+        stages[1].pSpecializationInfo = &spec_info;
 
         std::vector<VkVertexInputAttributeDescription> attrs;
         std::array<bool, 16> used_bindings{};
@@ -4248,6 +4255,9 @@ struct VulkanD3d9Backend::Impl {
         pkey.dst_alpha = static_cast<std::uint8_t>(st.rs[208]);
         pkey.op_alpha = static_cast<std::uint8_t>(st.rs[209]);
         pkey.color_mask = static_cast<std::uint8_t>(st.rs[168] & 0xFU);
+        const std::uint8_t eff_alpha_func =
+            (st.rs[15] != 0U && st.rs[25] >= 1U && st.rs[25] <= 7U) ? static_cast<std::uint8_t>(st.rs[25]) : 0U;
+        pkey.alpha_func = eff_alpha_func;
         if (pkey.blend_enable != 0U && !format_blendable(rp_color_fmt)) pkey.blend_enable = 0U;  // e.g. R32F
 
         VkPipeline pip = get_pipeline(pkey, vs, ps, decl);
@@ -4311,8 +4321,7 @@ struct VulkanD3d9Backend::Impl {
         std::memcpy(ps_ubo.c, st.ps_const.c.data(), sizeof(ps_ubo.c));
         std::memcpy(ps_ubo.i, st.ps_const.i.data(), sizeof(ps_ubo.i));
         std::memcpy(ps_ubo.b, st.ps_const.b.data(), sizeof(ps_ubo.b));
-        if (st.rs[15] != 0U && st.rs[25] >= 1U && st.rs[25] <= 7U) {  // D3DRS_ALPHATESTENABLE
-            ps_ubo.posfix[0] = static_cast<float>(st.rs[25]);
+        if (eff_alpha_func != 0U) {  // D3DRS_ALPHATESTENABLE
             ps_ubo.posfix[1] = static_cast<float>(st.rs[24] & 0xFFU);
         }
         std::memcpy(static_cast<std::uint8_t*>(ubo_ring.mem.mapped) + vs_off, &vs_ubo, sizeof(vs_ubo));
