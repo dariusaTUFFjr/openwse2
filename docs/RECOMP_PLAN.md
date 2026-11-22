@@ -878,7 +878,18 @@ own, and none blocks another.
        instancing, `Clear`/`Draw*`/`Present`; growable rings sized for 1,000+ troop battles and no
        per-draw descriptor allocation. Host test: replaying captured frames matches the D3D9 reference
        within tolerance.
-    5. **On the phone:** System Vulkan (`VK_KHR_android_surface` swapchain), the main menu drawn.
+    5. **On the phone, on every driver the app offers:** the main menu drawn with System Vulkan
+       (`VK_KHR_android_surface` swapchain) **and** with the custom drivers the user picks in
+       Advanced, PanVK on Mali and Turnip on Adreno, which present through the
+       `offscreen_hardware_buffer_bridge` (`AHardwareBuffer` + `ASurfaceControl`; `PresentationPath`
+       in `docs/PLATFORM_PLAN.md`). PanVK and Turnip are first-class targets, not a later add-on
+       (the user, 2026-11-22; this was R5c): the D3D9 layer uses only what all three provide
+       (Vulkan 1.1 core; no geometry or tessellation shaders; at most 4 descriptor sets; 16
+       samplers per stage; varyings within 23 locations, which `link_location` keeps), checks it
+       when the device is created and writes the driver, its version and every missing feature to
+       the game report, and falls back where a driver lacks something optional (BC textures:
+       ETC2/ASTC or RGBA8; `VkPipelineCache`: none). The reference phone is Mali-G68, so PanVK and
+       System Vulkan are checked there; Turnip is checked on an Adreno phone when one is available.
     HDR (`A16B16G16R16F`), DOF and MSAA (`CheckDeviceMultiSampleType`, `666` probes) stay advertised
     as unavailable until R11.
   - **R5b (Cached ETC2/ASTC, `fx_2_0` SM2/3 → SPIR-V, shadows, FSR/CAS + FXAA & dynamic resolution):**
@@ -895,17 +906,17 @@ own, and none blocks another.
     draw state: orthographic projection and the UI effect techniques), compositing the upscaled scene
     beneath. Until that detection is proven per module, menus and screens without a 3D scene run at
     100% scale and only battles and the map use the render scale.
-  - **R5c (PanVK / Turnip custom-ICD presentation):** Wire the `offscreen_hardware_buffer_bridge`
-    (`AHardwareBuffer` + `ASurfaceControl`, `docs/PLATFORM_PLAN.md`) so direct-loaded PanVK (Mali-G68)
-    and Turnip (Adreno) present frames cleanly alongside System Vulkan, including clean swapchain
-    recreation on rotation, folding, and app resume.
+  - **R5c (driver hardening):** PanVK and Turnip already present from R5a; R5c adds clean swapchain
+    and `AHardwareBuffer` recreation on rotation, folding and app resume, and the workarounds the
+    first phone runs on each driver turn up (fences, latency, format quirks).
 - **Depends on:** R4 green on phone (done 2026-11-22); P4's Vulkan loader and device setup
   (`VulkanDriverLoader`); `wse_glslang` and P5's SPIR-V cache. R5 is shim code only, outside the
   translator fingerprint, so its updates never retranslate the game.
 - **Done when:**
   - **R5a:** every effect parses and all 776 shaders translate and compile on the PC; the per-shader
     check and the replayed main-menu frames match real D3D9 within tolerance; the main menu renders
-    on the phone and holds **60 FPS**, measured on the replay workload.
+    on the phone with System Vulkan and with PanVK and holds **60 FPS** on each, measured on the
+    replay workload; the game report lists the driver and any missing feature.
   - Host synthetic D3D9→Vulkan tests pass in CI (`host-linux` + `android-arm64`), including shadow
     render-target, FSR/CAS, and FXAA passes.
   - On the user's phone (System Vulkan in R5a, PanVK in R5c), `Native` renders the main menu,
