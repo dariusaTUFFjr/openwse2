@@ -191,6 +191,7 @@ Newest first. One line per landed milestone; details belong in the commit and in
 
 | Date | Commit | Milestone |
 | --- | --- | --- |
+| 2026-11-22 | — | R5a step 3: the PC reference works: 60 captured frames of the recompiled game replay on the real D3D9 (14,263 calls, 0 failures) and draw Warband's loading screen |
 | 2026-11-22 | — | R5 plan: PanVK and Turnip are first-class from R5a (the user): the D3D9 layer uses only what System Vulkan, PanVK and Turnip all provide, logs the driver and missing features, and the main menu must render on PanVK as well as System Vulkan; R5c becomes driver hardening |
 | 2026-11-22 | — | R5a step 3, part 1: D3D9/D3DX call capture (`wse/recomp/d3d9_capture.h`, `r4_run --capture`), with per-method data rules; the replay on real D3D9 comes next |
 | 2026-11-22 | — | R5a step 2: D3D9 shader bytecode to Vulkan GLSL (`wse/recomp/d3d9_shader.h`); all 1,157 shaders of the install's effects translate and compile with glslang (correctness against real D3D9 is step 3) |

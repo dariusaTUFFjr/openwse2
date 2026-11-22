@@ -173,9 +173,15 @@ struct Replay {
         return hr >= 0;
     }
 
+    bool trace = std::getenv("WSE_REPLAY_TRACE") != nullptr;  // print each call before making it
+
     void run(const cap::Call& c) {
         ++calls;
         keep.clear();
+        if (trace) {
+            std::fprintf(stderr, "%d %s::%s\n", calls, c.iface.c_str(), c.method.c_str());
+            std::fflush(stderr);
+        }
         if (c.iface.rfind("IDirectInput", 0) == 0 || c.iface == "DINPUT8.dll" || c.method == "AddRef" || c.method == "Release" ||
             c.method == "QueryInterface" || c.method == "SetStateManager" || is_query(c.method)) {
             ++skipped;
@@ -227,6 +233,12 @@ struct Replay {
             std::uint32_t w = 0, h = 0;
             std::memcpy(&w, pp, 4);
             std::memcpy(&h, pp + 4, 4);
+            // As the recording device sized it (shim_d3d9.h reset_buffers): a zero field takes the
+            // device's default, 1920 x 1080.
+            if (w == 0) w = 1920;
+            if (h == 0) h = 1080;
+            std::memcpy(pp, &w, 4);
+            std::memcpy(pp + 4, &h, 4);
             SetWindowPos(hwnd, nullptr, 0, 0, static_cast<int>(w), static_cast<int>(h), SWP_NOMOVE | SWP_NOZORDER);
             a[m == "Reset" ? 0 : 4] = reinterpret_cast<u64>(pp);
             if (m == "CreateDevice") a[2] = reinterpret_cast<u64>(hwnd);
@@ -273,6 +285,12 @@ struct Replay {
             if (save_frames.count(frame) != 0 || (save_all_tenth && frame % 10 == 0)) save(frame);
         }
 
+        if (trace && c.iface == "d3dx9_43.dll") {
+            for (int i = 0; i < 8; ++i) std::fprintf(stderr, "    a[%d] = %llx (captured %llx)\n", i, static_cast<unsigned long long>(a[i]),
+                                                     static_cast<unsigned long long>(c.args[i]));
+            for (const cap::Data& d : c.data) std::fprintf(stderr, "    tag %x, %zu bytes\n", d.tag, d.bytes.size());
+            std::fflush(stderr);
+        }
         u64 ret = 0;
         if (c.iface == "d3d9.dll" || c.iface == "d3dx9_43.dll") {
             FARPROC p = GetProcAddress(c.iface == "d3d9.dll" ? d3d9 : d3dx, m.c_str());
@@ -306,6 +324,16 @@ struct Replay {
                                                      a[14], a[15]);
             }
             if (static_cast<long>(ret) < 0 && c.iface != "ID3DXEffect") ++failed;
+            if (trace && static_cast<long>(ret) < 0) {
+                std::fprintf(stderr, "    failed: hr %08lx\n", static_cast<unsigned long>(ret));
+                if (m == "CreateDevice") {
+                    for (int i = 0; i < 6; ++i) std::fprintf(stderr, "    a[%d] = %llx\n", i, static_cast<unsigned long long>(a[i]));
+                    std::uint32_t w[16];
+                    std::memcpy(w, pp, 64);
+                    for (int i = 0; i < 16; ++i) std::fprintf(stderr, "    pp[%d] = %08x\n", i * 4, w[i]);
+                }
+                std::fflush(stderr);
+            }
             if (m == "Lock") buffer_locks[c.self] = reinterpret_cast<std::uint8_t*>(lock_ptr);
             if (m == "LockRect") rect_locks[{c.self, rect_key(c)}] = {locked.bits, locked.pitch};
         }
