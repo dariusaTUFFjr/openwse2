@@ -39,6 +39,7 @@
 
 #include "wse/recomp/com_vtables.h"
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/fx_effect.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/shim_crt.h"
 
@@ -82,6 +83,18 @@ public:
     std::function<void(std::uint64_t frames)> on_present;
 
     [[nodiscard]] std::uint64_t frames() const noexcept { return frames_; }
+    // The current value of a parsed effect's parameter (the R5 device uploads these; tests read
+    // them). Empty for an unknown effect or parameter, or an opaque effect.
+    [[nodiscard]] std::vector<std::uint8_t> effect_value(std::uint64_t effect, const std::string& name) {
+        const std::lock_guard<std::mutex> lock(m_);
+        const auto it = objs_.find(effect);
+        if (it == objs_.end() || !it->second->fx) return {};
+        const EffectState& st = *it->second->fx;
+        for (std::size_t i = 0; i < st.effect.parameters.size(); ++i) {
+            if (st.effect.parameters[i].type.name == name) return st.values[i];
+        }
+        return {};
+    }
     [[nodiscard]] std::size_t objects() const {
         const std::lock_guard<std::mutex> lock(m_);
         return objs_.size();
@@ -155,10 +168,28 @@ public:
         dx("D3DXFilterTexture", [](CpuState& s) { win64_return(s, 0); });
         dx("D3DXSaveSurfaceToFileA", [](CpuState& s) { win64_return(s, 0); });  // nothing is written
         // D3DXCreateEffectFromFileA(dev, file, defines, include, flags, pool, ppEffect, ppErrors)
+        // A compiled fx_2_0 file is parsed (R5a step 1); anything else keeps the R4 opaque effect.
         dx("D3DXCreateEffectFromFileA", [this](CpuState& s) {
             if (win64_arg(s, 7) != 0) put<std::uint64_t>(win64_arg(s, 7), 0);
             if (win64_arg(s, 6) == 0) return win64_return(s, kD3dErrInvalidCall);
-            put<std::uint64_t>(win64_arg(s, 6), create(Kind::effect));
+            std::shared_ptr<EffectState> st;
+            std::vector<std::uint8_t> bytes;
+            const std::string file = win64_arg(s, 1) != 0 ? crt_detail::guest_string(win64_arg(s, 1)) : std::string();
+            if (read_file && read_file(file, bytes) && bytes.size() >= 4) {
+                std::uint32_t tag = 0;
+                std::memcpy(&tag, bytes.data(), 4);
+                if (tag == fx::kFx20Tag) {
+                    st = std::make_shared<EffectState>();
+                    if (!fx::parse(bytes, st->effect)) return win64_return(s, kD3dxErrInvalidData);
+                    index_effect(*st);
+                }
+            }
+            const std::uint64_t obj_addr = create(Kind::effect);
+            if (st) {
+                const std::lock_guard<std::mutex> lock(m_);
+                objs_[obj_addr]->fx = std::move(st);
+            }
+            put<std::uint64_t>(win64_arg(s, 6), obj_addr);
             win64_return(s, 0);
         });
         return n;
@@ -166,6 +197,23 @@ public:
 
 private:
     using Desc = d3d9_detail::Desc;
+    // An effect read from a compiled fx_2_0 file (R5a step 1, `fx_effect.h`): its parameters'
+    // current values, and the handles this device gave out for parameters, techniques and passes.
+    // Effects that are not compiled fx_2_0 (HLSL source such as PostFx.fx, or no file reader) keep
+    // the R4 behaviour: opaque handles that accept everything.
+    struct EffectState {
+        struct Ref {
+            int kind = 0;  // 0 parameter, 1 technique, 2 pass
+            std::uint32_t a = 0, b = 0;  // parameter or technique index; pass index
+        };
+        fx::Effect effect;
+        std::vector<std::vector<std::uint8_t>> values;  // per parameter, starting from the default
+        std::vector<std::uint64_t> textures;            // per parameter: the texture set (SetTexture)
+        std::vector<std::uint64_t> params, techniques;
+        std::vector<std::vector<std::uint64_t>> passes;
+        std::map<std::uint64_t, Ref> refs;
+        std::uint32_t current = 0;  // the technique SetTechnique chose
+    };
     struct Obj {
         Kind kind = Kind::d3d;
         int variant = 0;  // DirectInput: 0 = A, 1 = W
@@ -177,6 +225,7 @@ private:
         std::map<std::uint64_t, std::uint64_t> children;  // level/face -> surface object
         std::uint64_t parent = 0;   // a surface's texture, an object's device
         std::uint64_t memory_index = 0;  // a surface: which entry of its parent's memory
+        std::shared_ptr<EffectState> fx;  // an effect read from a compiled fx_2_0 file
     };
     struct Image {
         std::uint32_t width = 256, height = 256, depth = 1, levels = 1, format = kD3dFmtA8R8G8B8, type = 3, file_format = 1;
@@ -198,6 +247,52 @@ private:
     static constexpr std::uint32_t kD3dPool = 0;
 
     // --- helpers ---------------------------------------------------------------------------
+    // Gives a parsed effect its handles (unique across effects) and starting values.
+    void index_effect(EffectState& st) {
+        const std::lock_guard<std::mutex> lock(m_);
+        const fx::Effect& e = st.effect;
+        auto next = [&](int kind, std::uint32_t a, std::uint32_t b) {
+            next_handle_ += 0x10;
+            st.refs[next_handle_] = EffectState::Ref{kind, a, b};
+            return next_handle_;
+        };
+        for (std::uint32_t i = 0; i < e.parameters.size(); ++i) {
+            st.params.push_back(next(0, i, 0));
+            st.values.push_back(e.parameters[i].value);
+            st.textures.push_back(0);
+        }
+        for (std::uint32_t t = 0; t < e.techniques.size(); ++t) {
+            st.techniques.push_back(next(1, t, 0));
+            st.passes.emplace_back();
+            for (std::uint32_t p = 0; p < e.techniques[t].passes.size(); ++p) st.passes.back().push_back(next(2, t, p));
+        }
+    }
+    // A D3DXHANDLE of `kind`: one this effect gave out, else (as D3DX allows) a pointer to a name.
+    // Returns the index (parameter or technique), or -1.
+    static long resolve(const EffectState& st, std::uint64_t h, int kind) {
+        if (h == 0) return -1;
+        const auto it = st.refs.find(h);
+        if (it != st.refs.end()) return it->second.kind == kind ? static_cast<long>(it->second.a) : -1;
+        if (h < 0x10000) return -1;  // neither a handle nor a plausible pointer
+        const std::string name = crt_detail::guest_string(h);
+        if (kind == 0) {
+            for (std::size_t i = 0; i < st.effect.parameters.size(); ++i) {
+                if (st.effect.parameters[i].type.name == name) return static_cast<long>(i);
+            }
+        } else if (kind == 1) {
+            for (std::size_t i = 0; i < st.effect.techniques.size(); ++i) {
+                if (st.effect.techniques[i].name == name) return static_cast<long>(i);
+            }
+        }
+        return -1;
+    }
+    // Copies `n` bytes into a parameter's value, as far as the value reaches.
+    static void set_value(EffectState& st, long i, const void* src, std::size_t n) {
+        if (i < 0 || src == nullptr) return;
+        std::vector<std::uint8_t>& v = st.values[static_cast<std::size_t>(i)];
+        const std::size_t count = std::min(n, v.size());
+        if (count != 0) std::memcpy(v.data(), src, count);  // samplers have no plain value
+    }
     static std::uint32_t size_or(std::uint64_t v, std::uint32_t fallback) {
         const auto x = static_cast<std::uint32_t>(v);
         return x == 0 || x == kD3dxDefault || x == 0xFFFFFFFEU ? fallback : x;  // D3DX_DEFAULT, D3DX_DEFAULT_NONPOW2
@@ -1038,13 +1133,18 @@ inline void D3d9::build_vtables() {
          }},
     });
 
-    // ID3DXEffect: parameters and techniques are opaque handles; setting succeeds.
+    // ID3DXEffect. A parsed fx_2_0 effect (`o.fx`) answers from the file: handles name real
+    // parameters, techniques and passes (a name pointer works as a handle, as in D3DX), an unknown
+    // name is NULL, GetParameterDesc gives the real class, type, size and array length, Begin
+    // reports the technique's passes, and the setters store values the R5 device will upload.
+    // An opaque effect (no file reader, or not compiled fx_2_0) keeps the R4 behaviour: every
+    // lookup gives a fresh handle and setting succeeds.
     auto handle = [this, ret](CpuState& s, Obj&, std::uint64_t) {
         const std::lock_guard<std::mutex> lock(m_);
         next_handle_ += 0x10;
         ret(s, next_handle_);
     };
-    // GetParameterByName / BySemantic(hParent, name): a new handle that remembers the name.
+    // R4: GetParameterByName / BySemantic(hParent, name): a new handle that remembers the name.
     auto named_handle = [this, ret](CpuState& s, Obj&, std::uint64_t) {
         const std::uint64_t name = win64_arg(s, 2);
         const std::lock_guard<std::mutex> lock(m_);
@@ -1052,15 +1152,71 @@ inline void D3d9::build_vtables() {
         handle_names_[next_handle_] = name != 0 ? crt_detail::guest_string(name) : std::string();
         ret(s, next_handle_);
     };
+    // A method that answers from the parsed effect when there is one, else from `opaque`.
+    auto either = [](Method opaque, std::function<void(CpuState&, EffectState&)> parsed) -> Method {
+        return [opaque = std::move(opaque), parsed = std::move(parsed)](CpuState& s, Obj& o, std::uint64_t self) {
+            if (o.fx) {
+                parsed(s, *o.fx);
+            } else {
+                opaque(s, o, self);
+            }
+        };
+    };
+    auto ok = [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 0); };
+    // Setters: (handle, pointer, count of the unit) and plain values.
+    auto set_ptr = [either, ok, ret](std::size_t unit) {
+        return either(ok, [ret, unit](CpuState& s, EffectState& st) {
+            const long i = resolve(st, win64_arg(s, 1), 0);
+            if (i < 0) return ret(s, kD3dErrInvalidCall);
+            set_value(st, i, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(win64_arg(s, 2))), unit);
+            ret(s, 0);
+        });
+    };
+    auto set_array = [either, ok, ret](std::size_t unit) {
+        return either(ok, [ret, unit](CpuState& s, EffectState& st) {
+            const long i = resolve(st, win64_arg(s, 1), 0);
+            if (i < 0) return ret(s, kD3dErrInvalidCall);
+            set_value(st, i, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(win64_arg(s, 2))),
+                      unit * static_cast<std::uint32_t>(win64_arg(s, 3)));
+            ret(s, 0);
+        });
+    };
+    auto set_word = [either, ok, ret]() {
+        return either(ok, [ret](CpuState& s, EffectState& st) {
+            const long i = resolve(st, win64_arg(s, 1), 0);
+            if (i < 0) return ret(s, kD3dErrInvalidCall);
+            const auto v = static_cast<std::uint32_t>(win64_arg(s, 2));
+            set_value(st, i, &v, 4);
+            ret(s, 0);
+        });
+    };
     make_table(Kind::effect, 0, com::kID3DXEffect, {
         {"GetDevice", get_device},
-        {"GetParameterByName", named_handle},
-        {"GetParameterBySemantic", named_handle},
-        // GetParameterDesc(handle, D3DXPARAMETER_DESC*): the stub knows no parameter's class, type
-        // or size (the .fxo is not read before R5), so the 56-byte desc is zero apart from Name;
-        // Elements 0 makes array-sized engine settings (lights per shader) 0. A handle this
-        // device never returned is D3DERR_INVALIDCALL.
-        {"GetParameterDesc", [this, ret](CpuState& s, Obj&, std::uint64_t) {
+        // GetParameterByName / BySemantic(hParent, name): top-level parameters (no struct members
+        // in the game's effects); NULL when there is none, as in D3DX.
+        {"GetParameterByName", either(named_handle, [ret](CpuState& s, EffectState& st) {
+             const std::uint64_t name = win64_arg(s, 2);
+             if (win64_arg(s, 1) != 0 || name == 0) return ret(s, 0);
+             const long i = resolve(st, name, 0);
+             ret(s, i < 0 ? 0 : st.params[static_cast<std::size_t>(i)]);
+         })},
+        {"GetParameterBySemantic", either(named_handle, [ret](CpuState& s, EffectState& st) {
+             const std::uint64_t sem = win64_arg(s, 2);
+             if (win64_arg(s, 1) != 0 || sem == 0) return ret(s, 0);
+             const std::string want = crt_detail::guest_string(sem);
+             for (std::size_t i = 0; i < st.effect.parameters.size(); ++i) {
+                 const std::string& have = st.effect.parameters[i].type.semantic;
+                 if (have.size() == want.size() && std::equal(have.begin(), have.end(), want.begin(),
+                                                              [](char a, char b) { return (a | 0x20) == (b | 0x20); })) {
+                     return ret(s, st.params[i]);
+                 }
+             }
+             ret(s, 0);
+         })},
+        // GetParameterDesc(handle, D3DXPARAMETER_DESC*): Name 0, Semantic 8, Class 16, Type 20,
+        // Rows 24, Columns 28, Elements 32, Annotations 36, StructMembers 40, Flags 44, Bytes 48.
+        // R4 (opaque): zero apart from Name; a handle never given out is D3DERR_INVALIDCALL.
+        {"GetParameterDesc", either([this, ret](CpuState& s, Obj&, std::uint64_t) {
              const std::uint64_t h = win64_arg(s, 1), desc = win64_arg(s, 2);
              const std::lock_guard<std::mutex> lock(m_);
              const auto it = handle_names_.find(h);
@@ -1068,28 +1224,129 @@ inline void D3d9::build_vtables() {
              std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(desc)), 0, 56);
              crt_detail::put<std::uint64_t>(desc, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(it->second.c_str())));
              ret(s, 0);
-         }},
-        {"GetParameter", handle},
-        {"GetTechniqueByName", handle},
-        {"GetTechnique", handle},
-        {"GetPass", handle},
-        {"GetPassByName", handle},
-        {"GetCurrentTechnique", handle},
+         }, [ret](CpuState& s, EffectState& st) {
+             const std::uint64_t desc = win64_arg(s, 2);
+             const long i = resolve(st, win64_arg(s, 1), 0);
+             if (desc == 0 || i < 0) return ret(s, kD3dErrInvalidCall);
+             const fx::Parameter& p = st.effect.parameters[static_cast<std::size_t>(i)];
+             auto ptr = [](const std::string& str) {
+                 return str.empty() ? 0 : static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(str.c_str()));
+             };
+             std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(desc)), 0, 56);
+             crt_detail::put<std::uint64_t>(desc, ptr(p.type.name));
+             crt_detail::put<std::uint64_t>(desc + 8, ptr(p.type.semantic));
+             const std::uint32_t words[] = {static_cast<std::uint32_t>(p.type.cls), p.type.type, p.type.rows, p.type.columns,
+                                            p.type.elements, p.annotations, static_cast<std::uint32_t>(p.type.members.size()),
+                                            p.flags, static_cast<std::uint32_t>(st.values[static_cast<std::size_t>(i)].size())};
+             for (std::size_t k = 0; k < 9; ++k) crt_detail::put<std::uint32_t>(desc + 16 + 4 * k, words[k]);
+             ret(s, 0);
+         })},
+        // GetParameter(hParent, index)
+        {"GetParameter", either(handle, [ret](CpuState& s, EffectState& st) {
+             const auto i = static_cast<std::uint32_t>(win64_arg(s, 2));
+             ret(s, win64_arg(s, 1) == 0 && i < st.params.size() ? st.params[i] : 0);
+         })},
+        {"GetTechniqueByName", either(handle, [ret](CpuState& s, EffectState& st) {
+             const long t = resolve(st, win64_arg(s, 1), 1);
+             ret(s, t < 0 ? 0 : st.techniques[static_cast<std::size_t>(t)]);
+         })},
+        {"GetTechnique", either(handle, [ret](CpuState& s, EffectState& st) {
+             const auto t = static_cast<std::uint32_t>(win64_arg(s, 1));
+             ret(s, t < st.techniques.size() ? st.techniques[t] : 0);
+         })},
+        // GetPass(hTechnique, index) / GetPassByName(hTechnique, name)
+        {"GetPass", either(handle, [ret](CpuState& s, EffectState& st) {
+             const long t = resolve(st, win64_arg(s, 1), 1);
+             const auto p = static_cast<std::uint32_t>(win64_arg(s, 2));
+             ret(s, t >= 0 && p < st.passes[static_cast<std::size_t>(t)].size() ? st.passes[static_cast<std::size_t>(t)][p] : 0);
+         })},
+        {"GetPassByName", either(handle, [ret](CpuState& s, EffectState& st) {
+             const long t = resolve(st, win64_arg(s, 1), 1);
+             if (t < 0 || win64_arg(s, 2) == 0) return ret(s, 0);
+             const std::string name = crt_detail::guest_string(win64_arg(s, 2));
+             const fx::Technique& tech = st.effect.techniques[static_cast<std::size_t>(t)];
+             for (std::size_t p = 0; p < tech.passes.size(); ++p) {
+                 if (tech.passes[p].name == name) return ret(s, st.passes[static_cast<std::size_t>(t)][p]);
+             }
+             ret(s, 0);
+         })},
+        {"GetCurrentTechnique", either(handle, [ret](CpuState& s, EffectState& st) {
+             ret(s, st.current < st.techniques.size() ? st.techniques[st.current] : 0);
+         })},
+        {"SetTechnique", either(ok, [ret](CpuState& s, EffectState& st) {
+             const long t = resolve(st, win64_arg(s, 1), 1);
+             if (t < 0) return ret(s, kD3dErrInvalidCall);
+             st.current = static_cast<std::uint32_t>(t);
+             ret(s, 0);
+         })},
         {"GetPool", [this, ret](CpuState& s, Obj&, std::uint64_t) {
              if (win64_arg(s, 1) != 0) crt_detail::put<std::uint64_t>(win64_arg(s, 1), create(Kind::effect_pool));
              ret(s, 0);
          }},
         {"ValidateTechnique", [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 0); }},
-        {"FindNextValidTechnique", [ret](CpuState& s, Obj&, std::uint64_t) {
+        // FindNextValidTechnique(hTechnique, pNext): every technique is valid; the next after the
+        // given one (the first for NULL), NULL after the last.
+        {"FindNextValidTechnique", either([ret](CpuState& s, Obj&, std::uint64_t) {
              if (win64_arg(s, 2) != 0) crt_detail::put<std::uint64_t>(win64_arg(s, 2), win64_arg(s, 1) != 0 ? 0 : 0x7E000010ULL);
              ret(s, 0);
-         }},
-        // Begin(UINT* pPasses, flags): one pass.
-        {"Begin", [ret](CpuState& s, Obj&, std::uint64_t) {
+         }, [ret](CpuState& s, EffectState& st) {
+             const long t = win64_arg(s, 1) == 0 ? -1 : resolve(st, win64_arg(s, 1), 1);
+             const auto next = static_cast<std::size_t>(t + 1);
+             if (win64_arg(s, 2) != 0) crt_detail::put<std::uint64_t>(win64_arg(s, 2), next < st.techniques.size() ? st.techniques[next] : 0);
+             ret(s, 0);
+         })},
+        // Begin(UINT* pPasses, flags): R4 one pass; parsed: the current technique's passes.
+        {"Begin", either([ret](CpuState& s, Obj&, std::uint64_t) {
              if (win64_arg(s, 1) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 1), 1);
              ret(s, 0);
-         }},
+         }, [ret](CpuState& s, EffectState& st) {
+             const std::size_t n = st.current < st.effect.techniques.size() ? st.effect.techniques[st.current].passes.size() : 0;
+             if (win64_arg(s, 1) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 1), static_cast<std::uint32_t>(n));
+             ret(s, 0);
+         })},
         {"IsParameterUsed", [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 1); }},
+        // Setters (handle first): values the R5 device will upload. SetMatrixTranspose stores the
+        // transposed matrix, as D3DX does.
+        {"SetValue", either(ok, [ret](CpuState& s, EffectState& st) {
+             const long i = resolve(st, win64_arg(s, 1), 0);
+             if (i < 0) return ret(s, kD3dErrInvalidCall);
+             set_value(st, i, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(win64_arg(s, 2))),
+                       static_cast<std::uint32_t>(win64_arg(s, 3)));
+             ret(s, 0);
+         })},
+        {"SetBool", set_word()},
+        {"SetInt", set_word()},
+        // SetFloat(handle, float): the float is the third argument, in xmm2.
+        {"SetFloat", either(ok, [ret](CpuState& s, EffectState& st) {
+             const long i = resolve(st, win64_arg(s, 1), 0);
+             if (i < 0) return ret(s, kD3dErrInvalidCall);
+             set_value(st, i, s.xmm[2], 4);
+             ret(s, 0);
+         })},
+        {"SetVector", set_ptr(16)},
+        {"SetMatrix", set_ptr(64)},
+        {"SetFloatArray", set_array(4)},
+        {"SetVectorArray", set_array(16)},
+        {"SetMatrixArray", set_array(64)},
+        {"SetMatrixTranspose", either(ok, [ret](CpuState& s, EffectState& st) {
+             const long i = resolve(st, win64_arg(s, 1), 0);
+             const std::uint64_t m = win64_arg(s, 2);
+             if (i < 0 || m == 0) return ret(s, kD3dErrInvalidCall);
+             float t[16];
+             const auto* src = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(m));
+             for (int r = 0; r < 4; ++r) {
+                 for (int c = 0; c < 4; ++c) t[r * 4 + c] = src[c * 4 + r];
+             }
+             set_value(st, i, t, sizeof(t));
+             ret(s, 0);
+         })},
+        // SetTexture(handle, texture): remembered per parameter for the R5 device's samplers.
+        {"SetTexture", either(ok, [ret](CpuState& s, EffectState& st) {
+             const long i = resolve(st, win64_arg(s, 1), 0);
+             if (i < 0) return ret(s, kD3dErrInvalidCall);
+             st.textures[static_cast<std::size_t>(i)] = win64_arg(s, 2);
+             ret(s, 0);
+         })},
     });
     make_table(Kind::effect_pool, 0, com::kID3DXEffectPool, {});
     make_table(Kind::buffer, 0, com::kID3DXBuffer, {

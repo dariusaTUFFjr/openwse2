@@ -5676,6 +5676,65 @@ void test_fx_effects() {
     expect(truncations_fail && !fx::parse(bad_tag, scratch) && !fx::parse(huge, scratch),
            "fx: truncated, mistagged and oversized effects are refused");
 
+    // The ID3DXEffect of the D3D9 shim answers from a parsed effect.
+    {
+        using d3d_test::com;
+        using u32_test::call;
+        namespace sh = wse::recomp::shim;
+        namespace ci = wse::recomp::com;
+        Runtime rt;
+        sh::D3d9 d3d(rt);
+        d3d.read_file = [&](const std::string& path, std::vector<std::uint8_t>& out) {
+            if (path != "synthetic.fxo") return false;
+            out = file;
+            return true;
+        };
+        (void)d3d.install();
+        GuestStack stack(256 * 1024);
+        CpuState s;
+        stack.prepare(s);
+        rt.attach(s);
+        auto va = [](const void* p) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p)); };
+        std::uint64_t effect = 0;
+        const bool created = call(rt, s, "d3dx9_43.dll", "D3DXCreateEffectFromFileA",
+                                  {0, va("synthetic.fxo"), 0, 0, 0, 0, va(&effect), 0}) == 0 && effect != 0;
+        const std::uint64_t h_color = com(s, effect, ci::kID3DXEffect, "GetParameterByName", {0, va("color")});
+        const std::uint64_t h_missing = com(s, effect, ci::kID3DXEffect, "GetParameterByName", {0, va("missing")});
+        const std::uint64_t h_tech = com(s, effect, ci::kID3DXEffect, "GetTechniqueByName", {va("t0")});
+        std::uint64_t first = 0, after = 1;
+        std::uint32_t passes = 0;
+        const bool walk = com(s, effect, ci::kID3DXEffect, "FindNextValidTechnique", {0, va(&first)}) == 0 && first == h_tech &&
+                          com(s, effect, ci::kID3DXEffect, "FindNextValidTechnique", {h_tech, va(&after)}) == 0 && after == 0 &&
+                          com(s, effect, ci::kID3DXEffect, "SetTechnique", {va("t0")}) == 0 &&
+                          com(s, effect, ci::kID3DXEffect, "Begin", {va(&passes), 0}) == 0 && passes == 1 &&
+                          com(s, effect, ci::kID3DXEffect, "GetPass", {h_tech, 0}) != 0 &&
+                          com(s, effect, ci::kID3DXEffect, "GetPass", {h_tech, 1}) == 0;
+        expect(created && h_color != 0 && h_missing == 0 && h_tech != 0 && walk,
+               "fx shim: real handles, NULL for unknown names, techniques and passes from the file");
+        alignas(8) std::uint8_t desc[56] = {};
+        std::uint64_t name_ptr = 0;
+        std::uint32_t dw[9] = {};
+        const bool desc_ok = com(s, effect, ci::kID3DXEffect, "GetParameterDesc", {h_color, va(desc)}) == 0;
+        std::memcpy(&name_ptr, desc, 8);
+        std::memcpy(dw, desc + 16, sizeof(dw));
+        expect(desc_ok && name_ptr != 0 && std::string(reinterpret_cast<const char*>(static_cast<std::uintptr_t>(name_ptr))) == "color" &&
+                   dw[0] == 1 && dw[1] == fx::kFloat && dw[2] == 1 && dw[3] == 4 && dw[4] == 0 && dw[8] == 16,
+               "fx shim: GetParameterDesc gives the parameter's name, class, type, size and length");
+        const float vec[4] = {3.0F, 4.0F, 5.0F, 6.0F};
+        const float half = 0.5F;
+        const bool set_vec = com(s, effect, ci::kID3DXEffect, "SetVector", {h_color, va(vec)}) == 0;
+        const std::vector<std::uint8_t> after_vec = d3d.effect_value(effect, "color");
+        std::memcpy(s.xmm[2], &half, 4);  // SetFloat's float argument
+        const bool set_float = com(s, effect, ci::kID3DXEffect, "SetFloat", {va("color"), 0}) == 0;
+        const std::vector<std::uint8_t> after_float = d3d.effect_value(effect, "color");
+        float got_vec[4] = {}, got_float[4] = {};
+        if (after_vec.size() == 16) std::memcpy(got_vec, after_vec.data(), 16);
+        if (after_float.size() == 16) std::memcpy(got_float, after_float.data(), 16);
+        expect(set_vec && set_float && got_vec[0] == 3.0F && got_vec[3] == 6.0F && got_float[0] == 0.5F && got_float[1] == 4.0F &&
+                   static_cast<std::uint32_t>(com(s, effect, ci::kID3DXEffect, "SetVector", {h_missing, va(vec)})) == sh::kD3dErrInvalidCall,
+               "fx shim: setters store values (a name pointer works as a handle); an unknown handle is refused");
+    }
+
     // The user's install (local only): each effect parses to its last byte, with the shader count an
     // independent bytecode scan measured (2026-11-22).
     const char* env_root = std::getenv("WSE_WARBAND_ROOT");
