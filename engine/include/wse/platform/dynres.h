@@ -183,7 +183,7 @@ private:
         }
         const double scaled = static_cast<double>(dim) * static_cast<double>(scale);
         const auto rounded = static_cast<std::int64_t>(std::llround(scaled / 8.0)) * 8LL;
-        const std::int64_t clamped = std::clamp(rounded, 8LL, static_cast<std::int64_t>(dim));
+        const std::int64_t clamped = std::clamp<std::int64_t>(rounded, 8, static_cast<std::int64_t>(dim));
         return static_cast<std::uint32_t>(clamped);
     }
 
