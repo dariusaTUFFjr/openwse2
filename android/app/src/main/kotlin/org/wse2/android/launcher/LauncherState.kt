@@ -323,7 +323,8 @@ data class R4UiState(
     val running: Boolean = false,
     val useCopy: Boolean = false,
     val status: String = "",
-    val report: String? = null
+    val report: String? = null,
+    val installCacheBytes: Long = 0L
 )
 
 data class AdvancedUiState(

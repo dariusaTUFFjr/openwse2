@@ -1,10 +1,15 @@
 // JNI helpers shared by the SAF backends (`saf_vfs_jni.cpp` in libwse2, `r4_jni.cpp` in
 // libwse_r0): exception clearing, UTF-8 <-> jstring through UTF-16, and the child records
-// `WseSafBridge.listChildren` returns ("dir\tsize\tdocumentId\tdisplayName").
+// `WseSafBridge.listChildren` returns ("dir\tsize\tdocumentId\tdisplayName[\tmtimeMs]").
 
 #pragma once
 
+#if __has_include(<jni.h>)
 #include <jni.h>
+#define WSE_HAS_JNI_H 1
+#else
+#define WSE_HAS_JNI_H 0
+#endif
 
 #include <charconv>
 #include <cstddef>
@@ -16,6 +21,7 @@
 
 namespace wse::platform::android_jni {
 
+#if WSE_HAS_JNI_H
 inline bool clear_if_exception(JNIEnv* env) noexcept {
     if (env == nullptr) {
         return true;
@@ -122,9 +128,10 @@ inline jstring utf8_to_jstring(JNIEnv* env, std::string_view sv) {
     }
     return result;
 }
+#endif  // WSE_HAS_JNI_H
 
 inline bool parse_child_record(std::string_view line,
-                                      wse::platform::SafChildEntry& out) {
+                               wse::platform::SafChildEntry& out) {
     const std::size_t t1 = line.find('\t');
     if (t1 == std::string_view::npos) {
         return false;
@@ -137,11 +144,16 @@ inline bool parse_child_record(std::string_view line,
     if (t3 == std::string_view::npos) {
         return false;
     }
+    const std::size_t t4 = line.find('\t', t3 + 1U);
 
     const std::string_view dir_sv = line.substr(0, t1);
     const std::string_view size_sv = line.substr(t1 + 1U, t2 - (t1 + 1U));
     const std::string_view id_sv = line.substr(t2 + 1U, t3 - (t2 + 1U));
-    const std::string_view name_sv = line.substr(t3 + 1U);
+    const std::string_view name_sv =
+        (t4 == std::string_view::npos) ? line.substr(t3 + 1U)
+                                       : line.substr(t3 + 1U, t4 - (t3 + 1U));
+    const std::string_view mtime_sv =
+        (t4 == std::string_view::npos) ? std::string_view{} : line.substr(t4 + 1U);
     if (id_sv.empty() || name_sv.empty()) {
         return false;
     }
@@ -153,6 +165,15 @@ inline bool parse_child_record(std::string_view line,
         std::from_chars(size_sv.data(), size_sv.data() + size_sv.size(), parsed_size);
     if (ec == std::errc{} && ptr == size_sv.data() + size_sv.size()) {
         out.size_bytes = parsed_size;
+    }
+    out.last_modified_ms = 0;
+    if (!mtime_sv.empty()) {
+        std::int64_t parsed_mtime = 0;
+        const auto [mptr, mec] =
+            std::from_chars(mtime_sv.data(), mtime_sv.data() + mtime_sv.size(), parsed_mtime);
+        if (mec == std::errc{} && mptr == mtime_sv.data() + mtime_sv.size()) {
+            out.last_modified_ms = parsed_mtime;
+        }
     }
     out.document_id = std::string(id_sv);
     out.display_name = std::string(name_sv);

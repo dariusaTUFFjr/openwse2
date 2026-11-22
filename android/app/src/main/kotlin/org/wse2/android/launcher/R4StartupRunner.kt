@@ -62,6 +62,10 @@ class R4StartupRunner private constructor(private val app: Application) {
     @Volatile
     private var r5Preparing = false
 
+    init {
+        refreshInstallCacheSize()
+    }
+
     fun addListener(listener: (R4UiState) -> Unit) {
         listeners.add(listener)
         val now = state
@@ -95,10 +99,48 @@ class R4StartupRunner private constructor(private val app: Application) {
     // The result notification was tapped (or RecompGameActivity returned): show the last report,
     // even if this process was restarted since the run (the report is in app storage).
     fun showLastReport(force: Boolean = false) {
+        refreshInstallCacheSize()
         if (state.running || (!force && state.report != null)) return
         val file = File(r4Dir, "report.txt")
         if (!file.isFile) return
         update(state.copy(report = reportText(null)))
+    }
+
+    fun refreshInstallCacheSize() {
+        Thread({
+            val bytes = readInstallCacheBytes()
+            updateInstallCacheBytes(bytes)
+        }, "wse-r4-cache-size").start()
+    }
+
+    fun clearInstallCache() {
+        if (state.running) return
+        Thread({
+            if (R4Native.loadError == null) {
+                try {
+                    R4Native.clearInstallCache(workDir.absolutePath)
+                } catch (_: Throwable) {
+                }
+            }
+            val bytes = readInstallCacheBytes()
+            updateInstallCacheBytes(bytes)
+        }, "wse-r4-cache-clear").start()
+    }
+
+    private fun readInstallCacheBytes(): Long {
+        if (R4Native.loadError != null) return 0L
+        return try {
+            R4Native.installCacheBytes(workDir.absolutePath).coerceAtLeast(0L)
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    @Synchronized
+    private fun updateInstallCacheBytes(bytes: Long) {
+        if (state.installCacheBytes != bytes) {
+            update(state.copy(installCacheBytes = bytes))
+        }
     }
 
     // Prepares for a live R5a Vulkan run: rotates the previous report, imports any PC-prepared
@@ -529,6 +571,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         val report = reportText(error)
         update(state.copy(running = false, status = "", report = report))
         R4ForegroundService.finish(app, report.substringBefore("\n\n"))
+        refreshInstallCacheSize()
     }
 
     // The headline (the given error, or the report's RESULT line) and the report.

@@ -61,6 +61,7 @@ fun AdvancedScreen(
     onRunR4Startup: () -> Unit = {},
     onLaunchRecompVulkan: () -> Unit = {},
     onR4UseCopyChange: (Boolean) -> Unit = {},
+    onClearInstallCache: () -> Unit = {},
     onDismissR4Report: () -> Unit = {}
 ) {
     val colors = LocalWseColors.current
@@ -278,6 +279,27 @@ fun AdvancedScreen(
                     showDivider = true,
                     enabled = liveVulkanEnabled,
                     onClick = onLaunchRecompVulkan
+                )
+                val cacheMb = r4State.installCacheBytes / (1024L * 1024L)
+                val clearCacheEnabled = !r4State.running && !r0State.running
+                WseListRow(
+                    title = "Copied game files",
+                    supporting = "$cacheMb MB kept in the app so the game loads faster. Free " +
+                        "this space if you need it; the game copies files again as it reads them.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) {
+                                colors.primary
+                            } else {
+                                colors.onSurfaceVariant.copy(alpha = 0.45f)
+                            }
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = onClearInstallCache
                 )
                 // Saves the report as a file the player picks, during a run too (the user's
                 // request, 2026-11-21: keep the phone's report when finishing on the PC).
