@@ -280,6 +280,7 @@ private:
     // through an argument it does not know to be a pointer.
     struct CaptureState {
         std::map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> locks;  // buffer -> offset, size
+        std::map<std::uint64_t, std::vector<std::uint8_t>> shadow;  // buffer -> contents at its last unlock
     };
     static int out_arg(const std::string& iface, const std::string& m) {
         static const std::map<std::string, int> com_outs = {
@@ -384,15 +385,24 @@ private:
             if (m == "Lock") {
                 capture_.locks[c.self] = {static_cast<std::uint32_t>(a[0]), static_cast<std::uint32_t>(a[1])};
             } else if (m == "Unlock") {
-                const auto [off, size] = capture_.locks.count(c.self) != 0 ? capture_.locks[c.self] : std::pair<std::uint32_t, std::uint32_t>{0, 0};
+                // Only what changed since this buffer's last unlock: the game locks a 2.5 MB dynamic
+                // buffer whole every frame and rewrites a small part of it (2026-11-22).
                 std::vector<std::uint8_t>* mem = bytes(*o, 0);
-                if (mem != nullptr && off < mem->size()) {
-                    const std::size_t n = size == 0 ? mem->size() - off : std::min<std::size_t>(size, mem->size() - off);
+                if (mem != nullptr) {
+                    std::vector<std::uint8_t>& old = capture_.shadow[c.self];
+                    if (old.size() != mem->size()) old.assign(mem->size(), 0);
+                    std::size_t first = 0;
+                    while (first < mem->size() && (*mem)[first] == old[first]) ++first;
+                    std::size_t last = mem->size();
+                    while (last > first && (*mem)[last - 1] == old[last - 1]) --last;
+                    const auto off = static_cast<std::uint32_t>(first);
+                    const auto n = static_cast<std::uint32_t>(last - first);
                     std::vector<std::uint8_t> b(8);
                     std::memcpy(b.data(), &off, 4);
-                    const auto n32 = static_cast<std::uint32_t>(n);
-                    std::memcpy(b.data() + 4, &n32, 4);
-                    b.insert(b.end(), mem->begin() + off, mem->begin() + static_cast<std::ptrdiff_t>(off + n));
+                    std::memcpy(b.data() + 4, &n, 4);
+                    b.insert(b.end(), mem->begin() + static_cast<std::ptrdiff_t>(first), mem->begin() + static_cast<std::ptrdiff_t>(last));
+                    std::copy(mem->begin() + static_cast<std::ptrdiff_t>(first), mem->begin() + static_cast<std::ptrdiff_t>(last),
+                              old.begin() + static_cast<std::ptrdiff_t>(first));
                     c.data.push_back(Data{d3dcap::kTagLocked, std::move(b)});
                 }
             }

@@ -16,7 +16,9 @@
 //   str is u16 length + bytes. Objects are identified by the address the device gave them.
 // Data tags: kTagArg + i (the bytes argument i points to), kTagOut + i (the object address
 // argument i received), kTagName (a parameter or technique name passed instead of a handle),
-// kTagLocked (a buffer's or texture level's bytes when it is unlocked).
+// kTagLocked (on unlock: for a vertex or index buffer, u32 offset, u32 size and the bytes that
+// changed since its previous unlock, the rest being as then; for a texture level or surface, u32
+// index and the whole level).
 
 #pragma once
 

@@ -94,6 +94,8 @@ struct Replay {
     std::map<u64, void*> objects;              // captured address -> real object
     std::map<u64, u64> handles;                // captured effect handle -> real handle
     std::map<u64, std::uint8_t*> buffer_locks;  // captured buffer -> real locked pointer
+    std::map<u64, std::pair<std::uint32_t, std::uint32_t>> lock_ranges;  // captured buffer -> offset, size
+    std::map<u64, std::vector<std::uint8_t>> shadow;  // captured buffer -> its contents (unlocks store changes)
     std::map<std::pair<u64, std::uint32_t>, std::pair<std::uint8_t*, int>> rect_locks;  // (texture, index) -> bits, pitch
     std::vector<std::vector<std::uint8_t>> keep;  // strings and blobs kept alive for the call
     void* device = nullptr;
@@ -252,10 +254,21 @@ struct Replay {
                 return;
             }
             if (d != nullptr && m == "Unlock" && d->bytes.size() >= 8) {
-                if (const auto lk = buffer_locks.find(c.self); lk != buffer_locks.end() && lk->second != nullptr) {
-                    std::uint32_t n = 0;
-                    std::memcpy(&n, d->bytes.data() + 4, 4);
-                    std::memcpy(lk->second, d->bytes.data() + 8, std::min<std::size_t>(n, d->bytes.size() - 8));
+                // Apply the change to the full copy, then write the whole locked range (a discarded
+                // lock gives a fresh buffer, so unchanged bytes are written too).
+                std::uint32_t off = 0, n = 0;
+                std::memcpy(&off, d->bytes.data(), 4);
+                std::memcpy(&n, d->bytes.data() + 4, 4);
+                std::vector<std::uint8_t>& full = shadow[c.self];
+                if (full.size() < static_cast<std::size_t>(off) + n) full.resize(static_cast<std::size_t>(off) + n, 0);
+                std::memcpy(full.data() + off, d->bytes.data() + 8, std::min<std::size_t>(n, d->bytes.size() - 8));
+                const auto lk = buffer_locks.find(c.self);
+                const auto range = lock_ranges.find(c.self);
+                if (lk != buffer_locks.end() && lk->second != nullptr && range != lock_ranges.end() && range->second.first < full.size()) {
+                    const std::size_t from = range->second.first;
+                    const std::size_t count = range->second.second == 0 ? full.size() - from
+                                                                        : std::min<std::size_t>(range->second.second, full.size() - from);
+                    std::memcpy(lk->second, full.data() + from, count);
                 }
             } else if (d != nullptr && m == "UnlockRect" && d->bytes.size() >= 4) {
                 const auto lk = rect_locks.find({c.self, rect_key(c)});
@@ -334,7 +347,17 @@ struct Replay {
                 }
                 std::fflush(stderr);
             }
-            if (m == "Lock") buffer_locks[c.self] = reinterpret_cast<std::uint8_t*>(lock_ptr);
+            if (m == "Lock") {
+                buffer_locks[c.self] = reinterpret_cast<std::uint8_t*>(lock_ptr);
+                lock_ranges[c.self] = {static_cast<std::uint32_t>(c.args[0]), static_cast<std::uint32_t>(c.args[1])};
+            }
+            if (m == "CreateVertexBuffer" || m == "CreateIndexBuffer") {
+                if (const cap::Data* d = c.find(cap::kTagOut + 4); d != nullptr && d->bytes.size() == 8) {
+                    std::uint64_t captured = 0;
+                    std::memcpy(&captured, d->bytes.data(), 8);
+                    shadow[captured].assign(static_cast<std::uint32_t>(c.args[0]), 0);
+                }
+            }
             if (m == "LockRect") rect_locks[{c.self, rect_key(c)}] = {locked.bits, locked.pitch};
         }
         // Map what the call created, and effect handles it returned.
@@ -363,7 +386,7 @@ int main(int argc, char** argv) {
     const bool whole = cap::decode(bytes, calls);
     std::printf("%zu calls%s\n", calls.size(), whole ? "" : " (the capture ends mid-record; replaying the whole ones)");
     Replay r;
-    r.out_dir = argv[3];
+    r.out_dir = std::filesystem::absolute(argv[3]).string();  // before the working directory moves to the install
     std::filesystem::create_directories(r.out_dir);
     for (int i = 4; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "--frames") {
