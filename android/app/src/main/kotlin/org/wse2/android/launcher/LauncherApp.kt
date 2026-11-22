@@ -75,7 +75,8 @@ fun LauncherApp(
     onImportDriver: () -> Unit,
     onLaunchGame: (LauncherEvent.LaunchGame) -> Unit,
     // The activity asks for the notification permission first (the run's progress and result).
-    onRunR4Startup: () -> Unit = viewModel::runR4Startup
+    onRunR4Startup: () -> Unit = viewModel::runR4Startup,
+    onLaunchRecompVulkan: (LauncherEvent.LaunchRecompVulkan) -> Unit = {}
 ) {
     val selectedTab by viewModel.selectedTab.collectAsStateWithLifecycle()
     val installFolder by viewModel.installFolder.collectAsStateWithLifecycle()
@@ -118,6 +119,9 @@ fun LauncherApp(
                 }
                 is LauncherEvent.LaunchGame -> {
                     onLaunchGame(event)
+                }
+                is LauncherEvent.LaunchRecompVulkan -> {
+                    onLaunchRecompVulkan(event)
                 }
             }
         }
@@ -171,6 +175,7 @@ fun LauncherApp(
         onDismissR0Report = viewModel::dismissR0Report,
         r4State = r4State,
         onRunR4Startup = onRunR4Startup,
+        onLaunchRecompVulkan = viewModel::launchRecompVulkan,
         onR4UseCopyChange = viewModel::setR4UseCopy,
         onDismissR4Report = viewModel::dismissR4Report
     )
@@ -274,6 +279,7 @@ fun LauncherAppContent(
     onDismissR0Report: () -> Unit = {},
     r4State: R4UiState = R4UiState(),
     onRunR4Startup: () -> Unit = {},
+    onLaunchRecompVulkan: () -> Unit = {},
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onDismissR4Report: () -> Unit = {}
 ) {
@@ -390,6 +396,7 @@ fun LauncherAppContent(
                 onDismissR0Report = onDismissR0Report,
                 r4State = r4State,
                 onRunR4Startup = onRunR4Startup,
+                onLaunchRecompVulkan = onLaunchRecompVulkan,
                 onR4UseCopyChange = onR4UseCopyChange,
                 onDismissR4Report = onDismissR4Report
             )

@@ -3098,6 +3098,78 @@ void test_r5a_vulkan_d3d9_backend() {
                "R5a VulkanD3d9Backend: zero leaked mock Vulkan objects on teardown");
     }
 
+    // 1b. Direct-ICD Mock PanVK / Turnip AHB presentation extension negotiation & fallback (R5a step 5).
+    {
+        const MockVulkanObjectStats before = mock_vulkan_object_stats();
+        {
+            auto loader = std::make_shared<VulkanDriverLoader>();
+            VulkanMockConfig mc{};
+            mc.mode = DriverMode::panvk;
+            mc.direct_icd = true;
+            mc.expose_ahb_external_memory = true;
+            mc.expose_queue_family_foreign = true;
+            mc.expose_external_semaphore_fd = true;
+            VulkanDriverProbeResult probe{};
+            expect(loader->load_mock_icd(mc) && loader->probe_and_create_device(probe) &&
+                       probe.presentation_path == PresentationPath::offscreen_hardware_buffer_bridge &&
+                       probe.ahb_external_memory_enabled && probe.queue_family_foreign_enabled &&
+                       probe.external_semaphore_fd_enabled,
+                   "R5a step 5: direct ICD enables optional AHB + foreign queue + sync fd extensions on Vulkan >= 1.1");
+
+            std::uint64_t cb_frames = 0;
+            std::string cb_path;
+            VulkanD3d9Config cfg{};
+            cfg.on_frame_presented = [&](std::uint64_t frame, double inst_fps, double avg_fps, std::string_view p) {
+                (void)inst_fps;
+                (void)avg_fps;
+                cb_frames = frame;
+                cb_path = std::string(p);
+            };
+            VulkanD3d9Backend bk(loader, cfg);
+            std::string err;
+            expect(bk.init(64, 64, 22, 75, &err) && !bk.active_presentation_path().empty(),
+                   "R5a step 5: init exposes active_presentation_path");
+            bk.set_native_window(nullptr);
+            bk.flush_pipeline_cache();
+            expect(bk.present(nullptr, nullptr, nullptr) && cb_frames == 1U &&
+                       cb_path == bk.active_presentation_path(),
+                   "R5a step 5: on_frame_presented fires with frame count and presentation path");
+        }
+        {
+            // Optional AHB extensions refused at vkCreateDevice -> clean retry without them.
+            auto loader = std::make_shared<VulkanDriverLoader>();
+            VulkanMockConfig mc{};
+            mc.mode = DriverMode::turnip;
+            mc.direct_icd = true;
+            mc.expose_ahb_external_memory = true;
+            mc.expose_queue_family_foreign = true;
+            mc.refuse_optional_ahb_extensions = true;
+            VulkanDriverProbeResult probe{};
+            expect(loader->load_mock_icd(mc) && loader->probe_and_create_device(probe) &&
+                       !probe.ahb_external_memory_enabled && !probe.queue_family_foreign_enabled &&
+                       probe.presentation_note.find("AHB") != std::string::npos,
+                   "R5a step 5: device refusing optional AHB extensions retries cleanly and records note");
+        }
+        {
+            // Vulkan 1.0 device must never request Vulkan 1.1-dependent AHB extensions.
+            auto loader = std::make_shared<VulkanDriverLoader>();
+            VulkanMockConfig mc{};
+            mc.mode = DriverMode::panvk;
+            mc.direct_icd = true;
+            mc.require_api_version_1_0 = true;
+            mc.expose_ahb_external_memory = true;
+            VulkanDriverProbeResult probe{};
+            expect(loader->load_mock_icd(mc) && loader->probe_and_create_device(probe) &&
+                       !probe.ahb_external_memory_enabled,
+                   "R5a step 5: Vulkan 1.0 device skips AHB extensions cleanly");
+        }
+        const MockVulkanObjectStats after = mock_vulkan_object_stats();
+        expect(after.live_objects == before.live_objects &&
+                   after.leaked_at_device_destroy == before.leaked_at_device_destroy &&
+                   after.invalid_destroys == before.invalid_destroys,
+               "R5a step 5: zero leaked mock Vulkan objects across AHB negotiation tests");
+    }
+
     // 2. Real system Vulkan GPU (WSE_TEST_SYSTEM_VULKAN=1): draw alpha-tested, D3DCOLOR-tinted,
     // textured quad in BOTH native B8G8R8A8_UNORM and forced shader-swizzle modes and verify pixels.
     if (system_vulkan_tests_enabled()) {

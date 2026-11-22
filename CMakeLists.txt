@@ -398,6 +398,9 @@ target_link_libraries(wse_vulkan PUBLIC wse_engine wse_shader)  # P4: built-in G
 if(NOT WIN32)
     target_link_libraries(wse_vulkan PUBLIC ${CMAKE_DL_LIBS})
 endif()
+if(ANDROID)
+    target_link_libraries(wse_vulkan PUBLIC android)
+endif()
 wse_apply_strict_warnings(wse_vulkan)
 
 include(CTest)
@@ -724,10 +727,10 @@ if(WSE_ENABLE_LLVM)
     endif()
 
     if(WSE_BUILD_ANDROID_APP)
-        # The translator on the phone: Advanced > "R0 spikes" (`r0_jni.cpp`) and "R4 startup run"
-        # (`r4_jni.cpp`, run by R4StartupService in its own `:recomp` process).
+        # The translator on the phone: Advanced > "R0 spikes" (`r0_jni.cpp`), "R4 startup run",
+        # and R5a live Vulkan run (`r4_jni.cpp`, run in the isolated `:recomp` process).
         add_library(wse_r0 SHARED platform/android/r0_jni.cpp platform/android/r4_jni.cpp)
-        target_link_libraries(wse_r0 PRIVATE wse_recomp log)
+        target_link_libraries(wse_r0 PRIVATE wse_recomp wse_vulkan android log)
         target_link_options(wse_r0 PRIVATE "-Wl,--gc-sections" "-Wl,--exclude-libs,ALL")
         wse_apply_strict_warnings(wse_r0)
     endif()

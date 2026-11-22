@@ -354,4 +354,17 @@ sealed interface LauncherEvent {
         val gpuDriver: String,
         val showFpsOverlay: Boolean
     ) : LauncherEvent
+
+    data class LaunchRecompVulkan(
+        val treeUri: String,
+        val copyDir: String,
+        val workDir: String,
+        val moduleName: String,
+        val jobs: Int,
+        val driverMode: String,
+        val customIcdPath: String,
+        val nativeLibDir: String,
+        val shaderCacheDir: String,
+        val maxTextureSize: Int
+    ) : LauncherEvent
 }

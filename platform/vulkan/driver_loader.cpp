@@ -259,7 +259,6 @@ bool mock_config_exposes_wsi(const VulkanMockConfig* cfg) noexcept {
 
 constexpr std::array<const char*, 2> kMockWsiInstanceExts{"VK_KHR_surface",
                                                           "VK_KHR_android_surface"};
-constexpr std::array<const char*, 1> kMockWsiDeviceExts{"VK_KHR_swapchain"};
 
 // Standard two-call enumeration over `names` (empty when `expose` is false).
 template <std::size_t N>
@@ -463,9 +462,35 @@ VKAPI_ATTR VkResult VKAPI_CALL mock_vkEnumerateDeviceExtensionProperties(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     const auto* phys = reinterpret_cast<const MockPhysicalDevice*>(physicalDevice);
-    return mock_enumerate_extensions(
-        phys->instance->wsi_enabled && phys->instance->config.expose_swapchain, kMockWsiDeviceExts,
-                                     pPropertyCount, pProperties);
+    const VulkanMockConfig& cfg = phys->instance->config;
+    std::vector<const char*> offered;
+    if (phys->instance->wsi_enabled && cfg.expose_swapchain) {
+        offered.push_back("VK_KHR_swapchain");
+    }
+    if (cfg.expose_ahb_external_memory) {
+        offered.push_back("VK_ANDROID_external_memory_android_hardware_buffer");
+    }
+    if (cfg.expose_queue_family_foreign) {
+        offered.push_back("VK_EXT_queue_family_foreign");
+    }
+    if (cfg.expose_external_semaphore_fd) {
+        offered.push_back("VK_KHR_external_semaphore_fd");
+    }
+    const std::uint32_t total = static_cast<std::uint32_t>(offered.size());
+    if (pProperties == nullptr) {
+        *pPropertyCount = total;
+        return VK_SUCCESS;
+    }
+    const std::uint32_t n = std::min<std::uint32_t>(*pPropertyCount, total);
+    for (std::uint32_t i = 0U; i < n; ++i) {
+        std::memset(&pProperties[i], 0, sizeof(VkExtensionProperties));
+        const std::size_t len = std::min<std::size_t>(
+            std::strlen(offered[i]), VK_MAX_EXTENSION_NAME_SIZE - 1U);
+        std::memcpy(pProperties[i].extensionName, offered[i], len);
+        pProperties[i].specVersion = 1U;
+    }
+    *pPropertyCount = n;
+    return (n < total) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mock_vkCreateDevice(
@@ -478,14 +503,29 @@ VKAPI_ATTR VkResult VKAPI_CALL mock_vkCreateDevice(
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     const auto* phys = reinterpret_cast<const MockPhysicalDevice*>(physicalDevice);
-    bool swapchain_enabled = false;
-    // Device WSI extensions are offered only on an instance that enabled surface WSI.
-    const VkResult ext_res = mock_check_enabled_extensions(
-        phys->instance->wsi_enabled && phys->instance->config.expose_swapchain, kMockWsiDeviceExts,
-        pCreateInfo->enabledExtensionCount,
-        pCreateInfo->ppEnabledExtensionNames, swapchain_enabled);
-    if (ext_res != VK_SUCCESS) {
-        return ext_res;
+    const VulkanMockConfig& cfg = phys->instance->config;
+    const bool allow_swapchain = phys->instance->wsi_enabled && cfg.expose_swapchain;
+    for (std::uint32_t i = 0U; i < pCreateInfo->enabledExtensionCount; ++i) {
+        if (pCreateInfo->ppEnabledExtensionNames == nullptr ||
+            pCreateInfo->ppEnabledExtensionNames[i] == nullptr) {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        const std::string_view req(pCreateInfo->ppEnabledExtensionNames[i]);
+        const bool is_ahb_ext = (req == "VK_ANDROID_external_memory_android_hardware_buffer" ||
+                                 req == "VK_EXT_queue_family_foreign" ||
+                                 req == "VK_KHR_external_semaphore_fd");
+        if (is_ahb_ext && cfg.refuse_optional_ahb_extensions) {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        const bool ok =
+            (allow_swapchain && req == "VK_KHR_swapchain") ||
+            (cfg.expose_ahb_external_memory &&
+             req == "VK_ANDROID_external_memory_android_hardware_buffer") ||
+            (cfg.expose_queue_family_foreign && req == "VK_EXT_queue_family_foreign") ||
+            (cfg.expose_external_semaphore_fd && req == "VK_KHR_external_semaphore_fd");
+        if (!ok) {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
     }
     auto* dev = new MockDevice{};
     g_mock_live_objects.fetch_add(1);
@@ -880,6 +920,9 @@ struct VulkanDriverLoader::Impl {
     bool can_execute_gpu = false;
     bool sampler_anisotropy = false;
     bool fill_mode_non_solid = false;
+    bool ahb_external_memory = false;
+    bool queue_family_foreign = false;
+    bool external_semaphore_fd = false;
 
     PFN_vkDestroyInstance fn_destroy_instance = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties fn_get_phys_mem_props = nullptr;
@@ -1256,6 +1299,9 @@ struct VulkanDriverLoader::Impl {
         gdpa = nullptr;
         sampler_anisotropy = false;
         fill_mode_non_solid = false;
+        ahb_external_memory = false;
+        queue_family_foreign = false;
+        external_semaphore_fd = false;
         clear_gpu_procs();
     }
 
@@ -1826,11 +1872,22 @@ bool VulkanDriverLoader::probe_and_create_device(VulkanDriverProbeResult& out) {
     dev_info.pQueueCreateInfos = &q_info;
     dev_info.pEnabledFeatures = &enabled;
 
-    // Presenting to a surface also needs VK_KHR_swapchain on the device; without it
-    // the surface path is unusable, so fall back to the offscreen bridge.
+    // Inspect device extensions for both presentation paths:
+    //  - `android_surface_wsi` requires `VK_KHR_swapchain` (else drop to offscreen bridge).
+    //  - `offscreen_hardware_buffer_bridge` (PanVK / Turnip / fallback) optionally enables
+    //    `VK_ANDROID_external_memory_android_hardware_buffer` (+ `VK_EXT_queue_family_foreign`
+    //    and `VK_KHR_external_semaphore_fd` when offered) on Vulkan >= 1.1 so presentation can
+    //    hand off GPU buffers zero-copy via `ASurfaceControl`.
     static constexpr const char* kSwapchainExt = "VK_KHR_swapchain";
-    if (out.presentation_path == PresentationPath::android_surface_wsi) {
-        bool has_swapchain = false;
+    static constexpr const char* kAhbExt = "VK_ANDROID_external_memory_android_hardware_buffer";
+    static constexpr const char* kForeignQueueExt = "VK_EXT_queue_family_foreign";
+    static constexpr const char* kExtSemFdExt = "VK_KHR_external_semaphore_fd";
+
+    bool has_swapchain = false;
+    bool has_ahb = false;
+    bool has_foreign = false;
+    bool has_ext_sem_fd = false;
+    {
         PFN_vkEnumerateDeviceExtensionProperties enum_dev_exts = nullptr;
         impl_->resolve_inst("vkEnumerateDeviceExtensionProperties", enum_dev_exts);
         if (enum_dev_exts != nullptr) {
@@ -1841,15 +1898,27 @@ bool VulkanDriverLoader::probe_and_create_device(VulkanDriverProbeResult& out) {
                 if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
                     dev_exts.resize(std::min<std::size_t>(dev_exts.size(), n));
                     for (const VkExtensionProperties& e : dev_exts) {
-                        has_swapchain = has_swapchain ||
-                                        std::string_view(e.extensionName) == kSwapchainExt;
+                        const std::string_view name(e.extensionName);
+                        if (name == kSwapchainExt) {
+                            has_swapchain = true;
+                        } else if (name == kAhbExt) {
+                            has_ahb = true;
+                        } else if (name == kForeignQueueExt) {
+                            has_foreign = true;
+                        } else if (name == kExtSemFdExt) {
+                            has_ext_sem_fd = true;
+                        }
                     }
                 }
             }
         }
+    }
+
+    std::vector<const char*> enabled_dev_exts;
+    bool requested_optional_ahb = false;
+    if (out.presentation_path == PresentationPath::android_surface_wsi) {
         if (has_swapchain) {
-            dev_info.enabledExtensionCount = 1U;
-            dev_info.ppEnabledExtensionNames = &kSwapchainExt;
+            enabled_dev_exts.push_back(kSwapchainExt);
             out.swapchain_extension_enabled = true;
         } else {
             out.presentation_path = PresentationPath::offscreen_hardware_buffer_bridge;
@@ -1857,13 +1926,49 @@ bool VulkanDriverLoader::probe_and_create_device(VulkanDriverProbeResult& out) {
         }
     }
 
-    const VkResult dev_res =
+    const bool vk11_available =
+        out.instance_api_version >= VK_API_VERSION_1_1 && chosen_props.apiVersion >= VK_API_VERSION_1_1;
+    if (out.presentation_path == PresentationPath::offscreen_hardware_buffer_bridge &&
+        vk11_available && has_ahb) {
+        enabled_dev_exts.push_back(kAhbExt);
+        if (has_foreign) {
+            enabled_dev_exts.push_back(kForeignQueueExt);
+        }
+        if (has_ext_sem_fd) {
+            enabled_dev_exts.push_back(kExtSemFdExt);
+        }
+        requested_optional_ahb = true;
+    }
+
+    dev_info.enabledExtensionCount = static_cast<std::uint32_t>(enabled_dev_exts.size());
+    dev_info.ppEnabledExtensionNames = enabled_dev_exts.empty() ? nullptr : enabled_dev_exts.data();
+
+    VkResult dev_res =
         create_dev(impl_->physical_device, &dev_info, nullptr, &impl_->device);
+    if (dev_res == VK_ERROR_EXTENSION_NOT_PRESENT && requested_optional_ahb) {
+        // Optional AHB extensions were listed but rejected at device creation: retry cleanly without them.
+        enabled_dev_exts.clear();
+        requested_optional_ahb = false;
+        dev_info.enabledExtensionCount = 0U;
+        dev_info.ppEnabledExtensionNames = nullptr;
+        impl_->device = VK_NULL_HANDLE;
+        if (!out.presentation_note.empty()) {
+            out.presentation_note += "; ";
+        }
+        out.presentation_note += "device refused optional AHB extensions; using CPU bridge fallback";
+        dev_res = create_dev(impl_->physical_device, &dev_info, nullptr, &impl_->device);
+    }
     if (dev_res != VK_SUCCESS || impl_->device == VK_NULL_HANDLE) {
         impl_->device = VK_NULL_HANDLE;
         return fail("vkCreateDevice failed with VkResult " +
                     std::to_string(static_cast<int>(dev_res)));
     }
+    impl_->ahb_external_memory = requested_optional_ahb;
+    impl_->queue_family_foreign = requested_optional_ahb && has_foreign;
+    impl_->external_semaphore_fd = requested_optional_ahb && has_ext_sem_fd;
+    out.ahb_external_memory_enabled = impl_->ahb_external_memory;
+    out.queue_family_foreign_enabled = impl_->queue_family_foreign;
+    out.external_semaphore_fd_enabled = impl_->external_semaphore_fd;
     impl_->device_generation = g_next_device_generation.fetch_add(1);
 
     PFN_vkGetDeviceProcAddr gdpa = nullptr;
@@ -4797,6 +4902,9 @@ bool vulkan_loader_extract_handles(const VulkanDriverLoader& loader,
     out.can_execute_gpu = im.can_execute_gpu;
     out.sampler_anisotropy = im.sampler_anisotropy;
     out.fill_mode_non_solid = im.fill_mode_non_solid;
+    out.ahb_external_memory = im.ahb_external_memory;
+    out.queue_family_foreign = im.queue_family_foreign;
+    out.external_semaphore_fd = im.external_semaphore_fd;
     out.generation = im.device_generation;
     out.probe = im.probe;
     return true;

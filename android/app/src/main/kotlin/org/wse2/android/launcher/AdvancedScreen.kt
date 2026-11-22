@@ -59,6 +59,7 @@ fun AdvancedScreen(
     onDismissR0Report: () -> Unit = {},
     r4State: R4UiState = R4UiState(),
     onRunR4Startup: () -> Unit = {},
+    onLaunchRecompVulkan: () -> Unit = {},
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onDismissR4Report: () -> Unit = {}
 ) {
@@ -254,6 +255,29 @@ fun AdvancedScreen(
                     showDivider = true,
                     enabled = !r4State.running && !r0State.running,
                     onClick = onRunR4Startup
+                )
+                val liveVulkanEnabled = !r4State.running && !r0State.running && treeUri != null
+                val activeDriverLabel = state.driverState.options.getOrElse(state.driverState.selectedIndex) {
+                    "Vulkan"
+                }
+                WseListRow(
+                    title = "Run on screen (R5a)",
+                    supporting = "Starts the translated game on screen with $activeDriverLabel. " +
+                        "Reuses prepared game files and saves driver + FPS diagnostics to the report.",
+                    trailing = {
+                        Text(
+                            text = "Launch",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (liveVulkanEnabled) {
+                                colors.primary
+                            } else {
+                                colors.onSurfaceVariant.copy(alpha = 0.45f)
+                            }
+                        )
+                    },
+                    showDivider = true,
+                    enabled = liveVulkanEnabled,
+                    onClick = onLaunchRecompVulkan
                 )
                 // Saves the report as a file the player picks, during a run too (the user's
                 // request, 2026-11-21: keep the phone's report when finishing on the PC).

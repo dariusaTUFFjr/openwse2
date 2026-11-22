@@ -57,6 +57,11 @@ struct VulkanDriverProbeResult {
     // (`presentation_note` says so).
     bool wsi_instance_extensions_enabled = false;
     bool swapchain_extension_enabled = false;
+    // Optional offscreen AHardwareBuffer presentation extensions (enabled on
+    // `offscreen_hardware_buffer_bridge` when offered by a Vulkan >= 1.1 device).
+    bool ahb_external_memory_enabled = false;
+    bool queue_family_foreign_enabled = false;
+    bool external_semaphore_fd_enabled = false;
     std::string presentation_note{};
     std::string device_name{};
     std::string loaded_library{};
@@ -81,6 +86,12 @@ struct VulkanMockConfig {
     bool require_api_version_1_0 = false;
     // Reject `vkCreateInstance` with `VK_ERROR_EXTENSION_NOT_PRESENT` when any extension is enabled.
     bool refuse_wsi_instance_extensions = false;
+    // Device-level Android external memory / AHardwareBuffer extensions (for PanVK/Turnip mock tests).
+    bool expose_ahb_external_memory = false;
+    bool expose_queue_family_foreign = false;
+    bool expose_external_semaphore_fd = false;
+    // Reject `vkCreateDevice` with `VK_ERROR_EXTENSION_NOT_PRESENT` when AHB extensions are requested.
+    bool refuse_optional_ahb_extensions = false;
 };
 
 [[nodiscard]] std::string format_vulkan_version(std::uint32_t vk_version);

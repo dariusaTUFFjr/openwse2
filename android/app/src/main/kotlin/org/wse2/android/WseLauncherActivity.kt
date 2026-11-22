@@ -72,6 +72,14 @@ class WseLauncherActivity : ComponentActivity() {
         viewModel.importDriverPackage(driverUri)
     }
 
+    // Phase 5 R5a: when the live Vulkan activity exits (or its `:recomp` process dies), show the
+    // saved driver + FPS report so the player can inspect, copy, or share it right away.
+    private val recompVulkanLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.showR4Report(force = true)
+    }
+
     // Android 13+: the R4 run's progress and result notifications need this; the run starts
     // whatever the answer (denied, the run still goes on in the background, silently).
     private val notificationPermission = registerForActivityResult(
@@ -145,7 +153,8 @@ class WseLauncherActivity : ComponentActivity() {
                     onChooseFolder = { openWarbandFolderPicker() },
                     onImportDriver = { openDriverPackagePicker() },
                     onLaunchGame = { event -> launchWseActivity(event) },
-                    onRunR4Startup = { runR4Startup() }
+                    onRunR4Startup = { runR4Startup() },
+                    onLaunchRecompVulkan = { event -> launchRecompVulkanActivity(event) }
                 )
             }
         }
@@ -195,6 +204,22 @@ class WseLauncherActivity : ComponentActivity() {
             putExtra(EXTRA_GPU_DRIVER, event.gpuDriver)
         }
         startActivity(intent)
+    }
+
+    private fun launchRecompVulkanActivity(event: LauncherEvent.LaunchRecompVulkan) {
+        val intent = Intent(this, RecompGameActivity::class.java).apply {
+            putExtra(RecompGameActivity.EXTRA_TREE_URI, event.treeUri)
+            putExtra(RecompGameActivity.EXTRA_COPY_DIR, event.copyDir)
+            putExtra(RecompGameActivity.EXTRA_WORK_DIR, event.workDir)
+            putExtra(RecompGameActivity.EXTRA_MODULE, event.moduleName)
+            putExtra(RecompGameActivity.EXTRA_JOBS, event.jobs)
+            putExtra(RecompGameActivity.EXTRA_DRIVER_MODE, event.driverMode)
+            putExtra(RecompGameActivity.EXTRA_CUSTOM_ICD_PATH, event.customIcdPath)
+            putExtra(RecompGameActivity.EXTRA_NATIVE_LIB_DIR, event.nativeLibDir)
+            putExtra(RecompGameActivity.EXTRA_SHADER_CACHE_DIR, event.shaderCacheDir)
+            putExtra(RecompGameActivity.EXTRA_MAX_TEXTURE_SIZE, event.maxTextureSize)
+        }
+        recompVulkanLauncher.launch(intent)
     }
 
     // Highest refresh rate among the display's modes (60 when unknown).

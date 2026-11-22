@@ -1,11 +1,17 @@
 package org.wse2.android.launcher
 
+import android.view.Surface
 import org.wse2.android.WseSafBridge
 
-// Phase 5 R4 startup run (docs/RECOMP_PLAN.md "R4 design", "Phone run"): `libwse_r0.so`
-// (`platform/android/r4_jni.cpp`). Called only in R4StartupService's own ":recomp" process:
-// the run maps the game at fixed addresses and ends the process when it is done.
+// Phase 5 R4 startup run and R5a live Vulkan run (docs/RECOMP_PLAN.md "R4 design", "R5 — Graphics"):
+// `libwse_r0.so` (`platform/android/r4_jni.cpp`). Called only in the isolated `:recomp` process
+// (`R4StartupService` or `RecompGameActivity`): the run maps the game at fixed addresses and ends
+// the process when it is done.
 object R4Native {
+    interface HudListener {
+        fun onHudUpdate(text: String)
+    }
+
     val loadError: String? by lazy {
         try {
             System.loadLibrary("wse_r0")
@@ -27,4 +33,31 @@ object R4Native {
         jobs: Int,
         frames: Long
     ): Int
+
+    // Phase 5 R5a live Vulkan run on an Android `Surface` using the user's selected GPU driver
+    // (`system` / `panvk` / `turnip`). Returns only on setup/Vulkan failure.
+    @JvmStatic
+    external fun nativeRunVulkan(
+        bridge: WseSafBridge?,
+        copyDir: String,
+        workDir: String,
+        module: String,
+        jobs: Int,
+        frames: Long,
+        surface: Surface?,
+        driverMode: String,
+        customIcdPath: String,
+        nativeLibDir: String,
+        shaderCacheDir: String,
+        maxTextureSize: Int,
+        hudListener: HudListener?
+    ): Int
+
+    // Updates or detaches (`surface == null`) the active Android presentation surface.
+    @JvmStatic
+    external fun nativeSetSurface(surface: Surface?)
+
+    // Saves the pipeline cache, detaches the surface, and flushes the final driver + FPS report.
+    @JvmStatic
+    external fun nativeFinishReport()
 }

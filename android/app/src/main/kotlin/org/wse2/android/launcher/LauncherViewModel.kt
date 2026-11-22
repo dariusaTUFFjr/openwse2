@@ -357,10 +357,62 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     fun dismissR4Report() = r4Runner.dismissReport()
 
-    // The result notification was tapped: open Advanced with the last report.
-    fun showR4Report() {
+    // The result notification was tapped (or live R5a activity returned): open Advanced with the report.
+    fun showR4Report(force: Boolean = false) {
         selectTab(LauncherTab.ADVANCED)
-        r4Runner.showLastReport()
+        r4Runner.showLastReport(force = force)
+    }
+
+    // Phase 5 R5a: launch the translated game on screen with Vulkan using the selected GPU driver.
+    fun launchRecompVulkan() {
+        if (_r4State.value.running || _r0State.value.running) return
+        val treeUri = _installFolder.value.treeUri
+        if (treeUri == null) {
+            _events.trySend(LauncherEvent.ShowWarbandFilesNotFound("No Warband folder is selected."))
+            return
+        }
+        R4Native.loadError?.let { err ->
+            _events.trySend(LauncherEvent.ShowToast("libwse_r0.so unavailable: $err"))
+            return
+        }
+        val driver = _driverState.value
+        val mode = driver.selectedModeKey
+        val icdPath = if (mode == "system") {
+            ""
+        } else {
+            prefs().getString(KEY_DRIVER_PATH_PREFIX + mode, "") ?: ""
+        }
+        if (mode != "system" && icdPath.isEmpty()) {
+            _events.trySend(
+                LauncherEvent.ShowToast(
+                    "Import a ${driver.options[driver.selectedIndex]} driver package first, or switch to System Vulkan."
+                )
+            )
+            return
+        }
+        val moduleName = _modulesState.value.selectedModule?.folderName?.ifBlank { "Native" } ?: "Native"
+        val maxTex = _settingsState.value.performance?.maxTextureSize ?: 0
+        val shaderCache = File(app.cacheDir, "mesa_shader_cache").apply { mkdirs() }
+        val nativeLibDir = app.applicationInfo.nativeLibraryDir ?: ""
+        _statusLog.value = "Preparing live Vulkan run ($mode, module $moduleName)…"
+        r4Runner.prepareForLiveVulkan(treeUri) { copyDir, workDir, jobs ->
+            if (!isCleared.get()) {
+                _events.trySend(
+                    LauncherEvent.LaunchRecompVulkan(
+                        treeUri = treeUri.toString(),
+                        copyDir = copyDir,
+                        workDir = workDir,
+                        moduleName = moduleName,
+                        jobs = jobs,
+                        driverMode = mode,
+                        customIcdPath = icdPath,
+                        nativeLibDir = nativeLibDir,
+                        shaderCacheDir = shaderCache.absolutePath,
+                        maxTextureSize = maxTex
+                    )
+                )
+            }
+        }
     }
 
     fun selectDriver(index: Int) {

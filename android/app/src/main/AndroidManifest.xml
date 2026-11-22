@@ -45,6 +45,15 @@
             android:name=".R4StartupService"
             android:exported="false"
             android:process=":recomp" />
+        <!-- Phase 5 R5a live Vulkan run: renders the translated game on a fullscreen SurfaceView
+             in the same isolated `:recomp` process (never concurrent with R4StartupService). -->
+        <activity
+            android:name=".RecompGameActivity"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:exported="false"
+            android:process=":recomp"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
         <!-- Keeps the launcher process (which holds the binding to :recomp) running while the R4
              startup run goes on in the background. -->
         <service

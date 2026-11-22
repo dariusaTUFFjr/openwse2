@@ -5,9 +5,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "driver_loader.h"
@@ -21,6 +23,11 @@ struct VulkanD3d9Config {
     bool prefer_bc_compression = true;     // upload BC1/BC2/BC3 natively when supported
     bool prefer_bgra_vertex_format = true; // use B8G8R8A8_UNORM vertex fetch when supported (false forces shader swizzle)
     bool eager_shader_compile = false;     // false: compile shaders lazily on first draw; true: compile at create_shader
+    void* native_window = nullptr;         // Android ANativeWindow* (non-owning; null = offscreen)
+    // Optional callback invoked once per presented frame (outside internal locks).
+    std::function<void(std::uint64_t frame, double inst_fps, double avg_fps,
+                       std::string_view presentation_path)>
+        on_frame_presented{};
 };
 
 class VulkanD3d9Backend final : public wse::recomp::D3d9Backend {
@@ -76,6 +83,13 @@ public:
     bool present(std::vector<std::uint8_t>* out_rgba8 = nullptr,
                  std::uint32_t* out_width = nullptr,
                  std::uint32_t* out_height = nullptr) override;
+
+    // Thread-safe Android ANativeWindow* attachment (pass nullptr on surfaceDestroyed).
+    // Safe no-op on non-Android platforms.
+    void set_native_window(void* native_window) noexcept;
+    // Persists VkPipelineCache to `config.pipeline_cache_path` (safe to call before process exit).
+    void flush_pipeline_cache() noexcept;
+    [[nodiscard]] std::string active_presentation_path() const;
 
     // Diagnostics for tests and reports.
     [[nodiscard]] std::size_t compiled_shader_count() const noexcept;

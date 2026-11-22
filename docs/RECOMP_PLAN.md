@@ -883,16 +883,21 @@ own, and none blocks another.
        readback. Replayed the 3,000-frame Warband capture on Intel HD 520 Vulkan matching real D3D9
        pixel-for-pixel on every main-menu frame (`STATUS.md` §5; offscreen `SetRenderTarget`
        surfaces for shadow/post-fx passes land with R5b).
-    5. **On the phone, on every driver the app offers:** the main menu drawn with System Vulkan
+    5. **On the phone, on every driver the app offers (wired 2026-11-22, on-device phone run next):** the main menu drawn with System Vulkan
        (`VK_KHR_android_surface` swapchain) **and** with the custom drivers the user picks in
        Advanced, PanVK on Mali and Turnip on Adreno, which present through the
        `offscreen_hardware_buffer_bridge` (`AHardwareBuffer` + `ASurfaceControl`; `PresentationPath`
-       in `docs/PLATFORM_PLAN.md`). PanVK and Turnip are first-class targets, not a later add-on
+       in `docs/PLATFORM_PLAN.md`, with an automatic `ANativeWindow_lock` RGBA8 fallback if a custom
+       driver lacks `VK_ANDROID_external_memory_android_hardware_buffer` or `ASurfaceControl` fails).
+       PanVK and Turnip are first-class targets, not a later add-on
        (the user, 2026-11-22; this was R5c): the D3D9 layer uses only what all three provide
        (Vulkan 1.1 core; no geometry or tessellation shaders; at most 4 descriptor sets; 16
        samplers per stage; varyings within 23 locations, which `link_location` keeps), checks it
-       when the device is created and writes the driver, its version and every missing feature to
-       the game report, and falls back where a driver lacks something optional (BC textures:
+       when the device is created and writes the driver, its version, active presentation path, live
+       FPS, and every missing/fallback feature to
+       the game report (`RecompGameActivity` in `:recomp`, Advanced > "Run on screen (R5a)", wired
+       through `D3d9::created_hook` so `translator_fingerprint` stays unchanged and PC-prepared
+       batches need no retranslation), and falls back where a driver lacks something optional (BC textures:
        ETC2/ASTC or RGBA8; `VkPipelineCache`: none). The reference phone is Mali-G68, so PanVK and
        System Vulkan are checked there; Turnip is checked on an Adreno phone when one is available.
     HDR (`A16B16G16R16F`), DOF and MSAA (`CheckDeviceMultiSampleType`, `666` probes) stay advertised

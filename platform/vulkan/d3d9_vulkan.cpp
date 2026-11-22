@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -22,11 +23,18 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#include <android/native_window.h>
+#include <android/surface_control.h>
+#endif
 
 namespace wse::platform {
 
@@ -348,11 +356,16 @@ struct VkProcs {
     PFN_vkDestroyFence destroy_fence = nullptr;
     PFN_vkWaitForFences wait_for_fences = nullptr;
     PFN_vkResetFences reset_fences = nullptr;
+    PFN_vkCreateSemaphore create_semaphore = nullptr;
+    PFN_vkDestroySemaphore destroy_semaphore = nullptr;
 
     PFN_vkCmdPipelineBarrier cmd_pipeline_barrier = nullptr;
     PFN_vkCmdCopyBuffer cmd_copy_buffer = nullptr;
     PFN_vkCmdCopyBufferToImage cmd_copy_buffer_to_image = nullptr;
     PFN_vkCmdCopyImageToBuffer cmd_copy_image_to_buffer = nullptr;
+    PFN_vkCmdCopyImage cmd_copy_image = nullptr;
+    PFN_vkCmdBlitImage cmd_blit_image = nullptr;
+    PFN_vkCmdClearColorImage cmd_clear_color_image = nullptr;
     PFN_vkCmdBeginRenderPass cmd_begin_render_pass = nullptr;
     PFN_vkCmdEndRenderPass cmd_end_render_pass = nullptr;
     PFN_vkCmdClearAttachments cmd_clear_attachments = nullptr;
@@ -366,6 +379,22 @@ struct VkProcs {
     PFN_vkCmdBindIndexBuffer cmd_bind_index_buffer = nullptr;
     PFN_vkCmdDraw cmd_draw = nullptr;
     PFN_vkCmdDrawIndexed cmd_draw_indexed = nullptr;
+
+#ifdef __ANDROID__
+    // Optional WSI + Android AHardwareBuffer presentation entry points.
+    PFN_vkCreateAndroidSurfaceKHR create_android_surface = nullptr;
+    PFN_vkDestroySurfaceKHR destroy_surface = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR get_phys_surface_support = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR get_phys_surface_caps = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR get_phys_surface_formats = nullptr;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR get_phys_surface_present_modes = nullptr;
+    PFN_vkCreateSwapchainKHR create_swapchain = nullptr;
+    PFN_vkDestroySwapchainKHR destroy_swapchain = nullptr;
+    PFN_vkGetSwapchainImagesKHR get_swapchain_images = nullptr;
+    PFN_vkAcquireNextImageKHR acquire_next_image = nullptr;
+    PFN_vkQueuePresentKHR queue_present = nullptr;
+    PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_ahb_props = nullptr;
+#endif
 
     void resolve(const VulkanRawHandles& h) noexcept {
         auto ri = [&](const char* name, auto& fn) {
@@ -440,11 +469,16 @@ struct VkProcs {
         rd("vkDestroyFence", destroy_fence);
         rd("vkWaitForFences", wait_for_fences);
         rd("vkResetFences", reset_fences);
+        rd("vkCreateSemaphore", create_semaphore);
+        rd("vkDestroySemaphore", destroy_semaphore);
 
         rd("vkCmdPipelineBarrier", cmd_pipeline_barrier);
         rd("vkCmdCopyBuffer", cmd_copy_buffer);
         rd("vkCmdCopyBufferToImage", cmd_copy_buffer_to_image);
         rd("vkCmdCopyImageToBuffer", cmd_copy_image_to_buffer);
+        rd("vkCmdCopyImage", cmd_copy_image);
+        rd("vkCmdBlitImage", cmd_blit_image);
+        rd("vkCmdClearColorImage", cmd_clear_color_image);
         rd("vkCmdBeginRenderPass", cmd_begin_render_pass);
         rd("vkCmdEndRenderPass", cmd_end_render_pass);
         rd("vkCmdClearAttachments", cmd_clear_attachments);
@@ -458,6 +492,21 @@ struct VkProcs {
         rd("vkCmdBindIndexBuffer", cmd_bind_index_buffer);
         rd("vkCmdDraw", cmd_draw);
         rd("vkCmdDrawIndexed", cmd_draw_indexed);
+
+#ifdef __ANDROID__
+        ri("vkCreateAndroidSurfaceKHR", create_android_surface);
+        ri("vkDestroySurfaceKHR", destroy_surface);
+        ri("vkGetPhysicalDeviceSurfaceSupportKHR", get_phys_surface_support);
+        ri("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", get_phys_surface_caps);
+        ri("vkGetPhysicalDeviceSurfaceFormatsKHR", get_phys_surface_formats);
+        ri("vkGetPhysicalDeviceSurfacePresentModesKHR", get_phys_surface_present_modes);
+        rd("vkCreateSwapchainKHR", create_swapchain);
+        rd("vkDestroySwapchainKHR", destroy_swapchain);
+        rd("vkGetSwapchainImagesKHR", get_swapchain_images);
+        rd("vkAcquireNextImageKHR", acquire_next_image);
+        rd("vkQueuePresentKHR", queue_present);
+        rd("vkGetAndroidHardwareBufferPropertiesANDROID", get_ahb_props);
+#endif
     }
 
     [[nodiscard]] bool has_core_gpu() const noexcept {
@@ -656,6 +705,11 @@ public:
         rng.offset = start;
         rng.size = end >= b.size ? VK_WHOLE_SIZE : (end - start);
         (void)vk_->invalidate_memory(dev_, 1U, &rng);
+    }
+
+    [[nodiscard]] std::uint32_t find_memory_type(std::uint32_t bits, VkMemoryPropertyFlags req,
+                                                 VkMemoryPropertyFlags pref) const noexcept {
+        return find_type(bits, req, pref);
     }
 
     void release_all() noexcept {
@@ -988,15 +1042,912 @@ struct VulkanD3d9Backend::Impl {
     VkPipeline bound_pipeline = VK_NULL_HANDLE;
     VkDescriptorSet bound_sampler_set = VK_NULL_HANDLE;
 
-    Impl(std::shared_ptr<VulkanDriverLoader> ldr, VulkanD3d9Config cfg)
-        : loader(std::move(ldr)), config(std::move(cfg)) {}
+    mutable std::mutex api_mutex;
 
-    ~Impl() { shutdown(); }
+    // Frame timing / FPS telemetry for on_frame_presented callback.
+    bool fps_started = false;
+    std::chrono::steady_clock::time_point fps_first_tp{};
+    std::chrono::steady_clock::time_point fps_win_tp{};
+    std::uint64_t presented_frames = 0;
+    std::uint64_t fps_win_frames = 0;
+    double last_inst_fps = 0.0;
+
+#ifdef __ANDROID__
+    enum class AndroidPresentPath { none, swapchain, ahb_surface_control, native_window_cpu };
+    AndroidPresentPath android_path = AndroidPresentPath::none;
+    ANativeWindow* active_window = nullptr;
+
+    // Path A: VK_KHR_android_surface + VK_KHR_swapchain (System Vulkan).
+    VkSurfaceKHR vk_surface = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkFormat sc_format = VK_FORMAT_R8G8B8A8_UNORM;
+    VkExtent2D sc_extent{0U, 0U};
+    std::vector<VkImage> sc_images;
+    VkSemaphore img_avail_sem = VK_NULL_HANDLE;
+    VkSemaphore render_done_sem = VK_NULL_HANDLE;
+    bool sc_dirty = false;
+
+    // Path B: Zero-copy AHardwareBuffer + ASurfaceControl (PanVK / Turnip).
+    static constexpr std::size_t kAhbRingSize = 3U;
+    struct AhbSlot {
+        AHardwareBuffer* ahb = nullptr;
+        VkImage img = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    };
+    std::array<AhbSlot, kAhbRingSize> ahb_slots{};
+    std::size_t ahb_slot_idx = 0U;
+    std::uint32_t ahb_width = 0U;
+    std::uint32_t ahb_height = 0U;
+    ASurfaceControl* ahb_surface_control = nullptr;
+
+    // Path C: Universal CPU readback + ANativeWindow_lock fallback.
+    std::uint32_t cpu_win_w = 0U;
+    std::uint32_t cpu_win_h = 0U;
+
+    static void compute_letterbox_rect(std::int32_t src_w, std::int32_t src_h,
+                                       std::int32_t dst_w, std::int32_t dst_h,
+                                       std::int32_t& out_x, std::int32_t& out_y,
+                                       std::int32_t& out_w, std::int32_t& out_h) noexcept {
+        if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) {
+            out_x = 0;
+            out_y = 0;
+            out_w = std::max<std::int32_t>(1, dst_w);
+            out_h = std::max<std::int32_t>(1, dst_h);
+            return;
+        }
+        const std::int64_t lhs = static_cast<std::int64_t>(dst_w) * src_h;
+        const std::int64_t rhs = static_cast<std::int64_t>(dst_h) * src_w;
+        if (lhs > rhs) {
+            out_h = dst_h;
+            out_w = static_cast<std::int32_t>(std::max<std::int64_t>(1, rhs / src_h));
+            out_x = (dst_w - out_w) / 2;
+            out_y = 0;
+        } else {
+            out_w = dst_w;
+            out_h = static_cast<std::int32_t>(std::max<std::int64_t>(1, lhs / src_w));
+            out_x = 0;
+            out_y = (dst_h - out_h) / 2;
+        }
+    }
+
+    void destroy_swapchain_only_locked() noexcept {
+        if (swapchain != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_swapchain != nullptr) {
+            vk.destroy_swapchain(h.device, swapchain, nullptr);
+        }
+        swapchain = VK_NULL_HANDLE;
+        sc_images.clear();
+        sc_extent = {0U, 0U};
+        sc_dirty = false;
+    }
+
+    void destroy_ahb_ring_locked() noexcept {
+        if (ahb_surface_control != nullptr) {
+            if (ASurfaceTransaction* tx = ASurfaceTransaction_create()) {
+                ASurfaceTransaction_setVisibility(tx, ahb_surface_control, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+                ASurfaceTransaction_setBuffer(tx, ahb_surface_control, nullptr, -1);
+                ASurfaceTransaction_reparent(tx, ahb_surface_control, nullptr);
+                ASurfaceTransaction_apply(tx);
+                ASurfaceTransaction_delete(tx);
+            }
+            ASurfaceControl_release(ahb_surface_control);
+            ahb_surface_control = nullptr;
+        }
+        for (AhbSlot& s : ahb_slots) {
+            if (s.img != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_image != nullptr) {
+                vk.destroy_image(h.device, s.img, nullptr);
+            }
+            if (s.mem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.free_memory != nullptr) {
+                vk.free_memory(h.device, s.mem, nullptr);
+            }
+            if (s.ahb != nullptr) {
+                AHardwareBuffer_release(s.ahb);
+            }
+            s = AhbSlot{};
+        }
+        ahb_slot_idx = 0U;
+        ahb_width = 0U;
+        ahb_height = 0U;
+    }
+
+    void teardown_android_presentation_locked() noexcept {
+        if (gpu_ready && h.device != VK_NULL_HANDLE && vk.device_wait_idle != nullptr) {
+            (void)vk.device_wait_idle(h.device);
+        }
+        destroy_swapchain_only_locked();
+        if (img_avail_sem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
+            vk.destroy_semaphore(h.device, img_avail_sem, nullptr);
+        }
+        img_avail_sem = VK_NULL_HANDLE;
+        if (render_done_sem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
+            vk.destroy_semaphore(h.device, render_done_sem, nullptr);
+        }
+        render_done_sem = VK_NULL_HANDLE;
+        if (vk_surface != VK_NULL_HANDLE && h.instance != VK_NULL_HANDLE && vk.destroy_surface != nullptr) {
+            vk.destroy_surface(h.instance, vk_surface, nullptr);
+        }
+        vk_surface = VK_NULL_HANDLE;
+        destroy_ahb_ring_locked();
+        cpu_win_w = 0U;
+        cpu_win_h = 0U;
+        android_path = AndroidPresentPath::none;
+    }
+
+    bool create_swapchain_for_surface_locked() {
+        if (vk_surface == VK_NULL_HANDLE || vk.get_phys_surface_caps == nullptr ||
+            vk.get_phys_surface_formats == nullptr || vk.create_swapchain == nullptr ||
+            vk.get_swapchain_images == nullptr) {
+            return false;
+        }
+        VkSurfaceCapabilitiesKHR caps{};
+        if (vk.get_phys_surface_caps(h.physical_device, vk_surface, &caps) != VK_SUCCESS) {
+            return false;
+        }
+        if ((caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0U) {
+            report.missing_features.push_back("swapchain lacks TRANSFER_DST_BIT");
+            return false;
+        }
+
+        std::uint32_t fmt_cnt = 0U;
+        if (vk.get_phys_surface_formats(h.physical_device, vk_surface, &fmt_cnt, nullptr) != VK_SUCCESS ||
+            fmt_cnt == 0U) {
+            return false;
+        }
+        std::vector<VkSurfaceFormatKHR> fmts(fmt_cnt);
+        if (vk.get_phys_surface_formats(h.physical_device, vk_surface, &fmt_cnt, fmts.data()) != VK_SUCCESS ||
+            fmt_cnt == 0U) {
+            return false;
+        }
+        fmts.resize(fmt_cnt);
+        VkSurfaceFormatKHR chosen_fmt = fmts[0];
+        for (const VkSurfaceFormatKHR& f : fmts) {
+            if (f.format == VK_FORMAT_R8G8B8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                chosen_fmt = f;
+                break;
+            }
+            if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                chosen_fmt = f;
+            }
+        }
+
+        VkExtent2D extent = caps.currentExtent;
+        if (extent.width == UINT32_MAX || extent.height == UINT32_MAX || extent.width == 0U || extent.height == 0U) {
+            const std::uint32_t ww = active_window != nullptr
+                                         ? static_cast<std::uint32_t>(std::max<std::int32_t>(1, ANativeWindow_getWidth(active_window)))
+                                         : bb_width;
+            const std::uint32_t wh = active_window != nullptr
+                                         ? static_cast<std::uint32_t>(std::max<std::int32_t>(1, ANativeWindow_getHeight(active_window)))
+                                         : bb_height;
+            extent.width = std::clamp(ww, caps.minImageExtent.width, caps.maxImageExtent.width);
+            extent.height = std::clamp(wh, caps.minImageExtent.height, caps.maxImageExtent.height);
+        }
+        if (extent.width == 0U || extent.height == 0U) return false;
+
+        std::uint32_t img_count = std::max<std::uint32_t>(caps.minImageCount, 3U);
+        if (caps.maxImageCount > 0U && img_count > caps.maxImageCount) {
+            img_count = caps.maxImageCount;
+        }
+
+        VkSurfaceTransformFlagBitsKHR pre_transform = caps.currentTransform;
+        if ((caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0U) {
+            pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        }
+
+        VkCompositeAlphaFlagBitsKHR comp_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        if ((caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0U) {
+            comp_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        } else if ((caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) != 0U) {
+            comp_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+        } else if ((caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) != 0U) {
+            comp_alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+        } else if ((caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) != 0U) {
+            comp_alpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+        }
+
+        VkSwapchainKHR old_sc = swapchain;
+        VkSwapchainCreateInfoKHR sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        sci.surface = vk_surface;
+        sci.minImageCount = img_count;
+        sci.imageFormat = chosen_fmt.format;
+        sci.imageColorSpace = chosen_fmt.colorSpace;
+        sci.imageExtent = extent;
+        sci.imageArrayLayers = 1U;
+        sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        sci.preTransform = pre_transform;
+        sci.compositeAlpha = comp_alpha;
+        sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        sci.clipped = VK_TRUE;
+        sci.oldSwapchain = old_sc;
+
+        VkSwapchainKHR next_sc = VK_NULL_HANDLE;
+        const VkResult r = vk.create_swapchain(h.device, &sci, nullptr, &next_sc);
+        if (old_sc != VK_NULL_HANDLE && vk.destroy_swapchain != nullptr) {
+            vk.destroy_swapchain(h.device, old_sc, nullptr);
+        }
+        swapchain = VK_NULL_HANDLE;
+        sc_images.clear();
+        if (r != VK_SUCCESS || next_sc == VK_NULL_HANDLE) {
+            report.missing_features.push_back("vkCreateSwapchainKHR failed (" + std::to_string(static_cast<int>(r)) + ")");
+            return false;
+        }
+
+        std::uint32_t sc_cnt = 0U;
+        if (vk.get_swapchain_images(h.device, next_sc, &sc_cnt, nullptr) != VK_SUCCESS || sc_cnt == 0U) {
+            vk.destroy_swapchain(h.device, next_sc, nullptr);
+            return false;
+        }
+        sc_images.resize(sc_cnt);
+        if (vk.get_swapchain_images(h.device, next_sc, &sc_cnt, sc_images.data()) != VK_SUCCESS || sc_cnt == 0U) {
+            sc_images.clear();
+            vk.destroy_swapchain(h.device, next_sc, nullptr);
+            return false;
+        }
+        sc_images.resize(sc_cnt);
+        swapchain = next_sc;
+        sc_format = chosen_fmt.format;
+        sc_extent = extent;
+        sc_dirty = false;
+        return true;
+    }
+
+    bool setup_swapchain_locked() {
+        if (active_window == nullptr || vk.create_android_surface == nullptr || vk.destroy_surface == nullptr ||
+            vk.get_phys_surface_support == nullptr || vk.create_semaphore == nullptr ||
+            vk.destroy_semaphore == nullptr || vk.acquire_next_image == nullptr || vk.queue_present == nullptr) {
+            report.missing_features.push_back("missing Android WSI/swapchain procs");
+            return false;
+        }
+        VkAndroidSurfaceCreateInfoKHR asci{};
+        asci.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+        asci.window = active_window;
+        const VkResult sr = vk.create_android_surface(h.instance, &asci, nullptr, &vk_surface);
+        if (sr != VK_SUCCESS || vk_surface == VK_NULL_HANDLE) {
+            vk_surface = VK_NULL_HANDLE;
+            report.missing_features.push_back("vkCreateAndroidSurfaceKHR failed (" +
+                                              std::to_string(static_cast<int>(sr)) + ")");
+            return false;
+        }
+        VkBool32 supported = VK_FALSE;
+        if (vk.get_phys_surface_support(h.physical_device, h.graphics_queue_family, vk_surface, &supported) !=
+                VK_SUCCESS ||
+            supported != VK_TRUE) {
+            teardown_android_presentation_locked();
+            report.missing_features.push_back("graphics queue lacks surface present support");
+            return false;
+        }
+        VkSemaphoreCreateInfo sem_ci{};
+        sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        if (vk.create_semaphore(h.device, &sem_ci, nullptr, &img_avail_sem) != VK_SUCCESS ||
+            vk.create_semaphore(h.device, &sem_ci, nullptr, &render_done_sem) != VK_SUCCESS) {
+            teardown_android_presentation_locked();
+            return false;
+        }
+        if (!create_swapchain_for_surface_locked()) {
+            teardown_android_presentation_locked();
+            return false;
+        }
+        return true;
+    }
+
+    bool setup_ahb_surface_control_locked() {
+        if (active_window == nullptr || !h.ahb_external_memory || vk.get_ahb_props == nullptr ||
+            bb_width == 0U || bb_height == 0U) {
+            return false;
+        }
+        destroy_ahb_ring_locked();
+
+        ahb_surface_control = ASurfaceControl_createFromWindow(active_window, "WSE2-R5");
+        if (ahb_surface_control == nullptr) {
+            report.missing_features.push_back("ASurfaceControl_createFromWindow failed -> ANativeWindow_lock");
+            return false;
+        }
+
+        for (std::size_t i = 0; i < kAhbRingSize; ++i) {
+            AhbSlot& slot = ahb_slots[i];
+            AHardwareBuffer_Desc desc{};
+            desc.width = bb_width;
+            desc.height = bb_height;
+            desc.layers = 1U;
+            desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+            desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                         AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                         AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+            if (AHardwareBuffer_allocate(&desc, &slot.ahb) != 0 || slot.ahb == nullptr) {
+                desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER;
+                if (AHardwareBuffer_allocate(&desc, &slot.ahb) != 0 || slot.ahb == nullptr) {
+                    report.missing_features.push_back("AHardwareBuffer_allocate failed -> ANativeWindow_lock");
+                    destroy_ahb_ring_locked();
+                    return false;
+                }
+            }
+
+            VkAndroidHardwareBufferFormatPropertiesANDROID fmt_props{};
+            fmt_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+            VkAndroidHardwareBufferPropertiesANDROID ahb_props{};
+            ahb_props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+            ahb_props.pNext = &fmt_props;
+            const VkResult pr = vk.get_ahb_props(h.device, slot.ahb, &ahb_props);
+            if (pr != VK_SUCCESS || ahb_props.allocationSize == 0U || ahb_props.memoryTypeBits == 0U) {
+                report.missing_features.push_back("vkGetAndroidHardwareBufferPropertiesANDROID failed (" +
+                                                  std::to_string(static_cast<int>(pr)) + ") -> ANativeWindow_lock");
+                destroy_ahb_ring_locked();
+                return false;
+            }
+
+            slot.fmt = (fmt_props.format != VK_FORMAT_UNDEFINED) ? fmt_props.format : VK_FORMAT_R8G8B8A8_UNORM;
+            VkExternalMemoryImageCreateInfo ext_img{};
+            ext_img.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+            ext_img.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.pNext = &ext_img;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = slot.fmt;
+            ici.extent = {bb_width, bb_height, 1U};
+            ici.mipLevels = 1U;
+            ici.arrayLayers = 1U;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            const VkResult ir = vk.create_image(h.device, &ici, nullptr, &slot.img);
+            if (ir != VK_SUCCESS || slot.img == VK_NULL_HANDLE) {
+                report.missing_features.push_back("vkCreateImage(AHB) failed (" +
+                                                  std::to_string(static_cast<int>(ir)) + ") -> ANativeWindow_lock");
+                destroy_ahb_ring_locked();
+                return false;
+            }
+
+            std::uint32_t mem_type = alloc.find_memory_type(ahb_props.memoryTypeBits, 0U,
+                                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (mem_type == UINT32_MAX) {
+                for (std::uint32_t bit = 0; bit < 32U; ++bit) {
+                    if ((ahb_props.memoryTypeBits & (1U << bit)) != 0U) {
+                        mem_type = bit;
+                        break;
+                    }
+                }
+            }
+            if (mem_type == UINT32_MAX) {
+                report.missing_features.push_back("no memoryType for AHB import -> ANativeWindow_lock");
+                destroy_ahb_ring_locked();
+                return false;
+            }
+
+            VkImportAndroidHardwareBufferInfoANDROID import_info{};
+            import_info.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+            import_info.buffer = slot.ahb;
+
+            VkMemoryDedicatedAllocateInfo ded_info{};
+            ded_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+            ded_info.pNext = &import_info;
+            ded_info.image = slot.img;
+
+            VkMemoryAllocateInfo mai{};
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            mai.pNext = &ded_info;
+            mai.allocationSize = ahb_props.allocationSize;
+            mai.memoryTypeIndex = mem_type;
+
+            const VkResult ar = vk.allocate_memory(h.device, &mai, nullptr, &slot.mem);
+            if (ar != VK_SUCCESS || slot.mem == VK_NULL_HANDLE ||
+                vk.bind_image_memory(h.device, slot.img, slot.mem, 0U) != VK_SUCCESS) {
+                report.missing_features.push_back("vkAllocateMemory/Bind(AHB) failed (" +
+                                                  std::to_string(static_cast<int>(ar)) + ") -> ANativeWindow_lock");
+                destroy_ahb_ring_locked();
+                return false;
+            }
+        }
+        ahb_width = bb_width;
+        ahb_height = bb_height;
+        ahb_slot_idx = 0U;
+        return true;
+    }
+
+    void setup_android_presentation_locked() {
+        teardown_android_presentation_locked();
+        if (!gpu_ready || active_window == nullptr) return;
+
+        // Tier 1: System Vulkan WSI (VK_KHR_android_surface + VK_KHR_swapchain).
+        if (h.probe.presentation_path == PresentationPath::android_surface_wsi &&
+            h.probe.swapchain_extension_enabled) {
+            if (setup_swapchain_locked()) {
+                android_path = AndroidPresentPath::swapchain;
+                report.presentation_path = "android_surface_wsi(swapchain)";
+                return;
+            }
+        }
+
+        // Tier 2: Zero-copy AHardwareBuffer + ASurfaceControl (PanVK / Turnip).
+        if (h.ahb_external_memory && vk.get_ahb_props != nullptr) {
+            if (setup_ahb_surface_control_locked()) {
+                android_path = AndroidPresentPath::ahb_surface_control;
+                report.presentation_path = "offscreen_hardware_buffer_bridge(ahb+ASurfaceControl)";
+                return;
+            }
+        } else if (h.probe.presentation_path == PresentationPath::offscreen_hardware_buffer_bridge) {
+            report.missing_features.push_back(
+                "VK_ANDROID_external_memory_android_hardware_buffer unavailable -> ANativeWindow_lock");
+        }
+
+        // Tier 3: Universal CPU readback + ANativeWindow_lock fallback.
+        android_path = AndroidPresentPath::native_window_cpu;
+        report.presentation_path = "native_window_cpu_fallback(ANativeWindow_lock)";
+    }
+
+    bool present_to_android_locked(std::vector<std::uint8_t>* out_rgba8) {
+        if (active_window == nullptr || android_path == AndroidPresentPath::none) return false;
+
+        const VkDeviceSize rb_bytes = static_cast<VkDeviceSize>(bb_width) * bb_height * 4U;
+
+        if (android_path == AndroidPresentPath::swapchain) {
+            if (sc_dirty || swapchain == VK_NULL_HANDLE) {
+                if (vk.device_wait_idle != nullptr) (void)vk.device_wait_idle(h.device);
+                if (!create_swapchain_for_surface_locked()) {
+                    // Fall back to CPU window upload if swapchain cannot be recreated.
+                    teardown_android_presentation_locked();
+                    android_path = AndroidPresentPath::native_window_cpu;
+                    report.presentation_path = "native_window_cpu_fallback(ANativeWindow_lock)";
+                    return present_to_android_locked(out_rgba8);
+                }
+            }
+
+            std::uint32_t img_idx = 0U;
+            VkResult ar = vk.acquire_next_image(h.device, swapchain, 1'000'000'000ULL,
+                                                img_avail_sem, VK_NULL_HANDLE, &img_idx);
+            if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
+                if (vk.device_wait_idle != nullptr) (void)vk.device_wait_idle(h.device);
+                if (!create_swapchain_for_surface_locked()) return true;
+                ar = vk.acquire_next_image(h.device, swapchain, 1'000'000'000ULL,
+                                           img_avail_sem, VK_NULL_HANDLE, &img_idx);
+            }
+            if ((ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) || img_idx >= sc_images.size()) {
+                if (ar == VK_ERROR_SURFACE_LOST_KHR) teardown_android_presentation_locked();
+                return true;
+            }
+            if (ar == VK_SUBOPTIMAL_KHR) sc_dirty = true;
+
+            if (!ensure_frame_recording()) return false;
+            if (render_pass_active) {
+                vk.cmd_end_render_pass(frame_cmd);
+                render_pass_active = false;
+            }
+            const bool do_rb = (out_rgba8 != nullptr) && ensure_readback(rb_bytes, &last_error);
+
+            std::array<VkImageMemoryBarrier, 2> pre_bars{};
+            pre_bars[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            pre_bars[0].oldLayout = bb_layout;
+            pre_bars[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            pre_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[0].image = bb_img;
+            pre_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            pre_bars[0].srcAccessMask =
+                (bb_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
+            pre_bars[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+            pre_bars[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            pre_bars[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            pre_bars[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            pre_bars[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[1].image = sc_images[img_idx];
+            pre_bars[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            pre_bars[1].srcAccessMask = 0U;
+            pre_bars[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr,
+                                    2U, pre_bars.data());
+
+            if (do_rb) {
+                VkBufferImageCopy cpy{};
+                cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                cpy.imageExtent = {bb_width, bb_height, 1U};
+                vk.cmd_copy_image_to_buffer(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                            readback_buf, 1U, &cpy);
+            }
+
+            std::int32_t dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
+            compute_letterbox_rect(static_cast<std::int32_t>(bb_width), static_cast<std::int32_t>(bb_height),
+                                   static_cast<std::int32_t>(sc_extent.width), static_cast<std::int32_t>(sc_extent.height),
+                                   dst_x, dst_y, dst_w, dst_h);
+            const bool letterboxed = (dst_x > 0 || dst_y > 0 ||
+                                      static_cast<std::uint32_t>(dst_w) < sc_extent.width ||
+                                      static_cast<std::uint32_t>(dst_h) < sc_extent.height);
+            if (letterboxed && vk.cmd_clear_color_image != nullptr) {
+                VkClearColorValue black{};
+                black.float32[0] = 0.0F;
+                black.float32[1] = 0.0F;
+                black.float32[2] = 0.0F;
+                black.float32[3] = 1.0F;
+                VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+                vk.cmd_clear_color_image(frame_cmd, sc_images[img_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                         &black, 1U, &rng);
+                VkImageMemoryBarrier clr_bar{};
+                clr_bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                clr_bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                clr_bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                clr_bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                clr_bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                clr_bar.image = sc_images[img_idx];
+                clr_bar.subresourceRange = rng;
+                clr_bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                clr_bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        0U, 0U, nullptr, 0U, nullptr, 1U, &clr_bar);
+            }
+
+            if (!letterboxed && static_cast<std::uint32_t>(dst_w) == bb_width &&
+                static_cast<std::uint32_t>(dst_h) == bb_height && sc_format == VK_FORMAT_R8G8B8A8_UNORM &&
+                vk.cmd_copy_image != nullptr) {
+                VkImageCopy ic{};
+                ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                ic.extent = {bb_width, bb_height, 1U};
+                vk.cmd_copy_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  sc_images[img_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &ic);
+            } else if (vk.cmd_blit_image != nullptr) {
+                VkImageBlit bl{};
+                bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                bl.srcOffsets[0] = {0, 0, 0};
+                bl.srcOffsets[1] = {static_cast<std::int32_t>(bb_width), static_cast<std::int32_t>(bb_height), 1};
+                bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                bl.dstOffsets[0] = {dst_x, dst_y, 0};
+                bl.dstOffsets[1] = {dst_x + dst_w, dst_y + dst_h, 1};
+                vk.cmd_blit_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  sc_images[img_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &bl, VK_FILTER_LINEAR);
+            }
+
+            std::array<VkImageMemoryBarrier, 2> post_bars{};
+            post_bars[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            post_bars[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            post_bars[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            post_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            post_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            post_bars[0].image = bb_img;
+            post_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            post_bars[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            post_bars[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+            post_bars[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            post_bars[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            post_bars[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            post_bars[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            post_bars[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            post_bars[1].image = sc_images[img_idx];
+            post_bars[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            post_bars[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            post_bars[1].dstAccessMask = 0U;
+
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr,
+                                    2U, post_bars.data());
+            bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) {
+                frame_recording = false;
+                return false;
+            }
+            if (vk.reset_fences(h.device, 1U, &frame_fence) != VK_SUCCESS) {
+                frame_recording = false;
+                return false;
+            }
+            const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.waitSemaphoreCount = 1U;
+            si.pWaitSemaphores = &img_avail_sem;
+            si.pWaitDstStageMask = &wait_stage;
+            si.commandBufferCount = 1U;
+            si.pCommandBuffers = &frame_cmd;
+            si.signalSemaphoreCount = 1U;
+            si.pSignalSemaphores = &render_done_sem;
+            if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) != VK_SUCCESS) {
+                frame_recording = false;
+                return false;
+            }
+
+            VkPresentInfoKHR pi{};
+            pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+            pi.waitSemaphoreCount = 1U;
+            pi.pWaitSemaphores = &render_done_sem;
+            pi.swapchainCount = 1U;
+            pi.pSwapchains = &swapchain;
+            pi.pImageIndices = &img_idx;
+            const VkResult pr = vk.queue_present(h.graphics_queue, &pi);
+            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) sc_dirty = true;
+
+            (void)vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL);
+            frame_recording = false;
+            free_retired();
+            if (do_rb) {
+                alloc.invalidate(readback_mem, 0U, rb_bytes);
+                out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
+                std::memcpy(out_rgba8->data(), readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
+            }
+            return true;
+        }
+
+        if (android_path == AndroidPresentPath::ahb_surface_control) {
+            if (ahb_width != bb_width || ahb_height != bb_height) {
+                if (!setup_ahb_surface_control_locked()) {
+                    android_path = AndroidPresentPath::native_window_cpu;
+                    report.presentation_path = "native_window_cpu_fallback(ANativeWindow_lock)";
+                    return present_to_android_locked(out_rgba8);
+                }
+            }
+
+            AhbSlot& slot = ahb_slots[ahb_slot_idx];
+            ahb_slot_idx = (ahb_slot_idx + 1U) % kAhbRingSize;
+            if (!ensure_frame_recording()) return false;
+            if (render_pass_active) {
+                vk.cmd_end_render_pass(frame_cmd);
+                render_pass_active = false;
+            }
+            const bool do_rb = (out_rgba8 != nullptr) && ensure_readback(rb_bytes, &last_error);
+
+            std::array<VkImageMemoryBarrier, 2> pre_bars{};
+            pre_bars[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            pre_bars[0].oldLayout = bb_layout;
+            pre_bars[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            pre_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[0].image = bb_img;
+            pre_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            pre_bars[0].srcAccessMask =
+                (bb_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
+            pre_bars[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+            pre_bars[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            pre_bars[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            pre_bars[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            pre_bars[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pre_bars[1].image = slot.img;
+            pre_bars[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            pre_bars[1].srcAccessMask = 0U;
+            pre_bars[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr,
+                                    2U, pre_bars.data());
+
+            if (do_rb) {
+                VkBufferImageCopy cpy{};
+                cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                cpy.imageExtent = {bb_width, bb_height, 1U};
+                vk.cmd_copy_image_to_buffer(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                            readback_buf, 1U, &cpy);
+            }
+
+            if (slot.fmt == VK_FORMAT_R8G8B8A8_UNORM && vk.cmd_copy_image != nullptr) {
+                VkImageCopy ic{};
+                ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                ic.extent = {bb_width, bb_height, 1U};
+                vk.cmd_copy_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  slot.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &ic);
+            } else if (vk.cmd_blit_image != nullptr) {
+                VkImageBlit bl{};
+                bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                bl.srcOffsets[0] = {0, 0, 0};
+                bl.srcOffsets[1] = {static_cast<std::int32_t>(bb_width), static_cast<std::int32_t>(bb_height), 1};
+                bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                bl.dstOffsets[0] = {0, 0, 0};
+                bl.dstOffsets[1] = {static_cast<std::int32_t>(bb_width), static_cast<std::int32_t>(bb_height), 1};
+                vk.cmd_blit_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  slot.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &bl, VK_FILTER_NEAREST);
+            }
+
+            std::array<VkImageMemoryBarrier, 2> post_bars{};
+            post_bars[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            post_bars[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            post_bars[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            post_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            post_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            post_bars[0].image = bb_img;
+            post_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            post_bars[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            post_bars[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+            post_bars[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            post_bars[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            post_bars[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            post_bars[1].srcQueueFamilyIndex = h.queue_family_foreign ? h.graphics_queue_family : VK_QUEUE_FAMILY_IGNORED;
+            post_bars[1].dstQueueFamilyIndex = h.queue_family_foreign ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED;
+            post_bars[1].image = slot.img;
+            post_bars[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            post_bars[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            post_bars[1].dstAccessMask = 0U;
+
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0U, 0U, nullptr, 0U, nullptr,
+                                    2U, post_bars.data());
+            bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) {
+                frame_recording = false;
+                return false;
+            }
+            if (vk.reset_fences(h.device, 1U, &frame_fence) != VK_SUCCESS) {
+                frame_recording = false;
+                return false;
+            }
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1U;
+            si.pCommandBuffers = &frame_cmd;
+            if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) != VK_SUCCESS) {
+                frame_recording = false;
+                return false;
+            }
+            if (vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL) != VK_SUCCESS) {
+                frame_recording = false;
+                return false;
+            }
+            frame_recording = false;
+            free_retired();
+
+            if (ahb_surface_control != nullptr) {
+                const std::int32_t win_w = std::max<std::int32_t>(1, ANativeWindow_getWidth(active_window));
+                const std::int32_t win_h = std::max<std::int32_t>(1, ANativeWindow_getHeight(active_window));
+                std::int32_t dst_x = 0, dst_y = 0, dst_w = 0, dst_h = 0;
+                compute_letterbox_rect(static_cast<std::int32_t>(bb_width), static_cast<std::int32_t>(bb_height),
+                                       win_w, win_h, dst_x, dst_y, dst_w, dst_h);
+                const ARect src_rc{0, 0, static_cast<std::int32_t>(bb_width), static_cast<std::int32_t>(bb_height)};
+                const ARect dst_rc{dst_x, dst_y, dst_x + dst_w, dst_y + dst_h};
+                if (ASurfaceTransaction* tx = ASurfaceTransaction_create()) {
+                    ASurfaceTransaction_setVisibility(tx, ahb_surface_control, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+                    ASurfaceTransaction_setZOrder(tx, ahb_surface_control, 0);
+                    ASurfaceTransaction_setBufferTransparency(tx, ahb_surface_control,
+                                                              ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
+                    ASurfaceTransaction_setBuffer(tx, ahb_surface_control, slot.ahb, -1);
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+                    ASurfaceTransaction_setGeometry(tx, ahb_surface_control, src_rc, dst_rc, 0);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+                    ASurfaceTransaction_apply(tx);
+                    ASurfaceTransaction_delete(tx);
+                }
+            }
+
+            if (do_rb) {
+                alloc.invalidate(readback_mem, 0U, rb_bytes);
+                out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
+                std::memcpy(out_rgba8->data(), readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
+            }
+            return true;
+        }
+
+        // Tier 3: CPU readback + ANativeWindow_lock upload.
+        if (!ensure_frame_recording()) return false;
+        if (render_pass_active) {
+            vk.cmd_end_render_pass(frame_cmd);
+            render_pass_active = false;
+        }
+        const bool rb_ok = ensure_readback(rb_bytes, &last_error);
+        if (rb_ok) {
+            VkImageMemoryBarrier bar{};
+            bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            bar.oldLayout = bb_layout;
+            bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.image = bb_img;
+            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            bar.srcAccessMask =
+                (bb_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
+            bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+            VkBufferImageCopy cpy{};
+            cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+            cpy.imageExtent = {bb_width, bb_height, 1U};
+            vk.cmd_copy_image_to_buffer(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                        readback_buf, 1U, &cpy);
+            bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+            bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        }
+        if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) {
+            frame_recording = false;
+            return false;
+        }
+        if (vk.reset_fences(h.device, 1U, &frame_fence) != VK_SUCCESS) {
+            frame_recording = false;
+            return false;
+        }
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1U;
+        si.pCommandBuffers = &frame_cmd;
+        if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) != VK_SUCCESS) {
+            frame_recording = false;
+            return false;
+        }
+        if (vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL) != VK_SUCCESS) {
+            frame_recording = false;
+            return false;
+        }
+        frame_recording = false;
+        free_retired();
+
+        if (rb_ok) {
+            alloc.invalidate(readback_mem, 0U, rb_bytes);
+            if (cpu_win_w != bb_width || cpu_win_h != bb_height) {
+                (void)ANativeWindow_setBuffersGeometry(active_window, static_cast<std::int32_t>(bb_width),
+                                                       static_cast<std::int32_t>(bb_height), WINDOW_FORMAT_RGBA_8888);
+                cpu_win_w = bb_width;
+                cpu_win_h = bb_height;
+            }
+            ANativeWindow_Buffer wb{};
+            if (ANativeWindow_lock(active_window, &wb, nullptr) == 0 && wb.bits != nullptr) {
+                const std::uint32_t copy_w =
+                    std::min<std::uint32_t>(bb_width, static_cast<std::uint32_t>(std::max<std::int32_t>(0, wb.width)));
+                const std::uint32_t copy_h =
+                    std::min<std::uint32_t>(bb_height, static_cast<std::uint32_t>(std::max<std::int32_t>(0, wb.height)));
+                const auto* src = static_cast<const std::uint8_t*>(readback_mem.mapped);
+                auto* dst = static_cast<std::uint8_t*>(wb.bits);
+                const std::size_t src_stride = static_cast<std::size_t>(bb_width) * 4U;
+                const std::size_t dst_stride = static_cast<std::size_t>(std::max<std::int32_t>(0, wb.stride)) * 4U;
+                const std::size_t row_bytes = static_cast<std::size_t>(copy_w) * 4U;
+                if (row_bytes > 0U && dst_stride >= row_bytes) {
+                    for (std::uint32_t y = 0; y < copy_h; ++y) {
+                        std::memcpy(dst + y * dst_stride, src + y * src_stride, row_bytes);
+                    }
+                }
+                (void)ANativeWindow_unlockAndPost(active_window);
+            }
+            if (out_rgba8 != nullptr) {
+                out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
+                std::memcpy(out_rgba8->data(), readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
+            }
+        }
+        return true;
+    }
+#endif
+
+    Impl(std::shared_ptr<VulkanDriverLoader> ldr, VulkanD3d9Config cfg)
+        : loader(std::move(ldr)), config(std::move(cfg)) {
+#ifdef __ANDROID__
+        if (config.native_window != nullptr) {
+            active_window = static_cast<ANativeWindow*>(config.native_window);
+            ANativeWindow_acquire(active_window);
+        }
+#endif
+    }
+
+    ~Impl() {
+        const std::lock_guard<std::mutex> lock(api_mutex);
+        shutdown();
+#ifdef __ANDROID__
+        if (active_window != nullptr) {
+            ANativeWindow_release(active_window);
+            active_window = nullptr;
+        }
+#endif
+    }
 
     void shutdown() noexcept {
         if (!initialized) return;
         if (gpu_ready && h.device != VK_NULL_HANDLE) {
             if (vk.device_wait_idle != nullptr) (void)vk.device_wait_idle(h.device);
+#ifdef __ANDROID__
+            teardown_android_presentation_locked();
+#endif
             save_pipeline_cache();
             free_retired();
 
@@ -1878,6 +2829,12 @@ struct VulkanD3d9Backend::Impl {
             return false;
         }
 
+#ifdef __ANDROID__
+        if (active_window != nullptr) {
+            setup_android_presentation_locked();
+        }
+#endif
+
         report.ok = true;
         return true;
     }
@@ -2555,6 +3512,7 @@ bool VulkanD3d9Backend::init(std::uint32_t width, std::uint32_t height, std::uin
                              std::uint32_t depth_fmt, std::string* error_out) {
     (void)color_fmt;
     (void)depth_fmt;
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     return impl_->init(width, height, error_out);
 }
 
@@ -2562,6 +3520,7 @@ bool VulkanD3d9Backend::reset(std::uint32_t width, std::uint32_t height, std::ui
                               std::uint32_t depth_fmt, std::string* error_out) {
     (void)color_fmt;
     (void)depth_fmt;
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     if (!impl_->initialized) return impl_->init(width, height, error_out);
     if (!impl_->gpu_ready) {
         impl_->bb_width = std::max<std::uint32_t>(1U, width);
@@ -2570,13 +3529,37 @@ bool VulkanD3d9Backend::reset(std::uint32_t width, std::uint32_t height, std::ui
     }
     impl_->flush_frame_if_recording();
     if (impl_->vk.device_wait_idle != nullptr) (void)impl_->vk.device_wait_idle(impl_->h.device);
-    return impl_->create_backbuffer(width, height, error_out);
+    if (!impl_->create_backbuffer(width, height, error_out)) return false;
+#ifdef __ANDROID__
+    if (impl_->active_window != nullptr) {
+        if (impl_->android_path == Impl::AndroidPresentPath::ahb_surface_control) {
+            if (!impl_->setup_ahb_surface_control_locked()) {
+                impl_->android_path = Impl::AndroidPresentPath::native_window_cpu;
+                impl_->report.presentation_path = "native_window_cpu_fallback(ANativeWindow_lock)";
+            }
+        } else if (impl_->android_path == Impl::AndroidPresentPath::native_window_cpu) {
+            impl_->cpu_win_w = 0U;
+            impl_->cpu_win_h = 0U;
+        }
+    }
+#endif
+    return true;
 }
 
 const D3d9DriverReport& VulkanD3d9Backend::report() const noexcept { return impl_->report; }
 
 void VulkanD3d9Backend::create_buffer(std::uint64_t id, bool is_index, std::uint32_t size,
                                       bool dynamic, std::uint32_t fmt) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    const auto old = impl_->buffers.find(id);
+    if (old != impl_->buffers.end()) {
+        if (impl_->gpu_ready && old->second.vk_buf != VK_NULL_HANDLE) {
+            impl_->flush_frame_if_recording();
+            impl_->vk.destroy_buffer(impl_->h.device, old->second.vk_buf, nullptr);
+            impl_->alloc.free(old->second.vk_mem);
+        }
+        impl_->buffers.erase(old);
+    }
     Impl::BufferObj b{};
     b.is_index = is_index;
     b.is_index32 = (fmt == 102U);
@@ -2584,13 +3567,13 @@ void VulkanD3d9Backend::create_buffer(std::uint64_t id, bool is_index, std::uint
     b.size = size;
     b.shadow.assign(size, 0U);
     b.dirty = true;
-    destroy_buffer(id);
     impl_->buffers.emplace(id, std::move(b));
 }
 
 void VulkanD3d9Backend::update_buffer(std::uint64_t id, std::uint32_t offset,
                                       std::span<const std::uint8_t> bytes, bool discard) {
     (void)discard;
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto it = impl_->buffers.find(id);
     if (it == impl_->buffers.end() || bytes.empty()) return;
     Impl::BufferObj& b = it->second;
@@ -2601,6 +3584,7 @@ void VulkanD3d9Backend::update_buffer(std::uint64_t id, std::uint32_t offset,
 }
 
 void VulkanD3d9Backend::destroy_buffer(std::uint64_t id) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto it = impl_->buffers.find(id);
     if (it == impl_->buffers.end()) return;
     if (impl_->gpu_ready && it->second.vk_buf != VK_NULL_HANDLE) {
@@ -2614,7 +3598,20 @@ void VulkanD3d9Backend::destroy_buffer(std::uint64_t id) {
 void VulkanD3d9Backend::create_texture(std::uint64_t id, int kind, std::uint32_t width, std::uint32_t height,
                                        std::uint32_t depth, std::uint32_t levels, std::uint32_t fmt,
                                        std::uint32_t usage) {
-    destroy_texture(id);
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    const auto old = impl_->textures.find(id);
+    if (old != impl_->textures.end()) {
+        if (impl_->gpu_ready && old->second.img != VK_NULL_HANDLE) {
+            impl_->flush_frame_if_recording();
+            if (impl_->vk.device_wait_idle != nullptr) (void)impl_->vk.device_wait_idle(impl_->h.device);
+            impl_->sampler_set_cache.clear();
+            for (VkDescriptorPool p : impl_->sampler_desc_pools) {
+                (void)impl_->vk.reset_desc_pool(impl_->h.device, p, 0U);
+            }
+            impl_->destroy_texture_gpu(old->second);
+        }
+        impl_->textures.erase(old);
+    }
     Impl::TextureObj t{};
     t.kind = kind;
     t.width = std::max<std::uint32_t>(1U, width);
@@ -2628,6 +3625,7 @@ void VulkanD3d9Backend::create_texture(std::uint64_t id, int kind, std::uint32_t
 
 void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t face, std::uint32_t level,
                                              std::span<const std::uint8_t> bytes, std::uint32_t row_pitch) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     if (!impl_->gpu_ready) return;
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
@@ -2698,6 +3696,7 @@ void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t fac
 }
 
 void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std::uint8_t> dds_bytes) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     if (!impl_->gpu_ready || dds_bytes.empty()) return;
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
@@ -2811,6 +3810,7 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
 }
 
 void VulkanD3d9Backend::destroy_texture(std::uint64_t id) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
     if (impl_->gpu_ready && it->second.img != VK_NULL_HANDLE) {
@@ -2835,6 +3835,7 @@ void VulkanD3d9Backend::create_surface(std::uint64_t id, std::uint32_t width, st
 void VulkanD3d9Backend::destroy_surface(std::uint64_t id) { (void)id; }
 
 void VulkanD3d9Backend::create_vertex_decl(std::uint64_t id, std::span<const D3d9VertexElement> elems) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     Impl::VertexDeclObj d;
     d.elems.assign(elems.begin(), elems.end());
     std::uint64_t h = 14695981039346656037ULL;
@@ -2850,9 +3851,13 @@ void VulkanD3d9Backend::create_vertex_decl(std::uint64_t id, std::span<const D3d
     impl_->decls[id] = std::move(d);
 }
 
-void VulkanD3d9Backend::destroy_vertex_decl(std::uint64_t id) { impl_->decls.erase(id); }
+void VulkanD3d9Backend::destroy_vertex_decl(std::uint64_t id) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    impl_->decls.erase(id);
+}
 
 void VulkanD3d9Backend::create_shader(std::uint64_t id, bool is_pixel, std::span<const std::uint8_t> bytecode) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     if (bytecode.empty()) return;
     const std::uint64_t sh_hash = fnv1a_bytes(bytecode) ^ (is_pixel ? 0x9E3779B97F4A7C15ULL : 0ULL);
     impl_->shader_id_to_hash[id] = sh_hash;
@@ -2867,10 +3872,14 @@ void VulkanD3d9Backend::create_shader(std::uint64_t id, bool is_pixel, std::span
     impl_->shader_by_hash.emplace(sh_hash, std::move(cs));
 }
 
-void VulkanD3d9Backend::destroy_shader(std::uint64_t id) { impl_->shader_id_to_hash.erase(id); }
+void VulkanD3d9Backend::destroy_shader(std::uint64_t id) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    impl_->shader_id_to_hash.erase(id);
+}
 
 void VulkanD3d9Backend::clear(const D3d9DrawState& state, std::uint32_t flags, std::uint32_t argb,
                               float z, std::uint32_t stencil, std::span<const D3d9Rect> rects) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     if (!impl_->gpu_ready || flags == 0U) return;
     const float r = static_cast<float>((argb >> 16) & 0xFFU) / 255.0F;
     const float g = static_cast<float>((argb >> 8) & 0xFFU) / 255.0F;
@@ -2950,6 +3959,7 @@ void VulkanD3d9Backend::draw_indexed(const D3d9DrawState& state, std::uint32_t p
                                      std::uint32_t start_index, std::uint32_t prim_count) {
     (void)min_v;
     (void)num_v;
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const std::uint32_t index_count = vertex_count_for_prims(prim_type, prim_count);
     if (!impl_->gpu_ready || index_count == 0U || state.indices == 0U) return;
 
@@ -2966,6 +3976,7 @@ void VulkanD3d9Backend::draw_indexed(const D3d9DrawState& state, std::uint32_t p
 
 void VulkanD3d9Backend::draw_primitive(const D3d9DrawState& state, std::uint32_t prim_type,
                                        std::uint32_t start_vertex, std::uint32_t prim_count) {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const std::uint32_t vert_count = vertex_count_for_prims(prim_type, prim_count);
     if (!impl_->gpu_ready || vert_count == 0U) return;
     std::uint32_t inst_count = 1U;
@@ -2975,84 +3986,182 @@ void VulkanD3d9Backend::draw_primitive(const D3d9DrawState& state, std::uint32_t
 
 bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
                                 std::uint32_t* out_width, std::uint32_t* out_height) {
-    if (out_width != nullptr) *out_width = impl_->bb_width;
-    if (out_height != nullptr) *out_height = impl_->bb_height;
-    if (!impl_->gpu_ready) {
-        if (out_rgba8 != nullptr) out_rgba8->assign(static_cast<std::size_t>(impl_->bb_width) * impl_->bb_height * 4U, 0U);
-        return impl_->initialized;
+    std::uint64_t cb_frame = 0;
+    double cb_inst_fps = 0.0;
+    double cb_avg_fps = 0.0;
+    std::string cb_path;
+    bool fire_cb = false;
+    bool ok = true;
+
+    {
+        const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+        if (out_width != nullptr) *out_width = impl_->bb_width;
+        if (out_height != nullptr) *out_height = impl_->bb_height;
+        if (!impl_->gpu_ready) {
+            if (out_rgba8 != nullptr) {
+                out_rgba8->assign(static_cast<std::size_t>(impl_->bb_width) * impl_->bb_height * 4U, 0U);
+            }
+            ok = impl_->initialized;
+        } else {
+#ifdef __ANDROID__
+            const bool has_android_window =
+                (impl_->active_window != nullptr && impl_->android_path != Impl::AndroidPresentPath::none);
+#else
+            const bool has_android_window = false;
+#endif
+            const bool need_present_img = (out_rgba8 != nullptr) || has_android_window;
+            // Ensure a clear-only or first-frame present executes its render pass before readback/present.
+            if (!impl_->frame_touched_rt &&
+                (impl_->pending_clear_color || impl_->pending_clear_depth ||
+                 (need_present_img && impl_->bb_layout == VK_IMAGE_LAYOUT_UNDEFINED) ||
+                 out_rgba8 != nullptr)) {
+                (void)impl_->ensure_render_pass_active();
+            }
+
+            bool handled_present = false;
+#ifdef __ANDROID__
+            if (has_android_window) {
+                ok = impl_->present_to_android_locked(out_rgba8);
+                handled_present = true;
+            }
+#endif
+            if (!handled_present && impl_->frame_recording) {
+                if (impl_->render_pass_active) {
+                    impl_->vk.cmd_end_render_pass(impl_->frame_cmd);
+                    impl_->render_pass_active = false;
+                }
+                const VkDeviceSize rb_bytes = static_cast<VkDeviceSize>(impl_->bb_width) * impl_->bb_height * 4U;
+                const bool do_rb = (out_rgba8 != nullptr) && impl_->ensure_readback(rb_bytes, &impl_->last_error);
+                if (do_rb) {
+                    VkImageMemoryBarrier bar{};
+                    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    bar.oldLayout = impl_->bb_layout;
+                    bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bar.image = impl_->bb_img;
+                    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+                    bar.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    impl_->vk.cmd_pipeline_barrier(impl_->frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+                    VkBufferImageCopy cpy{};
+                    cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
+                    cpy.imageExtent = {impl_->bb_width, impl_->bb_height, 1U};
+                    impl_->vk.cmd_copy_image_to_buffer(impl_->frame_cmd, impl_->bb_img,
+                                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, impl_->readback_buf, 1U, &cpy);
+                    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    impl_->vk.cmd_pipeline_barrier(impl_->frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr,
+                                                   1U, &bar);
+                    impl_->bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                }
+                if (impl_->vk.end_cmd_buffer(impl_->frame_cmd) != VK_SUCCESS) {
+                    impl_->frame_recording = false;
+                    ok = false;
+                } else if (impl_->vk.reset_fences(impl_->h.device, 1U, &impl_->frame_fence) != VK_SUCCESS) {
+                    impl_->frame_recording = false;
+                    ok = false;
+                } else {
+                    VkSubmitInfo si{};
+                    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                    si.commandBufferCount = 1U;
+                    si.pCommandBuffers = &impl_->frame_cmd;
+                    if (impl_->vk.queue_submit(impl_->h.graphics_queue, 1U, &si, impl_->frame_fence) != VK_SUCCESS ||
+                        impl_->vk.wait_for_fences(impl_->h.device, 1U, &impl_->frame_fence, VK_TRUE,
+                                                  10'000'000'000ULL) != VK_SUCCESS) {
+                        impl_->frame_recording = false;
+                        ok = false;
+                    } else {
+                        impl_->frame_recording = false;
+                        impl_->free_retired();
+                        if (do_rb) {
+                            impl_->alloc.invalidate(impl_->readback_mem, 0U, rb_bytes);
+                            out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
+                            std::memcpy(out_rgba8->data(), impl_->readback_mem.mapped,
+                                        static_cast<std::size_t>(rb_bytes));
+                        }
+                    }
+                }
+            }
+
+            // Reset per-frame ring cursors after the frame fence completed.
+            impl_->ubo_ring.cursor = 0U;
+            impl_->dyn_geom_ring.cursor = 0U;
+            impl_->frame_touched_rt = false;
+            impl_->pending_clear_color = false;
+            impl_->pending_clear_depth = false;
+            impl_->bound_pipeline = VK_NULL_HANDLE;
+            impl_->bound_sampler_set = VK_NULL_HANDLE;
+            ++impl_->frame_index;
+        }
+
+        if (ok) {
+            const auto now = std::chrono::steady_clock::now();
+            ++impl_->presented_frames;
+            ++impl_->fps_win_frames;
+            if (!impl_->fps_started) {
+                impl_->fps_started = true;
+                impl_->fps_first_tp = now;
+                impl_->fps_win_tp = now;
+                impl_->last_inst_fps = 0.0;
+            } else {
+                const double win_s = std::chrono::duration<double>(now - impl_->fps_win_tp).count();
+                if (win_s >= 0.5) {
+                    impl_->last_inst_fps = static_cast<double>(impl_->fps_win_frames) / win_s;
+                    impl_->fps_win_tp = now;
+                    impl_->fps_win_frames = 0U;
+                }
+            }
+            const double total_s = std::chrono::duration<double>(now - impl_->fps_first_tp).count();
+            cb_avg_fps = (total_s > 0.001) ? (static_cast<double>(impl_->presented_frames) / total_s) : 0.0;
+            cb_inst_fps = (impl_->last_inst_fps > 0.0) ? impl_->last_inst_fps : cb_avg_fps;
+            cb_frame = impl_->presented_frames;
+            cb_path = impl_->report.presentation_path;
+            fire_cb = static_cast<bool>(impl_->config.on_frame_presented);
+        }
     }
 
-    // Ensure a clear-only frame actually executes its render pass before readback/present.
-    if (!impl_->frame_touched_rt && (impl_->pending_clear_color || impl_->pending_clear_depth || out_rgba8 != nullptr)) {
-        (void)impl_->ensure_render_pass_active();
+    if (fire_cb) {
+        impl_->config.on_frame_presented(cb_frame, cb_inst_fps, cb_avg_fps, cb_path);
     }
+    return ok;
+}
 
-    if (impl_->frame_recording) {
-        if (impl_->render_pass_active) {
-            impl_->vk.cmd_end_render_pass(impl_->frame_cmd);
-            impl_->render_pass_active = false;
-        }
-        const VkDeviceSize rb_bytes = static_cast<VkDeviceSize>(impl_->bb_width) * impl_->bb_height * 4U;
-        const bool do_rb = (out_rgba8 != nullptr) && impl_->ensure_readback(rb_bytes, &impl_->last_error);
-        if (do_rb) {
-            VkImageMemoryBarrier bar{};
-            bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            bar.oldLayout = impl_->bb_layout;
-            bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bar.image = impl_->bb_img;
-            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
-            bar.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            impl_->vk.cmd_pipeline_barrier(impl_->frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
-            VkBufferImageCopy cpy{};
-            cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
-            cpy.imageExtent = {impl_->bb_width, impl_->bb_height, 1U};
-            impl_->vk.cmd_copy_image_to_buffer(impl_->frame_cmd, impl_->bb_img,
-                                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, impl_->readback_buf, 1U, &cpy);
-            bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            impl_->vk.cmd_pipeline_barrier(impl_->frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
-            impl_->bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        }
-        if (impl_->vk.end_cmd_buffer(impl_->frame_cmd) != VK_SUCCESS) {
-            impl_->frame_recording = false;
-            return false;
-        }
-        if (impl_->vk.reset_fences(impl_->h.device, 1U, &impl_->frame_fence) != VK_SUCCESS) return false;
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1U;
-        si.pCommandBuffers = &impl_->frame_cmd;
-        if (impl_->vk.queue_submit(impl_->h.graphics_queue, 1U, &si, impl_->frame_fence) != VK_SUCCESS) return false;
-        if (impl_->vk.wait_for_fences(impl_->h.device, 1U, &impl_->frame_fence, VK_TRUE, 10'000'000'000ULL) != VK_SUCCESS) {
-            return false;
-        }
-        impl_->frame_recording = false;
-        impl_->free_retired();
-
-        if (do_rb) {
-            impl_->alloc.invalidate(impl_->readback_mem, 0U, rb_bytes);
-            out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
-            std::memcpy(out_rgba8->data(), impl_->readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
-        }
+void VulkanD3d9Backend::set_native_window(void* native_window) noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+#ifdef __ANDROID__
+    auto* next_win = static_cast<ANativeWindow*>(native_window);
+    if (next_win != nullptr) ANativeWindow_acquire(next_win);
+    if (impl_->gpu_ready) {
+        impl_->flush_frame_if_recording();
+        impl_->teardown_android_presentation_locked();
     }
+    if (impl_->active_window != nullptr) {
+        ANativeWindow_release(impl_->active_window);
+    }
+    impl_->active_window = next_win;
+    if (impl_->gpu_ready && impl_->active_window != nullptr) {
+        impl_->setup_android_presentation_locked();
+    }
+#else
+    (void)native_window;
+#endif
+}
 
-    // Reset per-frame ring cursors after the frame fence completed.
-    impl_->ubo_ring.cursor = 0U;
-    impl_->dyn_geom_ring.cursor = 0U;
-    impl_->frame_touched_rt = false;
-    impl_->pending_clear_color = false;
-    impl_->pending_clear_depth = false;
-    impl_->bound_pipeline = VK_NULL_HANDLE;
-    impl_->bound_sampler_set = VK_NULL_HANDLE;
-    ++impl_->frame_index;
-    return true;
+void VulkanD3d9Backend::flush_pipeline_cache() noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    if (impl_->gpu_ready) {
+        impl_->save_pipeline_cache();
+    }
+}
+
+std::string VulkanD3d9Backend::active_presentation_path() const {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    return impl_->report.presentation_path;
 }
 
 std::size_t VulkanD3d9Backend::compiled_shader_count() const noexcept {

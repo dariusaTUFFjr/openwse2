@@ -59,6 +59,8 @@ class R4StartupRunner private constructor(private val app: Application) {
     private var resumes = 0
     @Volatile
     private var copying = false
+    @Volatile
+    private var r5Preparing = false
 
     fun addListener(listener: (R4UiState) -> Unit) {
         listeners.add(listener)
@@ -90,13 +92,56 @@ class R4StartupRunner private constructor(private val app: Application) {
         if (!copying) main.post { finish(STOPPED) }
     }
 
-    // The result notification was tapped: show the last report, even if this process was
-    // restarted since the run (the report is in app storage).
-    fun showLastReport() {
-        if (state.running || state.report != null) return
+    // The result notification was tapped (or RecompGameActivity returned): show the last report,
+    // even if this process was restarted since the run (the report is in app storage).
+    fun showLastReport(force: Boolean = false) {
+        if (state.running || (!force && state.report != null)) return
         val file = File(r4Dir, "report.txt")
         if (!file.isFile) return
         update(state.copy(report = reportText(null)))
+    }
+
+    // Prepares for a live R5a Vulkan run: rotates the previous report, imports any PC-prepared
+    // `wse2-prepared*.zip` in the Warband folder, computes the memory-safe thread count, and
+    // calls `onReady` on the main thread with (copyDir, workDir, jobs).
+    fun prepareForLiveVulkan(
+        treeUri: Uri,
+        onReady: (copyDir: String, workDir: String, jobs: Int) -> Unit
+    ) {
+        if (state.running || r5Preparing) return
+        r5Preparing = true
+        stopRequested = false
+        r4Dir.mkdirs()
+        val previous = File(r4Dir, "report.txt")
+        if (previous.isFile && previous.length() > 0) {
+            val kept = File(r4Dir, PREVIOUS_REPORT)
+            kept.delete()
+            if (!previous.renameTo(kept)) previous.delete()
+        } else {
+            previous.delete()
+        }
+        File(r4Dir, "progress.txt").delete()
+        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        val memory = android.app.ActivityManager.MemoryInfo()
+        (app.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).getMemoryInfo(memory)
+        val fit = (memory.availMem / BYTES_PER_THREAD).toInt().coerceIn(1, cores)
+        val resolvedJobs = prefs.getInt(PREF_JOBS, fit).coerceIn(1, fit)
+        val resolvedCopy = if (state.useCopy && File(copyDir, "mb_warband_wse2_x64.exe").isFile) {
+            copyDir.absolutePath
+        } else {
+            ""
+        }
+        Thread({
+            try {
+                importPrepared(treeUri)
+            } catch (t: Throwable) {
+                importNote("Importing the zip prepared on a PC failed: ${t.message ?: t.javaClass.simpleName}")
+            }
+            main.post {
+                r5Preparing = false
+                onReady(resolvedCopy, workDir.absolutePath, resolvedJobs)
+            }
+        }, "wse-r5a-prep").start()
     }
 
     // The report to save as a file (Advanced > "Save the game test report"), during a run too:
@@ -498,6 +543,9 @@ class R4StartupRunner private constructor(private val app: Application) {
             error != null -> error
             result == null -> "The game test ended unexpectedly (the phone may have closed it). " +
                 "Everything finished so far is saved."
+            result.startsWith("pass-r5a") -> "Live Vulkan run finished ($result)."
+            result.startsWith("stopped-r5a") -> "Live Vulkan run stopped before the first frame."
+            result.startsWith("vulkan-error") -> "Vulkan driver failed to start. Please share this report."
             result.startsWith("pass") -> "The game test passed."
             else -> "The game test stopped with a problem. Please share this report."
         }

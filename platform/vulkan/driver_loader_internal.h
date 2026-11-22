@@ -9,6 +9,12 @@
 #define VK_NO_PROTOTYPES
 #endif
 
+#ifdef __ANDROID__
+#ifndef VK_USE_PLATFORM_ANDROID_KHR
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
+#endif
+
 #if __has_include("../../runtime/android/third_party/vulkan/vulkan.h")
 #include "../../runtime/android/third_party/vulkan/vulkan.h"
 #elif __has_include(<vulkan/vulkan.h>)
@@ -32,6 +38,9 @@ struct VulkanRawHandles {
     bool can_execute_gpu = false;
     bool sampler_anisotropy = false;
     bool fill_mode_non_solid = false;
+    bool ahb_external_memory = false;
+    bool queue_family_foreign = false;
+    bool external_semaphore_fd = false;
     std::uint64_t generation = 0;
     VulkanDriverProbeResult probe{};
 };
