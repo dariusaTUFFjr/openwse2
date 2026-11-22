@@ -42,6 +42,7 @@ function Resolve-Zig([string]$explicit) {
 
 $zig = Resolve-Zig $Zig
 $include = Join-Path $here "include"
+$tarExe = if (Test-Path "$env:SystemRoot\System32\tar.exe") { "$env:SystemRoot\System32\tar.exe" } else { "tar" }
 
 # Ensure stock MIT Lua 5.1.5 is cached and verified under engine/build/third_party/.
 $thirdParty = Join-Path $here "build\third_party"
@@ -59,7 +60,7 @@ if (-not (Test-Path (Join-Path $luaSrc "lua.h"))) {
     if ($actualHash -ne $luaExpectedHash) {
         throw "lua-5.1.5.tar.gz SHA-256 mismatch: expected $luaExpectedHash, got $actualHash"
     }
-    & tar -xf $luaTar -C $thirdParty
+    & $tarExe -xf $luaTar -C $thirdParty
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $luaSrc "lua.h"))) {
         throw "failed to extract lua-5.1.5.tar.gz"
     }
@@ -172,7 +173,7 @@ if (-not (Test-Path (Join-Path $glslangRoot "glslang\Public\ShaderLang.h"))) {
         Remove-Item -Force $glslangTar -ErrorAction SilentlyContinue
         throw "glslang-16.6.0.tar.gz SHA-256 mismatch: expected $glslangExpectedHash, got $actualHash"
     }
-    & tar -xf $glslangTar -C $thirdParty
+    & $tarExe -xf $glslangTar -C $thirdParty
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $glslangRoot "glslang\Public\ShaderLang.h"))) {
         throw "failed to extract glslang-16.6.0.tar.gz"
     }
@@ -258,6 +259,59 @@ if ($LASTEXITCODE -ne 0) { throw "wse_shader_compiler compile failed" }
 & $zig ar rcs $wseShaderLib $shaderCompilerObj
 if ($LASTEXITCODE -ne 0) { throw "wse_shader archive failed" }
 
+# Ensure stock wolfpld/etcpak 2.1 (commit 7f15da4739cc5f8562311bdbb800436986d268ca) is cached and verified under engine/build/third_party/.
+$etcpakRoot = Join-Path $thirdParty "etcpak-2.1"
+$etcpakTar = Join-Path $thirdParty "etcpak-2.1.tar.gz"
+$etcpakExpectedHash = "7B076CA044318BAFEEFEF28BF5653F2FE6A21CC63F68F628FC696964925F695E"
+if (-not (Test-Path (Join-Path $etcpakRoot "ProcessRGB.hpp"))) {
+    New-Item -ItemType Directory -Force -Path $thirdParty | Out-Null
+    if (-not (Test-Path $etcpakTar)) {
+        Write-Host "downloading  etcpak-2.1.tar.gz"
+        Invoke-WebRequest -Uri "https://github.com/wolfpld/etcpak/archive/refs/tags/2.1.tar.gz" -OutFile $etcpakTar -UseBasicParsing
+    }
+    $actualHash = (Get-FileHash -Path $etcpakTar -Algorithm SHA256).Hash
+    if ($actualHash -ne $etcpakExpectedHash) {
+        Remove-Item -Force $etcpakTar -ErrorAction SilentlyContinue
+        throw "etcpak-2.1.tar.gz SHA-256 mismatch: expected $etcpakExpectedHash, got $actualHash"
+    }
+    & $tarExe -xf $etcpakTar -C $thirdParty
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $etcpakRoot "ProcessRGB.hpp"))) {
+        throw "failed to extract etcpak-2.1.tar.gz"
+    }
+}
+
+$etcpakFiles = @("ProcessRGB.cpp", "Tables.cpp", "Dither.cpp")
+$etcpakObjDir = Join-Path $out "wse_etcpak_obj"
+New-Item -ItemType Directory -Force -Path $etcpakObjDir | Out-Null
+$etcpakLib = Join-Path $out "libwse_etcpak.a"
+if (-not (Test-Path $etcpakLib)) {
+    Write-Host "building     wse_etcpak"
+    $etcpakObjs = @()
+    foreach ($ef in $etcpakFiles) {
+        $obj = Join-Path $etcpakObjDir ($ef -replace '\.cpp$', '.o')
+        & $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -w "-msse4.1" -mno-avx -mno-avx2 -mno-avx512f `
+            -I $etcpakRoot -c (Join-Path $etcpakRoot $ef) -o $obj
+        if ($LASTEXITCODE -ne 0) { throw "wse_etcpak compile failed: $ef" }
+        $etcpakObjs += $obj
+    }
+    & $zig ar rcs $etcpakLib @etcpakObjs
+    if ($LASTEXITCODE -ne 0) { throw "wse_etcpak archive failed" }
+}
+
+$assetSrcDir = Join-Path $here "src\asset"
+$wseTextureObjDir = Join-Path $out "wse_texture_obj"
+New-Item -ItemType Directory -Force -Path $wseTextureObjDir | Out-Null
+$wseTextureLib = Join-Path $out "libwse_texture.a"
+if (Test-Path $wseTextureLib) { Remove-Item -Force $wseTextureLib }
+Write-Host "building     wse_texture"
+$etc2Obj = Join-Path $wseTextureObjDir "etc2.o"
+& $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Werror `
+    -I $include -I $etcpakRoot `
+    -c (Join-Path $assetSrcDir "etc2.cpp") -o $etc2Obj
+if ($LASTEXITCODE -ne 0) { throw "wse_texture compile failed: etc2.cpp" }
+& $zig ar rcs $wseTextureLib $etc2Obj
+if ($LASTEXITCODE -ne 0) { throw "wse_texture archive failed" }
+
 $tests = @(
     @{ Name = "operand"; Source = Join-Path $here "tests\operand_test.cpp" },
     @{ Name = "trigger"; Source = Join-Path $here "tests\trigger_test.cpp" },
@@ -278,7 +332,7 @@ $tests = @(
     @{ Name = "module_loaders"; Source = Join-Path $here "tests\module_loaders_test.cpp" },
     @{ Name = "headless"; Source = Join-Path $here "tests\headless_test.cpp" },
     @{ Name = "lua"; Source = Join-Path $here "tests\lua_test.cpp"; LinkLua = $true },
-    @{ Name = "asset"; Source = Join-Path $here "tests\asset_test.cpp"; LinkShader = $true },
+    @{ Name = "asset"; Source = Join-Path $here "tests\asset_test.cpp"; LinkShader = $true; LinkTexture = $true },
     @{ Name = "audio"; Source = Join-Path $here "tests\audio_test.cpp"; LinkAudio = $true },
     @{ Name = "input"; Source = Join-Path $here "tests\input_test.cpp" },
     @{ Name = "scene"; Source = Join-Path $here "tests\scene_test.cpp" },
@@ -324,6 +378,9 @@ foreach ($test in $tests) {
     if ($test.ContainsKey("LinkShader") -and $test.LinkShader) {
         $extraLibs += @($wseShaderLib, $glslangLib)
     }
+    if ($test.ContainsKey("LinkTexture") -and $test.LinkTexture) {
+        $extraLibs += @($wseTextureLib, $etcpakLib)
+    }
     & $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Werror `
         -I $include -I $vulkanInclude -o $binary $test.Source @extraLibs
     if ($LASTEXITCODE -ne 0) {
@@ -358,7 +415,7 @@ foreach ($src in $selftestSources) {
 $selftestBinary = Join-Path $out "selftest_host_test.exe"
 & $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Werror `
     -I $include -o $selftestBinary (Join-Path $here "tests\selftest_host_test.cpp") `
-    @selftestObjs $driverLoaderObj $d3d9VulkanObj $wseLuaLib $luaLib $wseAudioLib $wseShaderLib $glslangLib
+    @selftestObjs $driverLoaderObj $d3d9VulkanObj $wseLuaLib $luaLib $wseAudioLib $wseShaderLib $glslangLib $wseTextureLib $etcpakLib
 if ($LASTEXITCODE -ne 0) {
     throw "selftest_host link failed"
 }

@@ -383,6 +383,86 @@ target_include_directories(wse_shader PRIVATE
 target_link_libraries(wse_shader PRIVATE wse_engine wse_glslang)
 wse_apply_strict_warnings(wse_shader)
 
+# Third-party wolfpld/etcpak 2.1 (commit 7f15da4739cc5f8562311bdbb800436986d268ca, BSD-3-Clause).
+# Cached under engine/build/third_party/etcpak-2.1/ when built via build_host.ps1,
+# or fetched per build directory with SHA-256 verification.
+set(WSE_ETCPAK_URL
+    "https://github.com/wolfpld/etcpak/archive/refs/tags/2.1.tar.gz")
+set(WSE_ETCPAK_SHA256
+    "7b076ca044318bafeefef28bf5653f2fe6a21cc63f68f628fc696964925f695e")
+
+if(NOT DEFINED WSE_ETCPAK_SOURCE_DIR AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/engine/build/third_party/etcpak-2.1/ProcessRGB.hpp")
+    set(WSE_ETCPAK_SOURCE_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/engine/build/third_party/etcpak-2.1")
+endif()
+
+if(DEFINED WSE_ETCPAK_SOURCE_DIR)
+    set(wse_etcpak_src_dir "${WSE_ETCPAK_SOURCE_DIR}")
+else()
+    set(wse_etcpak_tp_dir "${CMAKE_CURRENT_BINARY_DIR}/_third_party/etcpak")
+    set(wse_etcpak_tar "${wse_etcpak_tp_dir}/etcpak-2.1.tar.gz")
+    set(wse_etcpak_src_dir "${wse_etcpak_tp_dir}/etcpak-2.1")
+    file(MAKE_DIRECTORY "${wse_etcpak_tp_dir}")
+    if(EXISTS "${wse_etcpak_tar}")
+        file(SHA256 "${wse_etcpak_tar}" _wse_etcpak_actual_sha)
+        if(NOT _wse_etcpak_actual_sha STREQUAL WSE_ETCPAK_SHA256)
+            file(REMOVE "${wse_etcpak_tar}")
+            file(REMOVE_RECURSE "${wse_etcpak_src_dir}")
+        endif()
+    endif()
+    if(NOT EXISTS "${wse_etcpak_tar}")
+        message(STATUS "Downloading etcpak-2.1.tar.gz (SHA-256 verified)...")
+        file(DOWNLOAD "${WSE_ETCPAK_URL}" "${wse_etcpak_tar}"
+             EXPECTED_HASH "SHA256=${WSE_ETCPAK_SHA256}"
+             TLS_VERIFY ON
+             STATUS _wse_etcpak_dl_status)
+        list(GET _wse_etcpak_dl_status 0 _wse_etcpak_dl_code)
+        if(NOT _wse_etcpak_dl_code EQUAL 0)
+            file(REMOVE "${wse_etcpak_tar}")
+            message(FATAL_ERROR "Failed to download etcpak-2.1.tar.gz: ${_wse_etcpak_dl_status}")
+        endif()
+    endif()
+    if(NOT EXISTS "${wse_etcpak_src_dir}/ProcessRGB.hpp")
+        file(ARCHIVE_EXTRACT INPUT "${wse_etcpak_tar}" DESTINATION "${wse_etcpak_tp_dir}")
+    endif()
+endif()
+
+if(NOT EXISTS "${wse_etcpak_src_dir}/ProcessRGB.hpp")
+    message(FATAL_ERROR "etcpak source not found at ${wse_etcpak_src_dir}")
+endif()
+
+add_library(wse_etcpak STATIC
+    "${wse_etcpak_src_dir}/ProcessRGB.cpp"
+    "${wse_etcpak_src_dir}/Tables.cpp"
+    "${wse_etcpak_src_dir}/Dither.cpp"
+)
+set_target_properties(wse_etcpak PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(wse_etcpak PRIVATE "${wse_etcpak_src_dir}")
+if(NOT ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86|x86)$")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        # Cap x86 builds at SSE4.1 so AVX2/AVX-512 instructions are never emitted.
+        target_compile_options(wse_etcpak PRIVATE -msse4.1 -mno-avx -mno-avx2 -mno-avx512f)
+    endif()
+endif()
+if(MSVC)
+    target_compile_options(wse_etcpak PRIVATE /w)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(wse_etcpak PRIVATE -w)
+endif()
+
+add_library(wse_texture STATIC
+    engine/src/asset/etc2.cpp
+)
+set_target_properties(wse_texture PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(wse_texture PRIVATE "${wse_etcpak_src_dir}")
+target_link_libraries(wse_texture PRIVATE wse_engine wse_etcpak)
+wse_apply_strict_warnings(wse_texture)
+
 # Vulkan runtime driver loader + VulkanRhiDevice (slice P4) + VulkanD3d9Backend (Phase 5 R5a).
 # Its <vulkan/vulkan.h> comes from the vendored headers and stays private: callers see only rhi.h / d3d9_vulkan.h.
 add_library(wse_vulkan STATIC
@@ -437,7 +517,7 @@ if((WSE_BUILD_TESTS AND BUILD_TESTING) OR WSE_BUILD_ANDROID_APP)
     target_include_directories(wse_selftest PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/engine/tests"
     )
-    target_link_libraries(wse_selftest PUBLIC wse_engine wse_lua wse_vulkan wse_audio wse_shader)
+    target_link_libraries(wse_selftest PUBLIC wse_engine wse_lua wse_vulkan wse_audio wse_shader wse_texture)
     wse_apply_strict_warnings(wse_selftest)
 endif()
 
