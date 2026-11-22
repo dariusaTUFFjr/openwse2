@@ -397,7 +397,8 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     const std::string custom_icd = jstring_to_utf8(env, jcustom_icd_path);
     const std::string native_lib_dir = jstring_to_utf8(env, jnative_lib_dir);
     const std::string shader_cache_dir = jstring_to_utf8(env, jshader_cache_dir);
-    const wse::platform::DriverMode mode = wse::platform::parse_driver_mode(mode_str);
+    wse::platform::DriverMode mode = wse::platform::DriverMode::system;
+    (void)wse::platform::parse_driver_mode(mode_str, mode);
     const std::string drv_label(driver_label(mode));
 
     report("r5a-vulkan: mode=" + std::string(wse::platform::driver_mode_name(mode)) +
