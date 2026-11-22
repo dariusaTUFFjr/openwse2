@@ -372,7 +372,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             return
         }
         R4Native.loadError?.let { err ->
-            _events.trySend(LauncherEvent.ShowToast("libwse_r0.so unavailable: $err"))
+            _events.trySend(LauncherEvent.ShowToast("Part of the app failed to load. Reinstalling it usually fixes this. ($err)"))
             return
         }
         val driver = _driverState.value
@@ -394,7 +394,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         val maxTex = _settingsState.value.performance?.maxTextureSize ?: 0
         val shaderCache = File(app.cacheDir, "mesa_shader_cache").apply { mkdirs() }
         val nativeLibDir = app.applicationInfo.nativeLibraryDir ?: ""
-        _statusLog.value = "Preparing live Vulkan run ($mode, module $moduleName)…"
+        _statusLog.value = "Getting $moduleName ready to play…"
         r4Runner.prepareForLiveVulkan(treeUri) { copyDir, workDir, jobs ->
             if (!isCleared.get()) {
                 _events.trySend(

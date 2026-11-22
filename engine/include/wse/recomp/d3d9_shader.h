@@ -891,6 +891,19 @@ inline bool parse_preshader(std::span<const std::uint8_t> bytecode, Preshader& o
 // Evaluates a parsed FXLC preshader. `in_c` holds the preshader's own CTAB float inputs (256 vec4s
 // = 1024 floats); results are written into the main shader's `out_c` (1024 floats), `out_i`
 // (64 ints), and `out_b` (16 bool slots stored in `out_b[r * 4]`).
+// Float to integer for preshader results and indices: NaN gives 0 and out-of-range values
+// saturate (a plain cast is undefined behaviour for them; real hardware saturates too).
+inline std::int64_t preshader_to_i64(float v) noexcept {
+    if (!(v == v)) return 0;
+    if (v >= 9.2e18F) return INT64_MAX;
+    if (v <= -9.2e18F) return INT64_MIN;
+    return static_cast<std::int64_t>(v);
+}
+inline std::int32_t preshader_to_i32(float v) noexcept {
+    const std::int64_t w = preshader_to_i64(v);
+    return static_cast<std::int32_t>(std::clamp<std::int64_t>(w, INT32_MIN, INT32_MAX));
+}
+
 inline void eval_preshader(const Preshader& ps,
                            std::span<const float, 1024> in_c,
                            std::span<float, 1024> out_c,
@@ -912,7 +925,7 @@ inline void eval_preshader(const Preshader& ps,
     auto resolve_idx = [&](const PreshaderOperand& opnd, std::uint32_t lane) -> std::uint32_t {
         std::int64_t idx = static_cast<std::int64_t>(opnd.reg_num) + static_cast<std::int64_t>(lane);
         if (opnd.indexed) {
-            idx += static_cast<std::int64_t>(read_raw(opnd.idx_type, opnd.idx_num));
+            idx += preshader_to_i32(read_raw(opnd.idx_type, opnd.idx_num));
         }
         return idx < 0 ? 0xFFFFFFFFU : static_cast<std::uint32_t>(idx);
     };
@@ -932,7 +945,7 @@ inline void eval_preshader(const Preshader& ps,
             break;
         }
         case 6:
-            if (idx < out_i.size()) out_i[idx] = static_cast<std::int32_t>(val);
+            if (idx < out_i.size()) out_i[idx] = preshader_to_i32(val);
             break;
         case 7:
             if (idx < temps.size()) temps[idx] = val;

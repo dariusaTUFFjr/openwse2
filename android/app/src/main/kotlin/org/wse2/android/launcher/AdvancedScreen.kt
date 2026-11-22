@@ -261,9 +261,9 @@ fun AdvancedScreen(
                     "Vulkan"
                 }
                 WseListRow(
-                    title = "Run on screen (R5a)",
-                    supporting = "Starts the translated game on screen with $activeDriverLabel. " +
-                        "Reuses prepared game files and saves driver + FPS diagnostics to the report.",
+                    title = "Play on screen (test)",
+                    supporting = "Starts the game on screen with $activeDriverLabel, using the game files " +
+                        "already prepared. Saves a report with the frame rate when you exit.",
                     trailing = {
                         Text(
                             text = "Launch",

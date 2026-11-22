@@ -11,10 +11,12 @@
 #include <jni.h>
 #include <sys/auxv.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -66,8 +68,10 @@ public:
         mid_root_ = env->GetMethodID(cls, "rootDocumentId", "()Ljava/lang/String;");
         mid_list_ = env->GetMethodID(cls, "listChildren", "(Ljava/lang/String;)[Ljava/lang/String;");
         mid_read_ = env->GetMethodID(cls, "readDocument", "(Ljava/lang/String;)[B");
-        env->DeleteLocalRef(cls);
         if (clear_if_exception(env)) mid_root_ = mid_list_ = mid_read_ = nullptr;
+        mid_open_fd_ = env->GetMethodID(cls, "openDocumentFd", "(Ljava/lang/String;)I");
+        if (clear_if_exception(env)) mid_open_fd_ = nullptr;  // older bridge: read through Java
+        env->DeleteLocalRef(cls);
     }
     [[nodiscard]] bool valid() const noexcept {
         return bridge_ != nullptr && mid_root_ != nullptr && mid_list_ != nullptr && mid_read_ != nullptr;
@@ -117,6 +121,18 @@ public:
         if (env == nullptr || !valid()) return false;
         jstring jid = utf8_to_jstring(env, id);
         if (jid == nullptr) return false;
+        // Java only opens the document; the bytes go straight from the descriptor into `out`
+        // (one copy, nothing left for the garbage collector).
+        if (mid_open_fd_ != nullptr) {
+            const jint fd = env->CallIntMethod(bridge_, mid_open_fd_, jid);
+            if (!clear_if_exception(env) && fd >= 0) {
+                env->DeleteLocalRef(jid);
+                const bool ok = read_fd(fd, out);
+                ::close(fd);
+                if (!ok) out.clear();
+                return ok;
+            }
+        }
         auto jbytes = static_cast<jbyteArray>(env->CallObjectMethod(bridge_, mid_read_, jid));
         env->DeleteLocalRef(jid);
         if (clear_if_exception(env) || jbytes == nullptr) return false;
@@ -156,6 +172,28 @@ private:
     jmethodID mid_root_ = nullptr;
     jmethodID mid_list_ = nullptr;
     jmethodID mid_read_ = nullptr;
+    jmethodID mid_open_fd_ = nullptr;
+
+    // Reads a whole descriptor; the size from `fstat` is a hint (a provider may hand out a pipe).
+    static bool read_fd(int fd, std::vector<std::uint8_t>& out) {
+        struct stat st {};
+        std::size_t cap = 1U << 16;
+        if (::fstat(fd, &st) == 0 && st.st_size > 0) cap = static_cast<std::size_t>(st.st_size) + 1U;
+        out.resize(cap);
+        std::size_t got = 0;
+        for (;;) {
+            if (got == out.size()) out.resize(out.size() * 2U);
+            const ssize_t n = ::read(fd, out.data() + got, out.size() - got);
+            if (n == 0) break;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            got += static_cast<std::size_t>(n);
+        }
+        out.resize(got);
+        return true;
+    }
 };
 
 // Install reads (count, bytes, wall time including the wait for the lock), for the load-time
@@ -302,21 +340,21 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
         JavaVM* vm = nullptr;
         if (bridge == nullptr || env->GetJavaVM(&vm) != JNI_OK) {
             report("setup: no install folder\nRESULT setup-error\n");
-            if (hud) hud->update("Setup error: no Warband folder selected.");
+            if (hud) hud->update("No Warband folder is selected. Pick it in the app first.");
             return wse::recomp::kStartupSetupError;
         }
         auto backend = std::make_shared<ThreadJniSafBackend>(vm, env, bridge);
         if (!backend->valid()) {
             report("setup: the install folder bridge is missing a method\nRESULT setup-error\n");
-            if (hud) hud->update("Setup error: install folder bridge invalid.");
+            if (hud) hud->update("Can't read the Warband folder. Pick it again in the app.");
             return wse::recomp::kStartupSetupError;
         }
-        if (hud) hud->update("Indexing Warband folder…");
+        if (hud) hud->update("Looking through your Warband folder…");
         report("install: the SAF folder (indexing it)\n");
         auto saf = std::make_unique<wse::platform::SafVfs>(backend, false);
         if (!saf->rebuild_index()) {
             report("setup: indexing the install folder failed (permission revoked or folder removed?)\nRESULT setup-error\n");
-            if (hud) hud->update("Setup error: failed to index Warband folder.");
+            if (hud) hud->update("Can't read the Warband folder. Pick it again in the app.");
             return wse::recomp::kStartupSetupError;
         }
         report("install: " + std::to_string(saf->index_file_count()) + " files indexed\n");
@@ -326,12 +364,12 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     static wse::platform::HostVfs user(work / "user");
 
     wse::recomp::StartupOptions o;
-    if (hud) hud->update("Reading mb_warband_wse2_x64.exe…");
+    if (hud) hud->update("Reading the game…");
     if (!install->read_file("mb_warband_wse2_x64.exe", o.exe) || !install->read_file("lua5164.dll", o.lua) ||
         !install->read_file("mb_warband_wse2_x64.pdb", o.pdb)) {
         report("setup: mb_warband_wse2_x64.exe, lua5164.dll and mb_warband_wse2_x64.pdb must be in the install's root\n"
                "RESULT setup-error\n");
-        if (hud) hud->update("Missing WSE2 files in Warband folder.");
+        if (hud) hud->update("WSE2 isn't installed in this Warband folder.");
         return wse::recomp::kStartupSetupError;
     }
     o.install = install.get();
@@ -346,7 +384,7 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     o.progress = [hud](const std::string& image, std::size_t done, std::size_t total) {
         std::ofstream(g_progress_path) << image << " " << done << " " << total << "\n";
         if (hud && total > 0 && done < total) {
-            hud->update("Preparing " + image + ": " + std::to_string(done) + "/" + std::to_string(total));
+            hud->update("Preparing the game: " + std::to_string(done) + " of " + std::to_string(total));
         } else if (hud && total > 0 && done == total) {
             hud->update("Loading Warband…");
         }
@@ -417,7 +455,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
 
     report("r5a-vulkan: mode=" + std::string(wse::platform::driver_mode_name(mode)) +
            " max_tex=" + std::to_string(std::max<jint>(0, max_texture_size)) + "\n");
-    hud->update("Initializing " + drv_label + "…");
+    hud->update("Starting " + drv_label + "…");
 
     auto loader = std::make_shared<wse::platform::VulkanDriverLoader>();
     std::string vk_err;
@@ -428,7 +466,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
                    "' is selected, but no driver package has been imported yet.\n"
                    "Use Advanced > Import driver package first, or switch GPU Driver to System Vulkan.\n"
                    "RESULT setup-error\n");
-            hud->update("No " + drv_label + " driver package imported.");
+            hud->update("Import the " + drv_label + " driver in the app first.");
             return wse::recomp::kStartupSetupError;
         }
         (void)wse::platform::apply_mesa_driver_environment(mode, shader_cache_dir);
@@ -444,14 +482,14 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     }
     if (!loaded) {
         report("vulkan: driver load failed: " + vk_err + "\nRESULT vulkan-error\n");
-        hud->update("Vulkan load failed: " + vk_err);
+        hud->update(drv_label + " couldn't start: " + vk_err);
         return wse::recomp::kStartupSetupError;
     }
 
     wse::platform::VulkanDriverProbeResult probe{};
     if (!loader->probe_and_create_device(probe)) {
         report("vulkan: probe/device failed: " + probe.error + "\nRESULT vulkan-error\n");
-        hud->update("Vulkan device failed: " + probe.error);
+        hud->update("The graphics driver couldn't start: " + probe.error);
         return wse::recomp::kStartupSetupError;
     }
 

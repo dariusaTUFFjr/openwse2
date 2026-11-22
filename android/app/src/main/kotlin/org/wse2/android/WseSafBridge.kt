@@ -55,6 +55,18 @@ class WseSafBridge(
         }
     }
 
+    // Opens a document for native code and hands over its file descriptor (the caller reads and
+    // closes it), or returns -1. The game's file reads go through this: reading in Java copied
+    // each file several times and left the bytes for the garbage collector (2026-11-23).
+    fun openDocumentFd(docId: String): Int {
+        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+        return try {
+            context.contentResolver.openFileDescriptor(docUri, "r")?.detachFd() ?: -1
+        } catch (_: Exception) {
+            -1
+        }
+    }
+
     fun readDocument(docId: String): ByteArray? {
         val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
         return try {

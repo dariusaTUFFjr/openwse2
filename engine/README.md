@@ -457,6 +457,14 @@ binary savegames; none of these checks changes valid module behaviour. In `str_s
 empty delimiter cannot advance in retail and would loop indefinitely; the port stores the source as
 a single piece (respecting `skip_empty`) and terminates.
 
+Phase 5 D3D9 device (`wse/recomp/shim_d3d9.h`, `wse/recomp/d3d9_shader.h`, 2026-11-23 review of R5a):
+
+- `IDirect3DDevice9::Clear` copies at most 4096 of the game's rectangles (the count is the game's;
+  more is not a real use and would only size an allocation).
+- Preshader (`FXLC`) results and register indices convert float to integer with
+  `preshader_to_i32`: NaN gives 0 and out-of-range values saturate instead of the undefined
+  plain cast.
+
 Asset decoders (`wse/asset/{brf,dds}.h`, P3 review & evidence follow-ups):
 
 - `.brf` element counts are checked against the remaining stream bytes at each record's minimum

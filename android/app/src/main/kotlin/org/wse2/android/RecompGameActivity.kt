@@ -61,7 +61,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback {
         val margin = dp(12)
 
         hudPill = TextView(this).apply {
-            text = "Starting Vulkan…"
+            text = "Starting the game…"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.MONOSPACE
@@ -84,7 +84,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback {
         )
 
         exitButton = TextView(this).apply {
-            text = "Exit & Report"
+            text = "Exit and save report"
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.DEFAULT_BOLD
@@ -206,12 +206,12 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback {
                     hudListener
                 )
             } catch (t: Throwable) {
-                updateHud("Native error: ${t.message ?: t.javaClass.simpleName}")
+                updateHud("The game stopped with an error: ${t.message ?: t.javaClass.simpleName}")
                 1
             }
             // Returns only on setup/Vulkan failure: return cleanly so the launcher shows report.txt.
             runOnUiThread {
-                updateHud("Stopped (code $rc)")
+                updateHud("The game stopped (code $rc)")
                 exitAndFinish()
             }
         }, "wse-r5a-vulkan").start()

@@ -1473,8 +1473,11 @@ inline void D3d9::build_vtables() {
                  const auto stencil = static_cast<std::uint32_t>(win64_arg(s, 6));
                  std::vector<D3d9Rect> rects;
                  if (cnt > 0 && prects != 0) {
-                     rects.resize(cnt);
-                     std::memcpy(rects.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(prects)), cnt * 16U);
+                     // Safety deviation: the count comes from the game; more than 4096 rectangles in one
+                     // Clear is not a real use, so the rest are ignored rather than allocated.
+                     const std::uint32_t n = std::min<std::uint32_t>(cnt, 4096U);
+                     rects.resize(n);
+                     std::memcpy(rects.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(prects)), n * 16U);
                  }
                  backend->clear(dev(self)->draw, flags, argb, z, stencil, rects);
              }
