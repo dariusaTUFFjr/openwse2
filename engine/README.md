@@ -464,6 +464,9 @@ Phase 5 D3D9 device (`wse/recomp/shim_d3d9.h`, `wse/recomp/d3d9_shader.h`, 2026-
 - Preshader (`FXLC`) results and register indices convert float to integer with
   `preshader_to_i32`: NaN gives 0 and out-of-range values saturate instead of the undefined
   plain cast.
+- Translated D3D9 pixel shaders pass the alpha-test function as fragment specialization constant
+  `wse_alpha_func` (`constant_id = 0`, `0` = off/`ALWAYS`) keyed in `PipelineKey::alpha_func`
+  instead of `u.posfix.x`, so pipelines without alpha test drop the `discard` and keep early-Z.
 
 Asset decoders (`wse/asset/{brf,dds}.h`, P3 review & evidence follow-ups):
 
