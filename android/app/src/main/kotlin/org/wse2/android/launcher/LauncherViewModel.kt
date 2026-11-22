@@ -160,6 +160,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         )
 
         restorePreferences()
+        // The phone check runs in this process, so a crash inside it ends the launcher: show what it
+        // wrote before the crash as soon as the launcher opens again, not only after another run.
+        R0Spikes.crashedRunReport(app)?.let { _r0State.value = R0UiState(report = it) }
         r4Runner.addListener(r4Listener)
     }
 
