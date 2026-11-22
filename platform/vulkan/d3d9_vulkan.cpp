@@ -1125,7 +1125,6 @@ struct VulkanD3d9Backend::Impl {
         if (ahb_surface_control != nullptr) {
             if (ASurfaceTransaction* tx = ASurfaceTransaction_create()) {
                 ASurfaceTransaction_setVisibility(tx, ahb_surface_control, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
-                ASurfaceTransaction_setBuffer(tx, ahb_surface_control, nullptr, -1);
                 ASurfaceTransaction_reparent(tx, ahb_surface_control, nullptr);
                 ASurfaceTransaction_apply(tx);
                 ASurfaceTransaction_delete(tx);
