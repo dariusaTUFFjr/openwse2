@@ -864,7 +864,7 @@ own, and none blocks another.
        our `ID3DXEffect` (`shim_d3dx.h`), so `SetFloat`/`SetMatrix`/`SetTexture` and `BeginPass`
        resolve to real constants and states. Host test: every effect in the install parses with the
        census counts (480 techniques queried at startup, 164 parameters).
-    2. **Shader translator:** SM2/SM3 bytecode (`vs`/`ps` 2.0, 2.x, 3.0) to GLSL 450 to SPIR-V, the 35
+    2. **Shader translator (landed 2026-11-22, `wse/recomp/d3d9_shader.h`; all 1,157 install shaders compile):** SM2/SM3 bytecode (`vs`/`ps` 2.0, 2.x, 3.0) to GLSL 450 to SPIR-V, the 35
        measured instructions first, D3D9 rules kept (constant registers, `mova`/relative addressing,
        `texkill`, `dsx`/`dsy`, half-pixel offset, clip-space depth 0..1). Host tests on hand-assembled
        synthetic bytecode; locally, all 776 shaders compile and the per-shader check passes.

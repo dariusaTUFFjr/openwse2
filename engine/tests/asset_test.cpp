@@ -25,6 +25,7 @@
 #include "wse/game/module_loader_common.h"
 #include "wse/io/binary_stream.h"
 #include "wse/platform/vfs.h"
+#include "wse/recomp/d3d9_shader.h"
 
 namespace {
 
@@ -2477,6 +2478,80 @@ void test_p5_lowering_review_regressions() {
            "infer_vertex_decl_from_glsl reads the attributes a vertex shader uses");
 }
 
+
+// R5a step 2: D3D9 shader bytecode to GLSL (wse/recomp/d3d9_shader.h), on hand-assembled shaders:
+// the GLSL says what the bytecode does, and glslang compiles it (SPIR-V written to
+// WSE_DUMP_SPIRV_DIR for CI's spirv-val). Locally, all 1,157 shaders of the user's install
+// translate and compile (2026-11-22).
+void test_d3d9_shader_translation() {
+    namespace sh = wse::recomp::d3d9sh;
+    using namespace wse::asset;
+    // vs_2_0: dcl_position v0; dcl_texcoord v1; def c10 (1, 0.5, 0, 2); dp4 oPos.x..w, v0, c0..c3;
+    // mad_sat oT0, v1, c10.yyyy, c10.xxxx
+    const std::uint32_t one = 0x3F800000U, half = 0x3F000000U, two = 0x40000000U;
+    const std::vector<std::uint32_t> vs = {
+        0xFFFE0200U,
+        0x0200001FU, 0x80000000U, 0x900F0000U,
+        0x0200001FU, 0x80000005U, 0x900F0001U,
+        0x05000051U, 0xA00F000AU, one, half, 0, two,
+        0x03000009U, 0xC0010000U, 0x90E40000U, 0xA0E40000U,
+        0x03000009U, 0xC0020000U, 0x90E40000U, 0xA0E40001U,
+        0x03000009U, 0xC0040000U, 0x90E40000U, 0xA0E40002U,
+        0x03000009U, 0xC0080000U, 0x90E40000U, 0xA0E40003U,
+        0x04000004U, 0xE01F0000U, 0x90E40001U, 0xA055000AU, 0xA000000AU,
+        0x0000FFFFU,
+    };
+    // ps_2_0: dcl t0.xy; dcl_2d s0; texld r0, t0, s0; texkill r0; mov oC0, r0
+    const std::vector<std::uint32_t> ps = {
+        0xFFFF0200U,
+        0x0200001FU, 0x80000000U, 0xB0030000U,
+        0x0200001FU, 0x90000000U, 0xA00F0800U,
+        0x03000042U, 0x800F0000U, 0xB0E40000U, 0xA0E40800U,
+        0x01000041U, 0x800F0000U,
+        0x02000001U, 0x800F0800U, 0x80E40000U,
+        0x0000FFFFU,
+    };
+    // call (not in scope): refused by name.
+    const std::vector<std::uint32_t> unsupported = {0xFFFE0200U, 0x01000019U, 0xF0E40000U, 0x0000FFFFU};
+
+    sh::Shader v, p, bad;
+    const bool vs_ok = sh::translate(std::span<const std::uint32_t>(vs), v);
+    const bool ps_ok = sh::translate(std::span<const std::uint32_t>(ps), p);
+    auto has = [](const sh::Shader& s, const char* text) { return s.glsl.find(text) != std::string::npos; };
+    expect(vs_ok && !v.pixel && v.inputs.size() == 2 && v.inputs[1].usage == sh::kTexCoord && v.inputs[1].reg == 1 &&
+               has(v, "layout(location = 1) in vec4 v1;") && has(v, "vec4(1.0, 0.5, 0.0, 2.0)") &&
+               has(v, "clamp(") && has(v, "gl_Position = oPos;") && has(v, "gl_Position.y = -gl_Position.y;") &&
+               has(v, "layout(location = 0) out vec4 out_oT0;"),
+           "d3d9 shader: vs_2_0 inputs by register, def literal, saturate, position flip, texcoord varying");
+    expect(ps_ok && p.pixel && p.samplers[0] == 2 && has(p, "uniform sampler2D s0;") && has(p, "texture(s0, (t0).xy)") &&
+               has(p, "discard;") && has(p, "layout(location = 0) in vec4 t0;") && has(p, "layout(location = 0) out vec4 out_oC0;"),
+           "d3d9 shader: ps_2_0 texcoord input links to the vertex output, texld, texkill, colour output");
+    expect(!sh::translate(std::span<const std::uint32_t>(unsupported), bad) && bad.error.find("unsupported instruction 25") != std::string::npos,
+           "d3d9 shader: an instruction outside the scope is refused by name");
+    expect(sh::link_location(sh::kTexCoord, 3) == 3 && sh::link_location(sh::kColor, 1) == 11 && sh::link_location(sh::kFog, 0) == 12,
+           "d3d9 shader: varyings link by usage and index");
+
+    const auto compiler = create_glslang_shader_compiler();
+    std::vector<std::uint32_t> vs_spv, ps_spv;
+    std::string log;
+    const bool vs_compiles = vs_ok && compiler->compile_vulkan_glsl_to_spirv(v.glsl, SpirvStage::Vertex, "main", vs_spv, nullptr, &log);
+    const bool ps_compiles = ps_ok && compiler->compile_vulkan_glsl_to_spirv(p.glsl, SpirvStage::Fragment, "main", ps_spv, nullptr, &log);
+    expect(vs_compiles && ps_compiles && !vs_spv.empty() && !ps_spv.empty(), "d3d9 shader: the translated GLSL compiles to SPIR-V");
+    const char* dump_dir = std::getenv("WSE_DUMP_SPIRV_DIR");
+    if (dump_dir != nullptr && dump_dir[0] != '\0') {
+        std::error_code ec;
+        std::filesystem::create_directories(dump_dir, ec);
+        for (const auto& [name, words] : {std::pair<const char*, const std::vector<std::uint32_t>*>{"d3d9_vs20.spv", &vs_spv},
+                                          std::pair<const char*, const std::vector<std::uint32_t>*>{"d3d9_ps20.spv", &ps_spv}}) {
+            if (words->empty()) continue;
+            if (std::FILE* fp = std::fopen((std::filesystem::path(dump_dir) / name).string().c_str(), "wb")) {
+                std::fwrite(words->data(), sizeof(std::uint32_t), words->size(), fp);
+                std::fclose(fp);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -2494,6 +2569,7 @@ int run_asset_suite(const char* fixture_path) {
     test_p5_shaders_materials_and_spirv_cache();
     test_p5_shader_review_regressions();
     test_p5_lowering_review_regressions();
+    test_d3d9_shader_translation();
 
     if (failures == 0) {
         std::printf("asset tests: PASS\n");
