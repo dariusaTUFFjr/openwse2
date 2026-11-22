@@ -1,7 +1,9 @@
 // Host unit tests for clean-room v1.1.5.6 .brf and .dds asset decoders
 // (engine/include/wse/asset/brf.h and engine/include/wse/asset/dds.h).
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +26,8 @@
 #include "wse/asset/shader_compiler.h"
 #include "wse/game/module_loader_common.h"
 #include "wse/io/binary_stream.h"
+#include "wse/platform/dynres.h"
+#include "wse/platform/postfx_shaders.h"
 #include "wse/platform/vfs.h"
 #include "wse/recomp/d3d9_shader.h"
 
@@ -2554,6 +2558,344 @@ void test_d3d9_shader_translation() {
     }
 }
 
+void test_r5b_postfx_and_dynres() {
+    using namespace wse::asset;
+    using namespace wse::platform;
+
+    // 1. Every post-pass GLSL 450 shader compiles to SPIR-V (Vulkan 1.0/1.1) and dumps to
+    //    `WSE_DUMP_SPIRV_DIR` when set (for CI `spirv-val`).
+    {
+        const auto compiler = create_glslang_shader_compiler();
+        const char* dump_dir = std::getenv("WSE_DUMP_SPIRV_DIR");
+        struct ShaderCase {
+            const char* name;
+            const char* spv_file;
+            SpirvStage stage;
+            std::string_view src;
+        };
+        const std::array<ShaderCase, 5> cases = {{
+            {"kPostVertex", "post_vs.spv", SpirvStage::Vertex, kPostVertex},
+            {"kFsrEasu", "post_fsr_easu.spv", SpirvStage::Fragment, kFsrEasu},
+            {"kFsrRcas", "post_fsr_rcas.spv", SpirvStage::Fragment, kFsrRcas},
+            {"kCas", "post_cas.spv", SpirvStage::Fragment, kCas},
+            {"kFxaa", "post_fxaa.spv", SpirvStage::Fragment, kFxaa},
+        }};
+        for (const auto& sc : cases) {
+            std::vector<std::uint32_t> spv;
+            ShaderStageReflection refl{};
+            std::string log;
+            const bool ok = compiler->compile_vulkan_glsl_to_spirv(
+                sc.src, sc.stage, "main", spv, &refl, &log);
+            if (!ok) {
+                std::printf("postfx compile error (%s): %s\n", sc.name, log.c_str());
+            }
+            const bool valid_magic = !spv.empty() && spv[0] == 0x07230203U;
+            expect(ok && valid_magic, sc.name);
+            if (sc.stage == SpirvStage::Fragment) {
+                bool has_src = false;
+                for (const auto& samp : refl.samplers) {
+                    if (samp.name == "src" && samp.binding == 0U) {
+                        has_src = true;
+                    }
+                }
+                expect(has_src, "postfx fragment shader reflects sampler2D src at binding 0");
+            }
+            if (ok && dump_dir != nullptr && dump_dir[0] != '\0' && !spv.empty()) {
+                std::error_code ec;
+                std::filesystem::create_directories(dump_dir, ec);
+                if (std::FILE* fp = std::fopen(
+                        (std::filesystem::path(dump_dir) / sc.spv_file).string().c_str(), "wb")) {
+                    std::fwrite(spv.data(), sizeof(std::uint32_t), spv.size(), fp);
+                    std::fclose(fp);
+                }
+            }
+        }
+    }
+
+    // 2. Hand-computed FSR1 `easu_constants` and `rcas_constants` verification.
+    {
+        auto near_f = [](float a, float b) { return std::fabs(a - b) <= 1e-6F; };
+
+        // 1280x720 -> 1920x1080 (derived from FsrEasuCon):
+        //   scale = 1280/1920 = 2/3, 720/1080 = 2/3
+        //   con0 = (2/3, 2/3, 0.5*(2/3)-0.5 = -1/6, -1/6)
+        //   con1 = (1/1280, 1/720, 1/1280, -1/720)
+        //   con2 = (-1/1280, 2/720, 1/1280, 2/720)
+        //   con3 = (0, 4/720, 0, 0)
+        const EasuConstants ups =
+            easu_constants(1280.0F, 720.0F, 1280.0F, 720.0F, 1920.0F, 1080.0F);
+        expect(near_f(ups.con[0], 0.6666667F) && near_f(ups.con[1], 0.6666667F) &&
+                   near_f(ups.con[2], -0.16666667F) && near_f(ups.con[3], -0.16666667F) &&
+                   near_f(ups.con[4], 0.00078125F) && near_f(ups.con[5], 0.0013888889F) &&
+                   near_f(ups.con[6], 0.00078125F) && near_f(ups.con[7], -0.0013888889F) &&
+                   near_f(ups.con[8], -0.00078125F) && near_f(ups.con[9], 0.0027777778F) &&
+                   near_f(ups.con[10], 0.00078125F) && near_f(ups.con[11], 0.0027777778F) &&
+                   ups.con[12] == 0.0F && near_f(ups.con[13], 0.0055555556F) &&
+                   ups.con[14] == 0.0F && ups.con[15] == 0.0F,
+               "easu_constants 1280x720 -> 1920x1080 match hand-computed FsrEasuCon");
+
+        // 1:1 1920x1080 -> 1920x1080:
+        //   con0 = (1, 1, 0, 0)
+        //   con1 = (1/1920, 1/1080, 1/1920, -1/1080)
+        //   con2 = (-1/1920, 2/1080, 1/1920, 2/1080)
+        //   con3 = (0, 4/1080, 0, 0)
+        const EasuConstants one_to_one =
+            easu_constants(1920.0F, 1080.0F, 1920.0F, 1080.0F, 1920.0F, 1080.0F);
+        expect(near_f(one_to_one.con[0], 1.0F) && near_f(one_to_one.con[1], 1.0F) &&
+                   near_f(one_to_one.con[2], 0.0F) && near_f(one_to_one.con[3], 0.0F) &&
+                   near_f(one_to_one.con[4], 0.0005208333F) &&
+                   near_f(one_to_one.con[5], 0.0009259259F) &&
+                   near_f(one_to_one.con[6], 0.0005208333F) &&
+                   near_f(one_to_one.con[7], -0.0009259259F) &&
+                   near_f(one_to_one.con[8], -0.0005208333F) &&
+                   near_f(one_to_one.con[9], 0.0018518519F) &&
+                   near_f(one_to_one.con[10], 0.0005208333F) &&
+                   near_f(one_to_one.con[11], 0.0018518519F) &&
+                   one_to_one.con[12] == 0.0F && near_f(one_to_one.con[13], 0.0037037037F) &&
+                   one_to_one.con[14] == 0.0F && one_to_one.con[15] == 0.0F,
+               "easu_constants 1:1 1920x1080 match hand-computed FsrEasuCon");
+
+        // Dynamic-resolution sub-viewport inside full texture:
+        //   in_size = 1920x1080, in_viewport = 1280x720, out_size = 1920x1080
+        const EasuConstants subview =
+            easu_constants(1920.0F, 1080.0F, 1280.0F, 720.0F, 1920.0F, 1080.0F);
+        expect(near_f(subview.con[0], 0.6666667F) && near_f(subview.con[2], -0.16666667F) &&
+                   near_f(subview.con[4], 0.0005208333F) && near_f(subview.con[5], 0.0009259259F),
+               "easu_constants separates input viewport scale from full input texture size");
+
+        // FsrRcasCon:
+        //   0 stops -> exp2(0)=1.0, fp16(1.0)=0x3C00 -> con[1]=bit_cast<float>(0x3C003C00)
+        //   1 stop  -> exp2(-1)=0.5, fp16(0.5)=0x3800 -> con[1]=bit_cast<float>(0x38003800)
+        //   2 stops -> exp2(-2)=0.25, fp16(0.25)=0x3400 -> con[1]=bit_cast<float>(0x34003400)
+        //   0.5 stops -> exp2(-0.5)=0.70710678, fp16=0x39A8 -> con[1]=bit_cast<float>(0x39A839A8)
+        const RcasConstants r0 = rcas_constants(0.0F);
+        const RcasConstants r1 = rcas_constants(1.0F);
+        const RcasConstants r2 = rcas_constants(2.0F);
+        const RcasConstants r05 = rcas_constants(0.5F);
+        expect(r0.con[0] == 1.0F && std::bit_cast<std::uint32_t>(r0.con[1]) == 0x3C003C00U &&
+                   r0.con[2] == 0.0F && r0.con[3] == 0.0F,
+               "rcas_constants(0.0) packs 1.0 and fp16 pair 0x3C003C00");
+        expect(r1.con[0] == 0.5F && std::bit_cast<std::uint32_t>(r1.con[1]) == 0x38003800U &&
+                   r1.con[2] == 0.0F && r1.con[3] == 0.0F,
+               "rcas_constants(1.0) packs 0.5 and fp16 pair 0x38003800");
+        expect(r2.con[0] == 0.25F && std::bit_cast<std::uint32_t>(r2.con[1]) == 0x34003400U &&
+                   r2.con[2] == 0.0F && r2.con[3] == 0.0F,
+               "rcas_constants(2.0) packs 0.25 and fp16 pair 0x34003400");
+        expect(near_f(r05.con[0], 0.70710678F) &&
+                   std::bit_cast<std::uint32_t>(r05.con[1]) == 0x39A839A8U,
+               "rcas_constants(0.5) packs exp2(-0.5) and fp16 pair 0x39A839A8");
+    }
+
+    // 3. CPU reference of kFxaa's Rec.601 luma, contrast threshold, and orientation on 3x3 patches.
+    {
+        struct Rgb {
+            float r, g, b;
+        };
+        struct FxaaDecision {
+            bool active;
+            bool is_horiz;
+            float range;
+        };
+        auto luma = [](Rgb c) { return 0.299F * c.r + 0.587F * c.g + 0.114F * c.b; };
+        auto eval_patch = [&](const std::array<Rgb, 9>& p, float edge_thresh,
+                              float edge_thresh_min) -> FxaaDecision {
+            const float lNW = luma(p[0]), lN = luma(p[1]), lNE = luma(p[2]);
+            const float lW = luma(p[3]), lM = luma(p[4]), lE = luma(p[5]);
+            const float lSW = luma(p[6]), lS = luma(p[7]), lSE = luma(p[8]);
+            const float lMin = std::min({lM, lN, lS, lW, lE});
+            const float lMax = std::max({lM, lN, lS, lW, lE});
+            const float lRange = lMax - lMin;
+            if (lRange < std::max(edge_thresh_min, lMax * edge_thresh)) {
+                return {false, false, lRange};
+            }
+            const float edgeH = std::fabs(lNW + lSW - 2.0F * lW) +
+                                2.0F * std::fabs(lN + lS - 2.0F * lM) +
+                                std::fabs(lNE + lSE - 2.0F * lE);
+            const float edgeV = std::fabs(lNW + lNE - 2.0F * lN) +
+                                2.0F * std::fabs(lW + lE - 2.0F * lM) +
+                                std::fabs(lSW + lSE - 2.0F * lS);
+            return {true, edgeH >= edgeV, lRange};
+        };
+
+        const float thresh = 0.125F;
+        const float thresh_min = 0.05F;
+        const Rgb flat_c{0.5F, 0.5F, 0.5F};
+        const std::array<Rgb, 9> flat = {flat_c, flat_c, flat_c, flat_c, flat_c,
+                                         flat_c, flat_c, flat_c, flat_c};
+        const FxaaDecision d_flat = eval_patch(flat, thresh, thresh_min);
+        expect(!d_flat.active && d_flat.range == 0.0F, "fxaa skips flat 3x3 patch");
+
+        // Dark step: lMax=0.04, lRange=0.04 < edge_threshold_min (0.05) even though 0.04 >= 0.04*0.125.
+        const Rgb d0{0.0F, 0.0F, 0.0F}, d1{0.04F, 0.04F, 0.04F};
+        const std::array<Rgb, 9> dark = {d0, d0, d0, d1, d1, d1, d1, d1, d1};
+        expect(!eval_patch(dark, thresh, thresh_min).active,
+               "fxaa skips dark low-contrast patch below edge_threshold_min");
+
+        // Bright step: lMax=0.98, lRange=0.08 > 0.05, but 0.08 < 0.98*0.125=0.1225 -> skipped.
+        const Rgb b0{0.90F, 0.90F, 0.90F}, b1{0.98F, 0.98F, 0.98F};
+        const std::array<Rgb, 9> bright = {b0, b0, b0, b1, b1, b1, b1, b1, b1};
+        expect(!eval_patch(bright, thresh, thresh_min).active,
+               "fxaa skips bright moderate-contrast patch below lMax * edge_threshold");
+
+        // Sharp horizontal edge (row 0 dark, rows 1-2 white): active and horizontal.
+        const Rgb blk{0.0F, 0.0F, 0.0F}, wht{1.0F, 1.0F, 1.0F};
+        const std::array<Rgb, 9> horiz = {blk, blk, blk, wht, wht, wht, wht, wht, wht};
+        const FxaaDecision d_horiz = eval_patch(horiz, thresh, thresh_min);
+        expect(d_horiz.active && d_horiz.is_horiz,
+               "fxaa activates on sharp horizontal edge and classifies isHoriz=true");
+
+        // Sharp vertical edge (col 0 dark, cols 1-2 white): active and vertical.
+        const std::array<Rgb, 9> vert = {blk, wht, wht, blk, wht, wht, blk, wht, wht};
+        const FxaaDecision d_vert = eval_patch(vert, thresh, thresh_min);
+        expect(d_vert.active && !d_vert.is_horiz,
+               "fxaa activates on sharp vertical edge and classifies isHoriz=false");
+    }
+
+    // 4. DynamicResolution controller and render_size tests.
+    {
+        auto near_s = [](float a, float b) { return std::fabs(a - b) <= 1e-4F; };
+
+        // Steady load under budget stays at max_scale (1.0).
+        {
+            DynamicResolution dr;
+            expect(near_s(dr.scale(), 1.0F), "dynres starts at max_scale");
+            for (int i = 0; i < 200; ++i) {
+                (void)dr.update(20.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 1.0F), "dynres steady under-budget load stays at max_scale");
+        }
+
+        // Sustained overload steps down one step every frames_to_decide until min_scale, then clamps.
+        {
+            DynamicResolution dr;
+            for (int i = 0; i < 29; ++i) {
+                (void)dr.update(35.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 1.0F), "dynres waits frames_to_decide before first step down");
+            (void)dr.update(35.0, ThermalStatus::none);
+            expect(near_s(dr.scale(), 0.95F), "dynres steps down 1 step at frame 30");
+            (void)dr.update(35.0, ThermalStatus::none);
+            expect(near_s(dr.scale(), 0.95F), "dynres resets window after stepping down");
+            for (int i = 1; i < 30; ++i) {
+                (void)dr.update(35.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 0.90F), "dynres steps down 2nd step at frame 60");
+            for (int i = 0; i < 300; ++i) {
+                (void)dr.update(35.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 0.50F), "dynres clamps at min_scale under sustained overload");
+        }
+
+        // Recovery requires 2x frames_to_decide frames well below budget per step.
+        {
+            DynamicResolution dr;
+            for (int i = 0; i < 30; ++i) {
+                (void)dr.update(35.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 0.95F), "dynres drops to 0.95 before recovery test");
+            for (int i = 0; i < 59; ++i) {
+                (void)dr.update(15.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 0.95F),
+                   "dynres does not recover before 2 * frames_to_decide frames");
+            (void)dr.update(15.0, ThermalStatus::none);
+            expect(near_s(dr.scale(), 1.0F),
+                   "dynres steps up 1 step at 2 * frames_to_decide frames well below budget");
+        }
+
+        // No oscillation on load exactly at the threshold (33.3 * 0.85 = 28.305 ms)
+        // or inside the deadband.
+        {
+            DynamicResolution dr;
+            const double threshold_ms = 33.3 * 0.85;
+            bool changed = false;
+            for (int i = 0; i < 300; ++i) {
+                const float s = dr.update(threshold_ms, ThermalStatus::none);
+                if (!near_s(s, 1.0F)) {
+                    changed = true;
+                }
+            }
+            expect(!changed, "dynres does not step down at exact threshold load");
+
+            // Step down to 0.85, then run at exact threshold: stays at 0.85 without oscillating.
+            for (int i = 0; i < 90; ++i) {
+                (void)dr.update(35.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 0.85F), "dynres stepped to 0.85 for deadband test");
+            bool oscillated = false;
+            for (int i = 0; i < 300; ++i) {
+                const float s = dr.update(threshold_ms, ThermalStatus::none);
+                if (!near_s(s, 0.85F)) {
+                    oscillated = true;
+                }
+            }
+            expect(!oscillated, "dynres does not oscillate when load sits at threshold");
+        }
+
+        // Thermal caps: none/light=1.0, moderate=0.85, severe=0.75, critical/emergency/shutdown=min_scale,
+        // and lifting thermal back to none/light allows recovery; reset() returns to max_scale.
+        {
+            DynamicResolution dr;
+            expect(near_s(dr.update(15.0, ThermalStatus::light), 1.0F),
+                   "dynres thermal light allows max_scale");
+            expect(near_s(dr.update(15.0, ThermalStatus::moderate), 0.85F),
+                   "dynres thermal moderate caps at 0.85");
+            expect(near_s(dr.update(15.0, ThermalStatus::severe), 0.75F),
+                   "dynres thermal severe caps at 0.75");
+            expect(near_s(dr.update(15.0, ThermalStatus::critical), 0.50F),
+                   "dynres thermal critical caps at min_scale");
+            expect(near_s(dr.update(15.0, ThermalStatus::emergency), 0.50F),
+                   "dynres thermal emergency caps at min_scale");
+            expect(near_s(dr.update(15.0, ThermalStatus::shutdown), 0.50F),
+                   "dynres thermal shutdown caps at min_scale");
+
+            // Lifting cap to none allows recovery over 2 * frames_to_decide per 0.05 step.
+            for (int i = 0; i < 600; ++i) {
+                (void)dr.update(15.0, ThermalStatus::none);
+            }
+            expect(near_s(dr.scale(), 1.0F),
+                   "dynres lifting thermal to none allows recovery back to max_scale");
+
+            (void)dr.update(15.0, ThermalStatus::critical);
+            expect(near_s(dr.scale(), 0.50F), "dynres drops to 0.50 on critical before reset");
+            dr.reset();
+            expect(near_s(dr.scale(), 1.0F), "dynres reset restores max_scale");
+        }
+
+        // render_size multiple-of-8 rounding and clamping.
+        {
+            const auto s75 = DynamicResolution::render_size(1920U, 1080U, 0.75F);
+            const auto s100 = DynamicResolution::render_size(1920U, 1080U, 1.0F);
+            const auto s50 = DynamicResolution::render_size(1920U, 1080U, 0.5F);
+            const auto s0 = DynamicResolution::render_size(1920U, 1080U, 0.0F);
+            const auto s_over = DynamicResolution::render_size(1920U, 1080U, 1.5F);
+            const auto s_odd = DynamicResolution::render_size(1366U, 768U, 1.0F);
+            const auto s_tiny = DynamicResolution::render_size(16U, 16U, 0.1F);
+            const auto s_sub8 = DynamicResolution::render_size(4U, 4U, 0.5F);
+            const auto s_zero = DynamicResolution::render_size(0U, 0U, 1.0F);
+
+            expect(s75.first == 1440U && s75.second == 808U,
+                   "render_size(1920x1080, 0.75) rounds to 1440x808");
+            expect(s100.first == 1920U && s100.second == 1080U,
+                   "render_size(1920x1080, 1.0) keeps 1920x1080");
+            expect(s50.first == 960U && s50.second == 544U,
+                   "render_size(1920x1080, 0.5) rounds 540 to 544");
+            expect(s0.first == 8U && s0.second == 8U,
+                   "render_size clamps minimum to 8x8");
+            expect(s_over.first == 1920U && s_over.second == 1080U,
+                   "render_size clamps scale > 1.0 to output size");
+            expect(s_odd.first == 1366U && s_odd.second == 768U,
+                   "render_size never exceeds non-multiple-of-8 output width");
+            expect(s_tiny.first == 8U && s_tiny.second == 8U,
+                   "render_size clamps small positive scale to at least 8");
+            expect(s_sub8.first == 4U && s_sub8.second == 4U,
+                   "render_size clamps sub-8 output to output size");
+            expect(s_zero.first == 0U && s_zero.second == 0U,
+                   "render_size preserves zero output dimensions");
+        }
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -2572,6 +2914,7 @@ int run_asset_suite(const char* fixture_path) {
     test_p5_shader_review_regressions();
     test_p5_lowering_review_regressions();
     test_d3d9_shader_translation();
+    test_r5b_postfx_and_dynres();
 
     if (failures == 0) {
         std::printf("asset tests: PASS\n");
