@@ -937,6 +937,16 @@ own, and none blocks another.
       folder index, so the first load is as now and later loads read local files; only what Native
       reads is copied (about 0.5-1 GB of the 1.4 GB the module could use; other modules are 0.7-5.4
       GB each). Advanced shows the space used and can free it.
+    - **Widescreen (the user's main way to play, 2026-11-23):** the game draws at the screen's own
+      shape. The phone's screen is 20:9 (2412 x 1080); the first runs drew 16:9, which System Vulkan
+      letterboxed and the PanVK CPU copy stretched (Android scaled the 1920 x 1080 buffer to the
+      window). With `rgl_config.txt` at its default `display_width = 0`, Warband sizes its window and
+      back buffer from the desktop (`GetSystemMetrics`, `GetAdapterDisplayMode`, `EnumAdapterModes`),
+      so the shims report the phone's window size as the desktop (`wse/recomp/screen.h`, set by
+      `r4_jni.cpp` from the `ANativeWindow` before the game starts; `r4_run --screen WxH` on the PC)
+      and list it as the largest display mode. Checked on the PC by replaying a 20:9 capture on the
+      real D3D9 (menu layout at 20:9) before the phone sees it; render cost grows with the pixel count
+      (+26 % over 1920 x 1080), which the dynamic resolution and FSR work absorb.
     - **Work split:** Gemini 4 Hydrogen (high) workers build the self-contained, test-covered units
       (etcpak + transcoder + cache format; the read-through cache and its UI; the post-pass shaders
       and the dynamic-resolution controller; the PC texture tool); Claude writes render-to-texture

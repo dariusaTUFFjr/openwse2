@@ -4,7 +4,7 @@
 //
 //   r4_run <install dir> [--work <dir>] [--retranslate] [--batch <n>] [--opt <0-3>] [--jobs <n>]
 //          [--reuse] [--quiet] [--module <name>] [--frames <n>] [--for-phone <dir>]
-//          [--capture <file> [--capture-frames <n>]]
+//          [--capture <file> [--capture-frames <n>]] [--screen <w>x<h>]
 //
 // The runner itself is `engine/src/recomp/r4_startup.{h,cpp}` (shared with the phone's Advanced >
 // "R4 startup run"); this tool reads the exe, `lua5164.dll` and the PDB from the install, mounts the
@@ -43,6 +43,7 @@
 #include "../engine/src/recomp/r4_startup.h"
 #include "../engine/src/recomp/recomp_llvm.h"
 #include "wse/recomp/d3d9_capture.h"
+#include "wse/recomp/screen.h"
 #include "wse/recomp/shim_d3d9.h"
 #include "wse/platform/vfs.h"
 
@@ -74,7 +75,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <install dir> [--work <dir>] [--retranslate] [--batch <n>] [--opt <0-3>] [--jobs <n>] "
-                     "[--reuse] [--quiet] [--module <name>] [--frames <n>] [--for-phone <dir>] [--capture <file> [--capture-frames <n>]]\n",
+                     "[--reuse] [--quiet] [--module <name>] [--frames <n>] [--for-phone <dir>] [--capture <file> [--capture-frames <n>]] [--screen <w>x<h>]\n",
                      argv[0]);
         return 2;
     }
@@ -98,6 +99,10 @@ int main(int argc, char** argv) {
         else if (a == "--for-phone" && i + 1 < argc) for_phone = argv[++i];
         else if (a == "--capture" && i + 1 < argc) capture = argv[++i];
         else if (a == "--capture-frames" && i + 1 < argc) capture_frames = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--screen" && i + 1 < argc) {  // e.g. 2412x1080: the display the game sees (widescreen)
+            int sw = 0, sh = 0;
+            if (std::sscanf(argv[++i], "%dx%d", &sw, &sh) == 2) wse::recomp::shim::set_screen_size(sw, sh);
+        }
     }
     // The capture is set up through the device's construction hook, so the shared startup code
     // (and with it the translator fingerprint) is unchanged.

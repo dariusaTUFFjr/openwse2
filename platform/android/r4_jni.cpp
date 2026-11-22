@@ -39,6 +39,7 @@
 #include "wse/platform/rhi.h"
 #include "wse/platform/saf_vfs.h"
 #include "wse/platform/vfs.h"
+#include "wse/recomp/screen.h"
 #include "wse/recomp/shim_d3d9.h"
 
 namespace {
@@ -515,6 +516,14 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
             g_pending_window = nullptr;
         }
     }
+
+    // Widescreen: the game draws at the screen's own shape (e.g. 2412 x 1080 on a 20:9 phone) when
+    // the shims report it as the desktop; without a window it stays 1920 x 1080.
+    if (init_win != nullptr) {
+        wse::recomp::shim::set_screen_size(ANativeWindow_getWidth(init_win), ANativeWindow_getHeight(init_win));
+    }
+    report("screen: " + std::to_string(wse::recomp::shim::screen_size().width) + "x" +
+           std::to_string(wse::recomp::shim::screen_size().height) + "\n");
 
     wse::platform::VulkanD3d9Config cfg{};
     cfg.pipeline_cache_path = (work / "r5_pipeline_cache.bin").string();

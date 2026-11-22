@@ -41,6 +41,7 @@
 
 #include "wse/recomp/cpu_state.h"
 #include "wse/recomp/runtime.h"
+#include "wse/recomp/screen.h"
 #include "wse/recomp/shim_crt.h"
 #include "wse/recomp/teb.h"
 
@@ -56,9 +57,10 @@ inline constexpr int kGwlWndProc = -4, kGwlStyle = -16, kGwlExStyle = -20, kGwlU
 inline constexpr std::uint32_t kErrorInvalidWindowHandle = 1400, kErrorClassAlreadyExists = 1410,
                                kErrorCannotFindWndClass = 1407;
 
+// The screen the game sees: `screen_size()` (wse/recomp/screen.h) when the shim is created.
 struct DisplayConfig {
-    int screen_width = 1920;
-    int screen_height = 1080;
+    int screen_width = screen_size().width;
+    int screen_height = screen_size().height;
 };
 
 class User32 {

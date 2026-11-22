@@ -42,6 +42,7 @@
 #include "wse/recomp/d3d9_backend.h"
 #include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/fx_effect.h"
+#include "wse/recomp/screen.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/shim_crt.h"
 
@@ -60,9 +61,10 @@ struct Desc {
 };
 }  // namespace d3d9_detail
 
+// The desktop display mode the game sees: `screen_size()` (wse/recomp/screen.h) when created.
 struct D3d9Config {
-    int width = 1920;
-    int height = 1080;
+    int width = screen_size().width;
+    int height = screen_size().height;
     int refresh = 60;
     std::uint64_t texture_memory = 1ULL << 30;
 };
@@ -961,8 +963,15 @@ inline void D3d9::build_vtables() {
         const std::uint32_t v[4] = {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), static_cast<std::uint32_t>(cfg_.refresh), kD3dFmtX8R8G8B8};
         std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(p)), v, sizeof(v));
     };
-    static constexpr int kModes[][2] = {{640, 480}, {800, 600}, {1024, 768}, {1280, 720}, {1280, 1024}, {1366, 768}, {1600, 900}, {1920, 1080}};
-    static constexpr std::uint32_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
+    // Display modes: the usual list up to the screen's size, then the screen itself (a 20:9 phone
+    // offers its own 2412 x 1080 last, as Windows lists the native mode).
+    static constexpr int kStdModes[][2] = {{640, 480}, {800, 600}, {1024, 768}, {1280, 720}, {1280, 1024}, {1366, 768}, {1600, 900}, {1920, 1080}};
+    std::vector<std::array<int, 2>> modes_list;
+    for (const auto& m : kStdModes) {
+        if (m[0] <= cfg_.width && m[1] <= cfg_.height && !(m[0] == cfg_.width && m[1] == cfg_.height)) modes_list.push_back({m[0], m[1]});
+    }
+    modes_list.push_back({cfg_.width, cfg_.height});
+    const auto kModeCount = static_cast<std::uint32_t>(modes_list.size());
     // D3DCAPS9 (304 bytes) exactly as a shader-model-3.0 D3D9 HAL device reports it
     // (GetDeviceCaps(0, D3DDEVTYPE_HAL) on Windows 10.0.19045). The engine's device check
     // (VertexShaderVersion and PixelShaderVersion >= 2.0, MaxStreams >= 16,
@@ -1001,14 +1010,14 @@ inline void D3d9::build_vtables() {
              std::memcpy(c + 1064, &vendor, 4);
              ret(s, 0);
          }},
-        {"GetAdapterModeCount", [ret](CpuState& s, Obj&, std::uint64_t) {
+        {"GetAdapterModeCount", [ret, kModeCount](CpuState& s, Obj&, std::uint64_t) {
              ret(s, static_cast<std::uint32_t>(win64_arg(s, 2)) == kD3dFmtX8R8G8B8 ? kModeCount : 0);
          }},
         // EnumAdapterModes(adapter, format, mode, D3DDISPLAYMODE*)
-        {"EnumAdapterModes", [ret, mode](CpuState& s, Obj&, std::uint64_t) {
+        {"EnumAdapterModes", [ret, mode, modes_list, kModeCount](CpuState& s, Obj&, std::uint64_t) {
              const auto i = static_cast<std::uint32_t>(win64_arg(s, 3));
              if (static_cast<std::uint32_t>(win64_arg(s, 2)) != kD3dFmtX8R8G8B8 || i >= kModeCount) return ret(s, kD3dErrInvalidCall);
-             mode(win64_arg(s, 4), kModes[i][0], kModes[i][1]);
+             mode(win64_arg(s, 4), modes_list[i][0], modes_list[i][1]);
              ret(s, 0);
          }},
         {"GetAdapterDisplayMode", [this, ret, mode](CpuState& s, Obj&, std::uint64_t) {
