@@ -509,14 +509,14 @@ private:
         if (!parts) return std::nullopt;
         std::filesystem::path current = root_;
         std::size_t start = 0;
-        std::string key;  // ASCII-folded parts [0, i) joined by '/'
+        std::string key;  // parts [0, i) as spelled, joined by '/'
         {
             // The longest remembered directory prefix (usually the parent).
             std::vector<std::string> prefixes;
             std::string k;
             for (std::size_t i = 0; i + 1 < parts->size(); ++i) {
                 if (!k.empty()) k += '/';
-                k += ascii_lower((*parts)[i]);
+                k += (*parts)[i];
                 prefixes.push_back(k);
             }
             for (std::size_t n = prefixes.size(); n > 0; --n) {
@@ -545,7 +545,7 @@ private:
             }
             if (!last) {
                 if (!key.empty()) key += '/';
-                key += ascii_lower(part);
+                key += part;
                 if (!inside_root(current)) return std::nullopt;
                 if (resolved_dirs_.size() < 4096U) resolved_dirs_.emplace(key, current);
             }
@@ -679,7 +679,9 @@ private:
 
     // Keyed by the ASCII-folded host path; see `cache_key`.
     mutable std::unordered_map<std::filesystem::path::string_type, DirListing> dir_cache_;
-    // ASCII-folded relative directory path -> host directory proven inside the root.
+    // Relative directory path as the caller spelled it -> host directory proven inside the
+    // root. Not case-folded: on a case-sensitive volume `Textures` and `textures` can be two
+    // directories (another spelling of the same directory is just another entry).
     mutable std::unordered_map<std::string, std::filesystem::path> resolved_dirs_;
     mutable std::size_t directory_scans_ = 0;
 };
