@@ -1259,7 +1259,7 @@ placeholders until each is checked against the v1.1.5.6 disassembly:
   - `GuestStack` (`r0_inputs.h`, used directly and by `threads.h` / `kernel.h` `CreateThread`) allocates via `mmap`/`VirtualAlloc` with a 64 KiB `PROT_NONE`/`PAGE_NOACCESS` guard below the stack.
 
 - **R5b FSR upscaling, sharpening, FXAA, and dynamic resolution (`d3d9_vulkan.{h,cpp}`, `r4_jni.cpp`, `r5_replay_vulkan.cpp`, `AdvancedScreen.kt`):**
-  - `VulkanD3d9Backend` scales viewport, scissor, `Clear` rects, and D3D9 half-pixel `posfix` into the top-left `ceil(W*s) x ceil(H*s)` region of the back buffer only (never render-to-texture targets) and runs optional FXAA -> FSR 1.0 EASU -> RCAS passes before present when `s < 1`, `sharpness > 0`, or `fxaa` is enabled.
+  - `VulkanD3d9Backend` scales viewport, scissor, `Clear` rects, and D3D9 half-pixel `posfix` into the top-left `round(W*s) x round(H*s)` region of the back buffer only (never render-to-texture targets) and runs optional FXAA -> FSR 1.0 EASU -> RCAS passes before present when `s < 1`, `sharpness > 0`, or `fxaa` is enabled.
   - `VulkanD3d9Backend` updates `DynamicResolution` once per presented frame using GPU timestamp queries (`VkQueryPool`, no wait) when supported or present-to-present wall time otherwise, capped by `set_thermal_status(ThermalStatus)` (polled every ~2 s in `r4_jni.cpp` via `dlsym` on `libandroid.so` for API 30+).
   - Launcher Advanced screen adds a "Picture" section (Resolution, Sharpen the picture, Smooth jagged edges) wired through `RecompGameActivity` / `R4Native.nativeRunVulkan`, with the HUD pill showing scale `< 100%` and `fps:` logging `scale=<s>`.
 
