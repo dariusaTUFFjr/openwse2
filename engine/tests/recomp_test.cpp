@@ -6012,7 +6012,7 @@ void test_d3d9_backend_and_preshader() {
         }
         const D3d9DriverReport& report() const noexcept override { return rep; }
         void create_buffer(std::uint64_t id, bool, std::uint32_t sz, bool, std::uint32_t) override { bufs[id].assign(sz, 0); }
-        void update_buffer(std::uint64_t id, std::uint32_t off, std::span<const std::uint8_t> b, bool) override {
+        void update_buffer(std::uint64_t id, std::uint32_t off, std::span<const std::uint8_t> b, std::uint32_t) override {
             auto& dst = bufs[id];
             if (dst.size() < off + b.size()) dst.resize(off + b.size(), 0);
             if (!b.empty()) std::memcpy(dst.data() + off, b.data(), b.size());

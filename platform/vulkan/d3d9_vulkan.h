@@ -48,7 +48,7 @@ public:
     void create_buffer(std::uint64_t id, bool is_index, std::uint32_t size,
                        bool dynamic, std::uint32_t fmt) override;
     void update_buffer(std::uint64_t id, std::uint32_t offset,
-                       std::span<const std::uint8_t> bytes, bool discard) override;
+                       std::span<const std::uint8_t> bytes, std::uint32_t lock_flags) override;
     void destroy_buffer(std::uint64_t id) override;
 
     void create_texture(std::uint64_t id, int kind, std::uint32_t width, std::uint32_t height,

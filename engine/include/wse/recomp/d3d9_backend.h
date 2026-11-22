@@ -203,8 +203,12 @@ public:
 
     virtual void create_buffer(std::uint64_t id, bool is_index, std::uint32_t size,
                                bool dynamic, std::uint32_t fmt) = 0;
+    // The bytes the game wrote under one Lock/Unlock: `offset` and `bytes` cover the locked range
+    // (or, for a capture replay, the bytes that changed in it); `lock_flags` are the Lock's
+    // D3DLOCK_* flags (DISCARD 0x2000, NOOVERWRITE 0x1000), which say whether queued draws may
+    // still read the buffer's old contents.
     virtual void update_buffer(std::uint64_t id, std::uint32_t offset,
-                               std::span<const std::uint8_t> bytes, bool discard) = 0;
+                               std::span<const std::uint8_t> bytes, std::uint32_t lock_flags) = 0;
     virtual void destroy_buffer(std::uint64_t id) = 0;
 
     // kind: 0 = 2D texture, 1 = Cube texture, 2 = Volume texture.
@@ -724,6 +728,7 @@ public:
         if (c.iface == "IDirect3DVertexBuffer9" || c.iface == "IDirect3DIndexBuffer9") {
             if (m == "Lock") {
                 buf_lock_flags_[c.self] = static_cast<std::uint32_t>(c.args[3]);
+                buf_lock_range_[c.self] = {static_cast<std::uint32_t>(c.args[0]), static_cast<std::uint32_t>(c.args[1])};
             } else if (m == "Unlock") {
                 const d3dcap::Data* d = c.find(d3dcap::kTagLocked);
                 if (d != nullptr && d->bytes.size() >= 8) {
@@ -736,11 +741,14 @@ public:
                         full.resize(static_cast<std::size_t>(off) + avail, 0);
                     }
                     if (avail != 0) std::memcpy(full.data() + off, d->bytes.data() + 8, avail);
-                    const bool discard = (buf_lock_flags_[c.self] & 0x2000U) != 0U;  // D3DLOCK_DISCARD
-                    if (discard) {
-                        backend_.update_buffer(c.self, 0, full, true);
+                    const std::uint32_t flags = buf_lock_flags_[c.self];
+                    if ((flags & 0x2000U) != 0U) {  // D3DLOCK_DISCARD: the whole locked range is new
+                        const auto [lo, size] = buf_lock_range_[c.self];
+                        const std::size_t from = std::min<std::size_t>(lo, full.size());
+                        const std::size_t n = size == 0 ? full.size() - from : std::min<std::size_t>(size, full.size() - from);
+                        if (n != 0) backend_.update_buffer(c.self, static_cast<std::uint32_t>(from), std::span<const std::uint8_t>(full.data() + from, n), flags);
                     } else if (avail != 0) {
-                        backend_.update_buffer(c.self, off, std::span<const std::uint8_t>(full.data() + off, avail), false);
+                        backend_.update_buffer(c.self, off, std::span<const std::uint8_t>(full.data() + off, avail), flags);
                     }
                 }
             }
@@ -1050,6 +1058,7 @@ private:
     std::map<std::uint64_t, std::vector<RecordedOp>> state_blocks_;
     std::map<std::uint64_t, std::vector<std::uint8_t>> buf_shadow_;
     std::map<std::uint64_t, std::uint32_t> buf_lock_flags_;
+    std::map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> buf_lock_range_;  // offset, size
     std::map<std::uint64_t, TexMeta> tex_meta_;
     std::map<std::uint64_t, std::unique_ptr<D3d9EffectInstance>> effects_;
     std::map<std::pair<std::uint64_t, std::uint64_t>, int> effect_param_handles_;

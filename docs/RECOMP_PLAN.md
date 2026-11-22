@@ -868,7 +868,7 @@ own, and none blocks another.
        measured instructions first, D3D9 rules kept (constant registers, `mova`/relative addressing,
        `texkill`, `dsx`/`dsy`, half-pixel offset, clip-space depth 0..1). Host tests on hand-assembled
        synthetic bytecode; locally, all 776 shaders compile and the per-shader check passes.
-    3. **Capture and PC reference (done 2026-11-22, `wse/recomp/d3d9_capture.h` + `tools/r5_replay_d3d9.cpp`):** `r4_run --capture` (set up through `D3d9::created_hook` so startup code and `translator_fingerprint` stay unchanged; buffer unlocks delta-encoded so 3,000 frames fit in 102 MB) and `tools/r5_replay_d3d9.cpp` replayed 3,000 captured frames (483,404 calls, 0 failures) on real `d3d9.dll`/`d3dx9_43.dll` reaching Warband's main menu by frame 1,250 through frame 3,000 (`175c656`, 7/7 Engine CI green).
+    3. **Capture and PC reference (done 2026-11-22, `wse/recomp/d3d9_capture.h` + `tools/r5_replay_d3d9.cpp`):** `r4_run --capture` (set up through `D3d9::created_hook` so startup code and `translator_fingerprint` stay unchanged; buffer unlocks delta-encoded so 3,000 frames fit in 102 MB) and `tools/r5_replay_d3d9.cpp` replayed 3,000 captured frames (483,404 calls, 0 failures) on real `d3d9.dll`/`d3dx9_43.dll` reaching Warband's main menu by frame 1,250 through frame 3,000 (`e84c266`; CI history stayed with the old repository when the project moved on 2026-11-22).
     4. **The Vulkan D3D9 device (done 2026-11-22, `wse/recomp/d3d9_backend.h` + `platform/vulkan/d3d9_vulkan.{h,cpp}` + `tools/r5_replay_vulkan.cpp`):**
        a D3D9-shaped Vulkan 1.1 core layer beside `RhiDevice` (isolated from `engine/include/` behind
        `D3d9Backend` and wired into `shim_d3d9.h` for live runs and `D3d9CaptureReplayer` for capture

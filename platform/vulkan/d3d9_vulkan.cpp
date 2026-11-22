@@ -45,7 +45,19 @@ using namespace wse::recomp;
 constexpr std::uint32_t kMaxSamplers = 16U;
 constexpr std::uint32_t kDummyVertexBinding = 15U;
 constexpr VkDeviceSize kInitialUboRingBytes = 8ULL * 1024ULL * 1024ULL;    // 8 MiB, doubles as needed
-constexpr VkDeviceSize kInitialDynGeomBytes = 16ULL * 1024ULL * 1024ULL;   // 16 MiB, doubles as needed
+constexpr VkDeviceSize kInitialDynGeomBytes = 256ULL * 1024ULL;            // unused by draws since the 2026-11-22 pass
+// Frames the CPU may record ahead of the GPU (2026-11-22 performance pass): the game prepares
+// frame N+1 while the GPU draws frame N. Each slot owns its command buffers, fence and host rings.
+constexpr std::size_t kFramesInFlight = 2U;
+// Upload staging per frame slot: grows as needed; past this size an upload first waits for the
+// frame so far (long loads that never present would otherwise grow it without bound).
+constexpr VkDeviceSize kInitialStagingBytes = 4ULL * 1024ULL * 1024ULL;
+constexpr VkDeviceSize kStagingFlushBytes = 64ULL * 1024ULL * 1024ULL;
+// D3DLOCK_* flags passed to `update_buffer`.
+constexpr std::uint32_t kLockNoOverwrite = 0x1000U;
+constexpr std::uint32_t kLockDiscard = 0x2000U;
+// A dynamic buffer keeps at most this many renamed copies before it waits for the GPU.
+constexpr std::size_t kMaxDynInstances = 16U;
 constexpr VkDeviceSize kSharedAllocBlockBytes = 16ULL * 1024ULL * 1024ULL; // 16 MiB device blocks
 
 struct StageUboData {
@@ -953,6 +965,34 @@ struct VulkanD3d9Backend::Impl {
     };
     std::vector<RetiredBuf> retired_bufs;
 
+    // Frames in flight. `frame_cmd`, `frame_fence`, `up_cmd`, `ubo_ring`, `dyn_geom_ring`,
+    // `stage_ring`, `ubo_desc_set` and `retired_bufs` always hold the current slot's; the other
+    // slots are parked in `slots` and swapped in by `advance_frame_slot()`.
+    struct FrameSlot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkCommandBuffer up_cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        bool in_flight = false;
+        std::uint64_t fence_frame = 0;
+        RingBuf ubo{};
+        RingBuf geom{};
+        RingBuf stage{};
+        VkDescriptorSet ubo_set = VK_NULL_HANDLE;
+        std::vector<RetiredBuf> retired;
+#ifdef __ANDROID__
+        VkSemaphore sc_acquire = VK_NULL_HANDLE;
+        VkSemaphore sc_done = VK_NULL_HANDLE;
+#endif
+    };
+    std::array<FrameSlot, kFramesInFlight> slots{};
+    std::size_t cur_slot = 0;
+    VkCommandBuffer up_cmd = VK_NULL_HANDLE;  // uploads submitted just before this frame's draws
+    bool up_recording = false;
+    RingBuf stage_ring{};
+    bool frame_in_flight = false;      // `frame_fence` is pending
+    std::uint64_t fence_frame = 0;     // the frame `frame_fence` covers
+    std::uint64_t completed_frame = 0; // every frame up to this one has finished on the GPU
+
     // Staging upload & readback buffers.
     VkBuffer staging_buf = VK_NULL_HANDLE;
     MemAlloc staging_mem{};
@@ -1009,10 +1049,19 @@ struct VulkanD3d9Backend::Impl {
         // Static buffer storage:
         VkBuffer vk_buf = VK_NULL_HANDLE;
         MemAlloc vk_mem{};
-        // Dynamic per-frame slice in dyn_geom_ring:
-        VkBuffer dyn_buf = VK_NULL_HANDLE;
-        VkDeviceSize dyn_off = 0;
-        std::uint64_t dyn_frame = 0;
+        // Changed bytes not yet copied to `vk_buf` (static buffers).
+        std::size_t dirty_lo = SIZE_MAX, dirty_hi = 0;
+        std::uint64_t last_used_frame = 0;  // the frame whose draws last read `vk_buf`
+        // Dynamic buffers: persistent host-visible copies, renamed like a D3D9 driver does. A
+        // NOOVERWRITE lock writes the current copy in place; a DISCARD (or a plain lock of a copy
+        // the GPU may still read) moves to a free copy.
+        struct DynInst {
+            VkBuffer buf = VK_NULL_HANDLE;
+            MemAlloc mem{};
+            std::uint64_t last_used = 0;  // frame of the last draw that read it (0: never)
+        };
+        std::vector<DynInst> insts;
+        int cur = -1;
     };
     std::unordered_map<std::uint64_t, BufferObj> buffers;
 
@@ -1025,6 +1074,7 @@ struct VulkanD3d9Backend::Impl {
         MemAlloc mem{};
         VkImageView view = VK_NULL_HANDLE;
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        std::uint64_t last_used_frame = 0;  // the frame whose draws last sampled it
     };
     std::unordered_map<std::uint64_t, TextureObj> textures;
 
@@ -1063,8 +1113,6 @@ struct VulkanD3d9Backend::Impl {
     VkFormat sc_format = VK_FORMAT_R8G8B8A8_UNORM;
     VkExtent2D sc_extent{0U, 0U};
     std::vector<VkImage> sc_images;
-    VkSemaphore img_avail_sem = VK_NULL_HANDLE;
-    VkSemaphore render_done_sem = VK_NULL_HANDLE;
     bool sc_dirty = false;
 
     // Path B: Zero-copy AHardwareBuffer + ASurfaceControl (PanVK / Turnip).
@@ -1122,6 +1170,9 @@ struct VulkanD3d9Backend::Impl {
     }
 
     void destroy_ahb_ring_locked() noexcept {
+        // Queued frames may still write these images, and pending entries name their slots.
+        if (gpu_ready && h.device != VK_NULL_HANDLE && vk.device_wait_idle != nullptr) (void)vk.device_wait_idle(h.device);
+        ahb_pending_count = 0;
         if (ahb_surface_control != nullptr) {
             if (ASurfaceTransaction* tx = ASurfaceTransaction_create()) {
                 ASurfaceTransaction_setVisibility(tx, ahb_surface_control, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
@@ -1154,14 +1205,14 @@ struct VulkanD3d9Backend::Impl {
             (void)vk.device_wait_idle(h.device);
         }
         destroy_swapchain_only_locked();
-        if (img_avail_sem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
-            vk.destroy_semaphore(h.device, img_avail_sem, nullptr);
+        for (FrameSlot& s : slots) {
+            for (VkSemaphore* sem : {&s.sc_acquire, &s.sc_done}) {
+                if (*sem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
+                    vk.destroy_semaphore(h.device, *sem, nullptr);
+                }
+                *sem = VK_NULL_HANDLE;
+            }
         }
-        img_avail_sem = VK_NULL_HANDLE;
-        if (render_done_sem != VK_NULL_HANDLE && h.device != VK_NULL_HANDLE && vk.destroy_semaphore != nullptr) {
-            vk.destroy_semaphore(h.device, render_done_sem, nullptr);
-        }
-        render_done_sem = VK_NULL_HANDLE;
         if (vk_surface != VK_NULL_HANDLE && h.instance != VK_NULL_HANDLE && vk.destroy_surface != nullptr) {
             vk.destroy_surface(h.instance, vk_surface, nullptr);
         }
@@ -1318,10 +1369,12 @@ struct VulkanD3d9Backend::Impl {
         }
         VkSemaphoreCreateInfo sem_ci{};
         sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        if (vk.create_semaphore(h.device, &sem_ci, nullptr, &img_avail_sem) != VK_SUCCESS ||
-            vk.create_semaphore(h.device, &sem_ci, nullptr, &render_done_sem) != VK_SUCCESS) {
-            teardown_android_presentation_locked();
-            return false;
+        for (FrameSlot& s : slots) {
+            if (vk.create_semaphore(h.device, &sem_ci, nullptr, &s.sc_acquire) != VK_SUCCESS ||
+                vk.create_semaphore(h.device, &sem_ci, nullptr, &s.sc_done) != VK_SUCCESS) {
+                teardown_android_presentation_locked();
+                return false;
+            }
         }
         if (!create_swapchain_for_surface_locked()) {
             teardown_android_presentation_locked();
@@ -1496,13 +1549,17 @@ struct VulkanD3d9Backend::Impl {
             }
 
             std::uint32_t img_idx = 0U;
+            // One acquire/render-done semaphore pair per frame slot: with two frames in flight
+            // the previous frame's submit may still be waiting on its own pair.
+            const VkSemaphore acquire_sem = slots[cur_slot].sc_acquire;
+            const VkSemaphore done_sem = slots[cur_slot].sc_done;
             VkResult ar = vk.acquire_next_image(h.device, swapchain, 1'000'000'000ULL,
-                                                img_avail_sem, VK_NULL_HANDLE, &img_idx);
+                                                acquire_sem, VK_NULL_HANDLE, &img_idx);
             if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
                 if (vk.device_wait_idle != nullptr) (void)vk.device_wait_idle(h.device);
                 if (!create_swapchain_for_surface_locked()) return true;
                 ar = vk.acquire_next_image(h.device, swapchain, 1'000'000'000ULL,
-                                           img_avail_sem, VK_NULL_HANDLE, &img_idx);
+                                           acquire_sem, VK_NULL_HANDLE, &img_idx);
             }
             if ((ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) || img_idx >= sc_images.size()) {
                 if (ar == VK_ERROR_SURFACE_LOST_KHR) teardown_android_presentation_locked();
@@ -1539,7 +1596,9 @@ struct VulkanD3d9Backend::Impl {
             pre_bars[1].srcAccessMask = 0U;
             pre_bars[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
-            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            // TRANSFER is in the first scope so the swapchain image's layout change waits for
+            // the acquire semaphore (waited at TRANSFER below).
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr,
                                     2U, pre_bars.data());
 
@@ -1628,42 +1687,19 @@ struct VulkanD3d9Backend::Impl {
                                     2U, post_bars.data());
             bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-            if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) {
-                frame_recording = false;
-                return false;
-            }
-            if (vk.reset_fences(h.device, 1U, &frame_fence) != VK_SUCCESS) {
-                frame_recording = false;
-                return false;
-            }
-            const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-            VkSubmitInfo si{};
-            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            si.waitSemaphoreCount = 1U;
-            si.pWaitSemaphores = &img_avail_sem;
-            si.pWaitDstStageMask = &wait_stage;
-            si.commandBufferCount = 1U;
-            si.pCommandBuffers = &frame_cmd;
-            si.signalSemaphoreCount = 1U;
-            si.pSignalSemaphores = &render_done_sem;
-            if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) != VK_SUCCESS) {
-                frame_recording = false;
-                return false;
-            }
+            // No wait here: the next frame records while this one draws (readback alone waits).
+            if (!submit_frame_locked(acquire_sem, VK_PIPELINE_STAGE_TRANSFER_BIT, done_sem, do_rb)) return false;
 
             VkPresentInfoKHR pi{};
             pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
             pi.waitSemaphoreCount = 1U;
-            pi.pWaitSemaphores = &render_done_sem;
+            pi.pWaitSemaphores = &done_sem;
             pi.swapchainCount = 1U;
             pi.pSwapchains = &swapchain;
             pi.pImageIndices = &img_idx;
             const VkResult pr = vk.queue_present(h.graphics_queue, &pi);
             if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) sc_dirty = true;
 
-            (void)vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL);
-            frame_recording = false;
-            free_retired();
             if (do_rb) {
                 alloc.invalidate(readback_mem, 0U, rb_bytes);
                 out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
@@ -1769,29 +1805,46 @@ struct VulkanD3d9Backend::Impl {
                                     2U, post_bars.data());
             bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-            if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) {
-                frame_recording = false;
-                return false;
-            }
-            if (vk.reset_fences(h.device, 1U, &frame_fence) != VK_SUCCESS) {
-                frame_recording = false;
-                return false;
-            }
-            VkSubmitInfo si{};
-            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            si.commandBufferCount = 1U;
-            si.pCommandBuffers = &frame_cmd;
-            if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) != VK_SUCCESS) {
-                frame_recording = false;
-                return false;
-            }
-            if (vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL) != VK_SUCCESS) {
-                frame_recording = false;
-                return false;
-            }
-            frame_recording = false;
-            free_retired();
+            // The compositor gets no GPU fence, so a buffer is handed over only once its frame has
+            // finished: `advance_frame_slot()` waits for the previous frame, then
+            // `show_finished_ahb_locked()` shows it (one frame of latency, no stall).
+            if (!submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, do_rb)) return false;
+            ahb_pending[ahb_pending_count < ahb_pending.size() ? ahb_pending_count++ : ahb_pending.size() - 1U] =
+                {&slot - ahb_slots.data(), fence_frame};
 
+            if (do_rb) {
+                alloc.invalidate(readback_mem, 0U, rb_bytes);
+                out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
+                std::memcpy(out_rgba8->data(), readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
+            }
+            return true;
+        }
+
+        // Tier 3: CPU readback + ANativeWindow_lock upload.
+        return present_cpu_window_locked(rb_bytes, out_rgba8);
+    }
+
+    // AHB slots whose frames were submitted but not yet shown (oldest first).
+    struct AhbPending {
+        std::ptrdiff_t slot = 0;
+        std::uint64_t frame = 0;
+    };
+    std::array<AhbPending, kFramesInFlight + 1U> ahb_pending{};
+    std::size_t ahb_pending_count = 0;
+
+    // Shows every pending AHB slot whose frame has finished on the GPU.
+    void show_finished_ahb_locked() {
+        std::size_t done = 0;
+        while (done < ahb_pending_count && ahb_pending[done].frame <= completed_frame) {
+            show_ahb_slot_locked(ahb_slots[static_cast<std::size_t>(ahb_pending[done].slot)]);
+            ++done;
+        }
+        for (std::size_t i = done; i < ahb_pending_count; ++i) ahb_pending[i - done] = ahb_pending[i];
+        ahb_pending_count -= done;
+    }
+
+    void show_ahb_slot_locked(AhbSlot& slot) {
+        {
             if (ahb_surface_control != nullptr) {
                 const std::int32_t win_w = std::max<std::int32_t>(1, ANativeWindow_getWidth(active_window));
                 const std::int32_t win_h = std::max<std::int32_t>(1, ANativeWindow_getHeight(active_window));
@@ -1818,16 +1871,11 @@ struct VulkanD3d9Backend::Impl {
                     ASurfaceTransaction_delete(tx);
                 }
             }
-
-            if (do_rb) {
-                alloc.invalidate(readback_mem, 0U, rb_bytes);
-                out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
-                std::memcpy(out_rgba8->data(), readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
-            }
-            return true;
         }
+    }
 
-        // Tier 3: CPU readback + ANativeWindow_lock upload.
+    // Tier 3: CPU readback + ANativeWindow_lock upload (waits for the frame: it copies the pixels).
+    bool present_cpu_window_locked(VkDeviceSize rb_bytes, std::vector<std::uint8_t>* out_rgba8) {
         if (!ensure_frame_recording()) return false;
         if (render_pass_active) {
             vk.cmd_end_render_pass(frame_cmd);
@@ -1861,28 +1909,7 @@ struct VulkanD3d9Backend::Impl {
                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
             bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         }
-        if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) {
-            frame_recording = false;
-            return false;
-        }
-        if (vk.reset_fences(h.device, 1U, &frame_fence) != VK_SUCCESS) {
-            frame_recording = false;
-            return false;
-        }
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1U;
-        si.pCommandBuffers = &frame_cmd;
-        if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) != VK_SUCCESS) {
-            frame_recording = false;
-            return false;
-        }
-        if (vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL) != VK_SUCCESS) {
-            frame_recording = false;
-            return false;
-        }
-        frame_recording = false;
-        free_retired();
+        if (!submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, true)) return false;
 
         if (rb_ok) {
             alloc.invalidate(readback_mem, 0U, rb_bytes);
@@ -1948,7 +1975,15 @@ struct VulkanD3d9Backend::Impl {
             teardown_android_presentation_locked();
 #endif
             save_pipeline_cache();
-            free_retired();
+            stash_slot();
+            for (FrameSlot& s : slots) {
+                for (RetiredBuf& rb : s.retired) {
+                    if (rb.buf != VK_NULL_HANDLE) vk.destroy_buffer(h.device, rb.buf, nullptr);
+                    alloc.free(rb.mem);
+                }
+                s.retired.clear();
+                s.in_flight = false;
+            }
 
             for (auto& [k, pip] : pipeline_cache_map) {
                 (void)k;
@@ -2009,13 +2044,16 @@ struct VulkanD3d9Backend::Impl {
 
             for (auto& [id, buf] : buffers) {
                 (void)id;
-                if (buf.vk_buf != VK_NULL_HANDLE) vk.destroy_buffer(h.device, buf.vk_buf, nullptr);
-                alloc.free(buf.vk_mem);
+                destroy_buffer_gpu(buf);
             }
             buffers.clear();
 
-            destroy_ring(ubo_ring);
-            destroy_ring(dyn_geom_ring);
+            for (FrameSlot& s : slots) {
+                destroy_ring(s.ubo);
+                destroy_ring(s.geom);
+                destroy_ring(s.stage);
+                s.ubo_set = VK_NULL_HANDLE;
+            }
             if (staging_buf != VK_NULL_HANDLE) {
                 vk.destroy_buffer(h.device, staging_buf, nullptr);
                 staging_buf = VK_NULL_HANDLE;
@@ -2045,18 +2083,22 @@ struct VulkanD3d9Backend::Impl {
                 vk.destroy_fence(h.device, upload_fence, nullptr);
                 upload_fence = VK_NULL_HANDLE;
             }
-            if (frame_fence != VK_NULL_HANDLE) {
-                vk.destroy_fence(h.device, frame_fence, nullptr);
-                frame_fence = VK_NULL_HANDLE;
+            for (FrameSlot& s : slots) {
+                if (s.fence != VK_NULL_HANDLE) vk.destroy_fence(h.device, s.fence, nullptr);
+                s.fence = VK_NULL_HANDLE;
             }
             if (h.command_pool != VK_NULL_HANDLE) {
-                std::array<VkCommandBuffer, 2> cbs{};
-                std::uint32_t cnt = 0;
-                if (upload_cmd != VK_NULL_HANDLE) cbs[cnt++] = upload_cmd;
-                if (frame_cmd != VK_NULL_HANDLE) cbs[cnt++] = frame_cmd;
-                if (cnt > 0) vk.free_cmd_buffers(h.device, h.command_pool, cnt, cbs.data());
-                upload_cmd = frame_cmd = VK_NULL_HANDLE;
+                std::vector<VkCommandBuffer> cbs;
+                if (upload_cmd != VK_NULL_HANDLE) cbs.push_back(upload_cmd);
+                for (FrameSlot& s : slots) {
+                    if (s.cmd != VK_NULL_HANDLE) cbs.push_back(s.cmd);
+                    if (s.up_cmd != VK_NULL_HANDLE) cbs.push_back(s.up_cmd);
+                    s.cmd = s.up_cmd = VK_NULL_HANDLE;
+                }
+                if (!cbs.empty()) vk.free_cmd_buffers(h.device, h.command_pool, static_cast<std::uint32_t>(cbs.size()), cbs.data());
+                upload_cmd = VK_NULL_HANDLE;
             }
+            load_slot();  // all null now
             alloc.release_all();
         }
         gpu_ready = false;
@@ -2079,6 +2121,223 @@ struct VulkanD3d9Backend::Impl {
             alloc.free(rb.mem);
         }
         retired_bufs.clear();
+    }
+
+    void destroy_buffer_gpu(BufferObj& b) noexcept {
+        if (b.vk_buf != VK_NULL_HANDLE) vk.destroy_buffer(h.device, b.vk_buf, nullptr);
+        b.vk_buf = VK_NULL_HANDLE;
+        alloc.free(b.vk_mem);
+        for (BufferObj::DynInst& d : b.insts) {
+            if (d.buf != VK_NULL_HANDLE) vk.destroy_buffer(h.device, d.buf, nullptr);
+            alloc.free(d.mem);
+        }
+        b.insts.clear();
+        b.cur = -1;
+    }
+
+    // --- frames in flight ------------------------------------------------------------------------
+    void stash_slot() {
+        FrameSlot& s = slots[cur_slot];
+        s.cmd = frame_cmd;
+        s.up_cmd = up_cmd;
+        s.fence = frame_fence;
+        s.in_flight = frame_in_flight;
+        s.fence_frame = fence_frame;
+        s.ubo = ubo_ring;
+        s.geom = dyn_geom_ring;
+        s.stage = stage_ring;
+        s.ubo_set = ubo_desc_set;
+        s.retired = std::move(retired_bufs);
+        retired_bufs.clear();
+    }
+    void load_slot() {
+        FrameSlot& s = slots[cur_slot];
+        frame_cmd = s.cmd;
+        up_cmd = s.up_cmd;
+        frame_fence = s.fence;
+        frame_in_flight = s.in_flight;
+        fence_frame = s.fence_frame;
+        ubo_ring = s.ubo;
+        dyn_geom_ring = s.geom;
+        stage_ring = s.stage;
+        ubo_desc_set = s.ubo_set;
+        retired_bufs = std::move(s.retired);
+        s.retired.clear();
+    }
+    // Waits for the current slot's last submit and frees what it retired.
+    void wait_current_slot() {
+        if (frame_in_flight) {
+            (void)vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL);
+            frame_in_flight = false;
+            completed_frame = std::max(completed_frame, fence_frame);
+        }
+        free_retired();
+    }
+    // Ends and submits the current slot's uploads and frame commands (uploads first), signalling
+    // `frame_fence`. `wait`: block until they finish (readback, mid-frame flush).
+    bool submit_frame_locked(VkSemaphore wait_sem, VkPipelineStageFlags wait_stage, VkSemaphore signal_sem, bool wait) {
+        std::array<VkCommandBuffer, 2> cbs{};
+        std::uint32_t n = 0;
+        if (up_recording) {
+            up_recording = false;
+            if (vk.end_cmd_buffer(up_cmd) == VK_SUCCESS) cbs[n++] = up_cmd;
+        }
+        if (frame_recording) {
+            if (render_pass_active) {
+                vk.cmd_end_render_pass(frame_cmd);
+                render_pass_active = false;
+            }
+            frame_recording = false;
+            if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) return false;
+            cbs[n++] = frame_cmd;
+        }
+        if (n == 0U && wait_sem == VK_NULL_HANDLE && signal_sem == VK_NULL_HANDLE) return true;
+        if (frame_in_flight) wait_current_slot();  // a mid-frame flush may have left it pending
+        if (vk.reset_fences(h.device, 1U, &frame_fence) != VK_SUCCESS) return false;
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        if (wait_sem != VK_NULL_HANDLE) {
+            si.waitSemaphoreCount = 1U;
+            si.pWaitSemaphores = &wait_sem;
+            si.pWaitDstStageMask = &wait_stage;
+        }
+        si.commandBufferCount = n;
+        si.pCommandBuffers = cbs.data();
+        if (signal_sem != VK_NULL_HANDLE) {
+            si.signalSemaphoreCount = 1U;
+            si.pSignalSemaphores = &signal_sem;
+        }
+        if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) != VK_SUCCESS) return false;
+        frame_in_flight = true;
+        fence_frame = frame_index;
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_sampler_set = VK_NULL_HANDLE;
+        if (wait) wait_current_slot();
+        return true;
+    }
+    // After a present: park this slot, take the next one and wait for its previous frame (the
+    // frame before this one), so at most `kFramesInFlight` frames are queued.
+    void advance_frame_slot() {
+        // A present that returned early (no swapchain image) leaves commands recorded: submit them,
+        // since recording state is not parked with the slot.
+        if (frame_recording || up_recording) (void)submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, false);
+        stash_slot();
+        cur_slot = (cur_slot + 1U) % kFramesInFlight;
+        load_slot();
+        wait_current_slot();
+        ubo_ring.cursor = 0U;
+        dyn_geom_ring.cursor = 0U;
+        stage_ring.cursor = 0U;
+    }
+    // Waits until the GPU has finished everything (before destroying or replacing a resource that
+    // a queued frame may still read). Rare: object destruction and device reset.
+    void wait_all_locked() {
+        flush_frame_if_recording();
+        for (std::size_t i = 0; i < kFramesInFlight; ++i) {
+            if (i == cur_slot) continue;
+            FrameSlot& s = slots[i];
+            if (s.in_flight) {
+                (void)vk.wait_for_fences(h.device, 1U, &s.fence, VK_TRUE, 10'000'000'000ULL);
+                s.in_flight = false;
+                completed_frame = std::max(completed_frame, s.fence_frame);
+            }
+            for (RetiredBuf& rb : s.retired) {
+                if (rb.buf != VK_NULL_HANDLE) vk.destroy_buffer(h.device, rb.buf, nullptr);
+                alloc.free(rb.mem);
+            }
+            s.retired.clear();
+        }
+        wait_current_slot();
+    }
+
+    // --- uploads without stalls ----------------------------------------------------------------
+    // Copies `bytes` into the current slot's staging ring. Call before `begin_upload_locked`: a
+    // full ring first waits for the frame so far.
+    bool stage_bytes(std::span<const std::uint8_t> bytes, VkBuffer& out_buf, VkDeviceSize& out_off) {
+        const VkDeviceSize aligned = align_up(std::max<VkDeviceSize>(bytes.size(), 16U), 16U);
+        if (stage_ring.cursor + aligned > stage_ring.cap) {
+            if (stage_ring.cap >= kStagingFlushBytes && stage_ring.cursor > 0U) {
+                flush_frame_if_recording();  // the staged copies are done: reuse the ring
+                stage_ring.cursor = 0U;
+            }
+            if (stage_ring.cursor + aligned > stage_ring.cap) {
+                const VkDeviceSize cap = std::max(stage_ring.cap * 2U, align_up(aligned + stage_ring.cursor, kInitialStagingBytes));
+                RingBuf next{};
+                if (!create_host_ring(next, cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &last_error)) return false;
+                if (stage_ring.buf != VK_NULL_HANDLE) retired_bufs.push_back({stage_ring.buf, stage_ring.mem});
+                stage_ring = next;
+            }
+        }
+        out_buf = stage_ring.buf;
+        out_off = stage_ring.cursor;
+        std::memcpy(static_cast<std::uint8_t*>(stage_ring.mem.mapped) + out_off, bytes.data(), bytes.size());
+        alloc.flush(stage_ring.mem, out_off, bytes.size());
+        stage_ring.cursor += aligned;
+        return true;
+    }
+    // The command buffer an upload records into: the slot's upload buffer, submitted just before
+    // this frame's draws, when no draw of this frame has read the resource yet; else the frame's
+    // own commands at this point (outside the render pass), so earlier draws keep the old data.
+    VkCommandBuffer begin_upload_locked(bool used_this_frame) {
+        if (!ensure_frame_recording()) return VK_NULL_HANDLE;
+        if (used_this_frame) {
+            if (render_pass_active) {
+                vk.cmd_end_render_pass(frame_cmd);
+                render_pass_active = false;
+                bound_pipeline = VK_NULL_HANDLE;
+                bound_sampler_set = VK_NULL_HANDLE;
+            }
+            return frame_cmd;
+        }
+        if (!up_recording) {
+            if (vk.reset_cmd_buffer(up_cmd, 0U) != VK_SUCCESS) return VK_NULL_HANDLE;
+            VkCommandBufferBeginInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            if (vk.begin_cmd_buffer(up_cmd, &bi) != VK_SUCCESS) return VK_NULL_HANDLE;
+            up_recording = true;
+        }
+        return up_cmd;
+    }
+    // Replacing an existing image: queued frames may still sample it, and cached sampler sets
+    // name its view.
+    void retire_texture_image_locked(TextureObj& t) {
+        if (t.img == VK_NULL_HANDLE) return;
+        wait_all_locked();
+        sampler_set_cache.clear();
+        for (VkDescriptorPool p : sampler_desc_pools) (void)vk.reset_desc_pool(h.device, p, 0U);
+        destroy_texture_gpu(t);
+    }
+
+    // --- dynamic buffers ---------------------------------------------------------------------
+    [[nodiscard]] bool dyn_busy(const BufferObj::DynInst& d) const noexcept {
+        return d.last_used != 0U && (d.last_used == frame_index || d.last_used > completed_frame);
+    }
+    // A copy no queued frame reads (a new one when all are busy). -1 on failure.
+    int dyn_acquire(BufferObj& b) {
+        for (int pass = 0; pass < 2; ++pass) {
+            for (std::size_t i = 0; i < b.insts.size(); ++i) {
+                if (static_cast<int>(i) != b.cur && !dyn_busy(b.insts[i])) return static_cast<int>(i);
+            }
+            if (b.insts.size() < kMaxDynInstances) break;
+            wait_all_locked();  // rare: very many discards in flight
+        }
+        if (b.insts.size() >= kMaxDynInstances) return -1;
+        RingBuf r{};
+        if (!create_host_ring(r, std::max<VkDeviceSize>(b.size, 16U),
+                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &last_error)) {
+            return -1;
+        }
+        b.insts.push_back({r.buf, r.mem, 0U});
+        return static_cast<int>(b.insts.size() - 1U);
+    }
+    void dyn_write(BufferObj& b, BufferObj::DynInst& d, std::size_t off, std::size_t n) {
+        if (off >= b.shadow.size() || d.mem.mapped == nullptr) return;
+        n = std::min(n, b.shadow.size() - off);
+        n = std::min<std::size_t>(n, std::max<std::size_t>(b.size, 16U) - std::min<std::size_t>(off, b.size));
+        if (n == 0U) return;
+        std::memcpy(static_cast<std::uint8_t*>(d.mem.mapped) + off, b.shadow.data() + off, n);
+        alloc.flush(d.mem, off, n);
     }
 
     void destroy_dummy_tex(DummyTex& d) noexcept {
@@ -2282,7 +2541,7 @@ struct VulkanD3d9Backend::Impl {
         return true;
     }
 
-    bool bind_ubo_desc_set(VkBuffer ubo_buf, std::string* err = nullptr) {
+    bool bind_ubo_desc_set(VkBuffer ubo_buf, VkDescriptorSet& out_set, std::string* err = nullptr) {
         VkDescriptorSetAllocateInfo ai{};
         ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         ai.descriptorPool = ubo_desc_pool;
@@ -2307,7 +2566,7 @@ struct VulkanD3d9Backend::Impl {
             w[i].pBufferInfo = &bi;
         }
         vk.update_desc_sets(h.device, 2U, w.data(), 0U, nullptr);
-        ubo_desc_set = ds;
+        out_set = ds;
         return true;
     }
 
@@ -2319,7 +2578,7 @@ struct VulkanD3d9Backend::Impl {
             if (!create_host_ring(next, new_cap, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &last_error)) return false;
             if (ubo_ring.buf != VK_NULL_HANDLE) retired_bufs.push_back({ubo_ring.buf, ubo_ring.mem});
             ubo_ring = next;
-            if (!bind_ubo_desc_set(ubo_ring.buf, &last_error)) return false;
+            if (!bind_ubo_desc_set(ubo_ring.buf, ubo_desc_set, &last_error)) return false;
         }
         vs_off = ubo_ring.cursor;
         ps_off = ubo_ring.cursor + ubo_stride;
@@ -2719,6 +2978,28 @@ struct VulkanD3d9Backend::Impl {
                 shutdown();
                 return false;
             }
+            // Slot 0 is the current one (`frame_cmd`/`frame_fence` above); the rest are parked.
+            cbai.commandBufferCount = 1U;
+            if (vk.allocate_cmd_buffers(h.device, &cbai, &up_cmd) != VK_SUCCESS) {
+                report.error = "vkAllocateCommandBuffers failed";
+                set_err(err, report.error);
+                shutdown();
+                return false;
+            }
+            for (std::size_t i = 1; i < kFramesInFlight; ++i) {
+                FrameSlot& s = slots[i];
+                VkCommandBuffer two[2]{};
+                cbai.commandBufferCount = 2U;
+                if (vk.allocate_cmd_buffers(h.device, &cbai, two) != VK_SUCCESS ||
+                    vk.create_fence(h.device, &fci, nullptr, &s.fence) != VK_SUCCESS) {
+                    report.error = "frame slot allocation failed";
+                    set_err(err, report.error);
+                    shutdown();
+                    return false;
+                }
+                s.cmd = two[0];
+                s.up_cmd = two[1];
+            }
         }
 
         load_pipeline_cache();
@@ -2784,10 +3065,18 @@ struct VulkanD3d9Backend::Impl {
             }
         }
 
-        if (!create_host_ring(ubo_ring, kInitialUboRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, err) ||
-            !bind_ubo_desc_set(ubo_ring.buf, err) ||
-            !create_host_ring(dyn_geom_ring, kInitialDynGeomBytes,
-                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, err)) {
+        bool rings_ok = create_host_ring(ubo_ring, kInitialUboRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, err) &&
+                        bind_ubo_desc_set(ubo_ring.buf, ubo_desc_set, err) &&
+                        create_host_ring(dyn_geom_ring, kInitialDynGeomBytes,
+                                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, err);
+        for (std::size_t i = 1; rings_ok && i < kFramesInFlight; ++i) {
+            FrameSlot& s = slots[i];
+            rings_ok = create_host_ring(s.ubo, kInitialUboRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, err) &&
+                       bind_ubo_desc_set(s.ubo.buf, s.ubo_set, err) &&
+                       create_host_ring(s.geom, kInitialDynGeomBytes,
+                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, err);
+        }
+        if (!rings_ok) {
             report.error = err != nullptr ? *err : "ring allocation failed";
             shutdown();
             return false;
@@ -2885,6 +3174,7 @@ struct VulkanD3d9Backend::Impl {
             VkSampler smp = default_sampler;
             if (need_dim != 0 && st.textures[i] != 0) {
                 const auto tit = textures.find(st.textures[i]);
+                if (tit != textures.end()) tit->second.last_used_frame = frame_index;
                 if (tit != textures.end() && tit->second.view != VK_NULL_HANDLE) {
                     const bool kind_match = (need_dim == 3 && tit->second.kind == 1) ||
                                             (need_dim == 4 && tit->second.kind == 2) ||
@@ -2944,27 +3234,11 @@ struct VulkanD3d9Backend::Impl {
         return ds;
     }
 
+    // Submits what this frame has recorded so far and waits for it (rare since the 2026-11-22
+    // pass: object destruction, window changes, a full staging ring).
     void flush_frame_if_recording() {
-        if (!gpu_ready || !frame_recording) return;
-        if (render_pass_active) {
-            vk.cmd_end_render_pass(frame_cmd);
-            render_pass_active = false;
-        }
-        if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) {
-            frame_recording = false;
-            return;
-        }
-        (void)vk.reset_fences(h.device, 1U, &frame_fence);
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1U;
-        si.pCommandBuffers = &frame_cmd;
-        if (vk.queue_submit(h.graphics_queue, 1U, &si, frame_fence) == VK_SUCCESS) {
-            (void)vk.wait_for_fences(h.device, 1U, &frame_fence, VK_TRUE, 10'000'000'000ULL);
-        }
-        frame_recording = false;
-        bound_pipeline = VK_NULL_HANDLE;
-        bound_sampler_set = VK_NULL_HANDLE;
+        if (!gpu_ready || (!frame_recording && !up_recording)) return;
+        (void)submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, true);
     }
 
     bool ensure_frame_recording() {
@@ -3018,7 +3292,7 @@ struct VulkanD3d9Backend::Impl {
 
     void upload_static_buffer(BufferObj& b) {
         if (!gpu_ready || b.shadow.empty()) return;
-        flush_frame_if_recording();
+        const bool fresh = (b.vk_buf == VK_NULL_HANDLE);
         if (b.vk_buf == VK_NULL_HANDLE) {
             VkBufferCreateInfo bi{};
             bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -3037,20 +3311,35 @@ struct VulkanD3d9Backend::Impl {
                 return;
             }
         }
-        if (!ensure_staging(b.shadow.size(), &last_error)) return;
-        std::memcpy(staging_mem.mapped, b.shadow.data(), b.shadow.size());
-        alloc.flush(staging_mem, 0, b.shadow.size());
-
-        (void)vk.reset_cmd_buffer(upload_cmd, 0U);
-        VkCommandBufferBeginInfo bi{};
-        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vk.begin_cmd_buffer(upload_cmd, &bi) != VK_SUCCESS) return;
-        VkBufferCopy cpy{0U, 0U, b.shadow.size()};
-        vk.cmd_copy_buffer(upload_cmd, staging_buf, b.vk_buf, 1U, &cpy);
-        if (vk.end_cmd_buffer(upload_cmd) != VK_SUCCESS) return;
-        (void)submit_upload(upload_cmd, &last_error);
+        // Only the bytes changed since the last upload, recorded without waiting for the GPU.
+        std::size_t lo = fresh ? 0U : std::min(b.dirty_lo, b.shadow.size());
+        std::size_t hi = fresh ? b.shadow.size() : std::min(b.dirty_hi, b.shadow.size());
+        if (hi <= lo) {
+            b.dirty = false;
+            return;
+        }
+        VkBuffer sbuf = VK_NULL_HANDLE;
+        VkDeviceSize soff = 0;
+        if (!stage_bytes(std::span<const std::uint8_t>(b.shadow.data() + lo, hi - lo), sbuf, soff)) return;
+        const VkCommandBuffer cmd = begin_upload_locked(b.last_used_frame == frame_index);
+        if (cmd == VK_NULL_HANDLE) return;
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        if (!fresh) {  // queued draws may still read the old bytes
+            mb.srcAccessMask = 0U;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vk.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 1U, &mb,
+                                    0U, nullptr, 0U, nullptr);
+        }
+        VkBufferCopy cpy{soff, lo, hi - lo};
+        vk.cmd_copy_buffer(cmd, sbuf, b.vk_buf, 1U, &cpy);
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+        vk.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0U, 1U, &mb,
+                                0U, nullptr, 0U, nullptr);
         b.dirty = false;
+        b.dirty_lo = SIZE_MAX;
+        b.dirty_hi = 0U;
     }
 
     bool resolve_buffer_for_draw(std::uint64_t id, VkBuffer& out_buf, VkDeviceSize& out_off, bool& out_index32) {
@@ -3059,25 +3348,23 @@ struct VulkanD3d9Backend::Impl {
         BufferObj& b = it->second;
         out_index32 = b.is_index32;
         if (b.dynamic) {
-            if (b.dirty || b.dyn_frame != frame_index || b.dyn_buf == VK_NULL_HANDLE) {
-                if (b.shadow.empty()) return false;
-                VkBuffer rbuf = VK_NULL_HANDLE;
-                VkDeviceSize roff = 0;
-                if (!alloc_dyn_geom(b.shadow.size(), rbuf, roff)) return false;
-                std::memcpy(static_cast<std::uint8_t*>(dyn_geom_ring.mem.mapped) + roff,
-                            b.shadow.data(), b.shadow.size());
-                alloc.flush(dyn_geom_ring.mem, roff, b.shadow.size());
-                b.dyn_buf = rbuf;
-                b.dyn_off = roff;
-                b.dyn_frame = frame_index;
-                b.dirty = false;
+            if (b.shadow.empty()) return false;
+            if (b.cur < 0) {  // first draw, or a rename that could not get a copy
+                const int ni = dyn_acquire(b);
+                if (ni < 0) return false;
+                b.cur = ni;
+                dyn_write(b, b.insts[static_cast<std::size_t>(ni)], 0U, b.shadow.size());
             }
-            out_buf = b.dyn_buf;
-            out_off = b.dyn_off;
+            BufferObj::DynInst& d = b.insts[static_cast<std::size_t>(b.cur)];
+            d.last_used = frame_index;
+            b.dirty = false;
+            out_buf = d.buf;
+            out_off = 0U;
             return true;
         }
         if (b.dirty || b.vk_buf == VK_NULL_HANDLE) upload_static_buffer(b);
         if (b.vk_buf == VK_NULL_HANDLE) return false;
+        b.last_used_frame = frame_index;
         out_buf = b.vk_buf;
         out_off = 0U;
         return true;
@@ -3552,10 +3839,9 @@ void VulkanD3d9Backend::create_buffer(std::uint64_t id, bool is_index, std::uint
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto old = impl_->buffers.find(id);
     if (old != impl_->buffers.end()) {
-        if (impl_->gpu_ready && old->second.vk_buf != VK_NULL_HANDLE) {
-            impl_->flush_frame_if_recording();
-            impl_->vk.destroy_buffer(impl_->h.device, old->second.vk_buf, nullptr);
-            impl_->alloc.free(old->second.vk_mem);
+        if (impl_->gpu_ready && (old->second.vk_buf != VK_NULL_HANDLE || !old->second.insts.empty())) {
+            impl_->wait_all_locked();
+            impl_->destroy_buffer_gpu(old->second);
         }
         impl_->buffers.erase(old);
     }
@@ -3570,8 +3856,7 @@ void VulkanD3d9Backend::create_buffer(std::uint64_t id, bool is_index, std::uint
 }
 
 void VulkanD3d9Backend::update_buffer(std::uint64_t id, std::uint32_t offset,
-                                      std::span<const std::uint8_t> bytes, bool discard) {
-    (void)discard;
+                                      std::span<const std::uint8_t> bytes, std::uint32_t lock_flags) {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto it = impl_->buffers.find(id);
     if (it == impl_->buffers.end() || bytes.empty()) return;
@@ -3579,17 +3864,41 @@ void VulkanD3d9Backend::update_buffer(std::uint64_t id, std::uint32_t offset,
     const std::size_t end = static_cast<std::size_t>(offset) + bytes.size();
     if (b.shadow.size() < end) b.shadow.resize(end, 0U);
     std::memcpy(b.shadow.data() + offset, bytes.data(), bytes.size());
-    b.dirty = true;
+    if (!b.dynamic) {
+        b.dirty = true;
+        b.dirty_lo = std::min<std::size_t>(b.dirty_lo, offset);
+        b.dirty_hi = std::max(b.dirty_hi, end);
+        return;
+    }
+    // Dynamic: copy only what changed into a GPU-visible copy now, as a D3D9 driver would.
+    if (!impl_->gpu_ready || b.cur < 0) return;  // the next draw copies the whole buffer
+    Impl::BufferObj::DynInst& d = b.insts[static_cast<std::size_t>(b.cur)];
+    if ((lock_flags & kLockNoOverwrite) != 0U || !impl_->dyn_busy(d)) {
+        // NOOVERWRITE: the game promises queued draws do not read these bytes.
+        impl_->dyn_write(b, d, offset, bytes.size());
+        return;
+    }
+    const int ni = impl_->dyn_acquire(b);
+    if (ni < 0) {
+        b.cur = -1;
+        return;
+    }
+    b.cur = ni;
+    Impl::BufferObj::DynInst& fresh = b.insts[static_cast<std::size_t>(ni)];
+    if ((lock_flags & kLockDiscard) != 0U) {
+        impl_->dyn_write(b, fresh, offset, bytes.size());  // a discarded buffer's other bytes are undefined
+    } else {
+        impl_->dyn_write(b, fresh, 0U, b.shadow.size());
+    }
 }
 
 void VulkanD3d9Backend::destroy_buffer(std::uint64_t id) {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto it = impl_->buffers.find(id);
     if (it == impl_->buffers.end()) return;
-    if (impl_->gpu_ready && it->second.vk_buf != VK_NULL_HANDLE) {
-        impl_->flush_frame_if_recording();
-        impl_->vk.destroy_buffer(impl_->h.device, it->second.vk_buf, nullptr);
-        impl_->alloc.free(it->second.vk_mem);
+    if (impl_->gpu_ready && (it->second.vk_buf != VK_NULL_HANDLE || !it->second.insts.empty())) {
+        impl_->wait_all_locked();
+        impl_->destroy_buffer_gpu(it->second);
     }
     impl_->buffers.erase(it);
 }
@@ -3600,15 +3909,7 @@ void VulkanD3d9Backend::create_texture(std::uint64_t id, int kind, std::uint32_t
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto old = impl_->textures.find(id);
     if (old != impl_->textures.end()) {
-        if (impl_->gpu_ready && old->second.img != VK_NULL_HANDLE) {
-            impl_->flush_frame_if_recording();
-            if (impl_->vk.device_wait_idle != nullptr) (void)impl_->vk.device_wait_idle(impl_->h.device);
-            impl_->sampler_set_cache.clear();
-            for (VkDescriptorPool p : impl_->sampler_desc_pools) {
-                (void)impl_->vk.reset_desc_pool(impl_->h.device, p, 0U);
-            }
-            impl_->destroy_texture_gpu(old->second);
-        }
+        if (impl_->gpu_ready) impl_->retire_texture_image_locked(old->second);
         impl_->textures.erase(old);
     }
     Impl::TextureObj t{};
@@ -3633,7 +3934,6 @@ void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t fac
     const std::uint32_t layers = (t.kind == 1) ? 6U : 1U;
     if (face >= layers) return;
 
-    impl_->flush_frame_if_recording();
     const bool use_bc = impl_->config.prefer_bc_compression && impl_->report.texture_compression_bc &&
                         is_dxt_d3dfmt(t.d3d_fmt);
     const VkFormat vk_fmt = use_bc ? dxt_d3dfmt_to_vk(t.d3d_fmt) : VK_FORMAT_R8G8B8A8_UNORM;
@@ -3649,15 +3949,12 @@ void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t fac
         convert_d3d9_level_to_rgba8(t.d3d_fmt, lw, lh, bytes, row_pitch, conv);
         payload = conv;
     }
-    if (payload.empty() || !impl_->ensure_staging(payload.size(), &impl_->last_error)) return;
-    std::memcpy(impl_->staging_mem.mapped, payload.data(), payload.size());
-    impl_->alloc.flush(impl_->staging_mem, 0, payload.size());
-
-    (void)impl_->vk.reset_cmd_buffer(impl_->upload_cmd, 0U);
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (impl_->vk.begin_cmd_buffer(impl_->upload_cmd, &bi) != VK_SUCCESS) return;
+    VkBuffer sbuf = VK_NULL_HANDLE;
+    VkDeviceSize soff = 0;
+    if (payload.empty() || !impl_->stage_bytes(payload, sbuf, soff)) return;
+    // Recorded with this frame (no wait): before its draws unless one already sampled the texture.
+    const VkCommandBuffer cmd = impl_->begin_upload_locked(t.last_used_frame == impl_->frame_index);
+    if (cmd == VK_NULL_HANDLE) return;
 
     VkImageMemoryBarrier bar{};
     bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -3667,31 +3964,28 @@ void VulkanD3d9Backend::upload_texture_level(std::uint64_t id, std::uint32_t fac
     bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     bar.image = t.img;
     bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, t.levels, 0U, layers};
-    bar.srcAccessMask = (t.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) ? VK_ACCESS_SHADER_READ_BIT : 0U;
+    bar.srcAccessMask = 0U;  // write-after-read: an execution dependency is enough
     bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    impl_->vk.cmd_pipeline_barrier(impl_->upload_cmd,
+    impl_->vk.cmd_pipeline_barrier(cmd,
                                    (t.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                                       ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                       ? (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
                                        : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
 
     VkBufferImageCopy cpy{};
+    cpy.bufferOffset = soff;
     cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, face, 1U};
     cpy.imageExtent = {lw, lh, 1U};
-    impl_->vk.cmd_copy_buffer_to_image(impl_->upload_cmd, impl_->staging_buf, t.img,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &cpy);
+    impl_->vk.cmd_copy_buffer_to_image(cmd, sbuf, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &cpy);
 
     bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    impl_->vk.cmd_pipeline_barrier(impl_->upload_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    impl_->vk.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                    0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
-    if (impl_->vk.end_cmd_buffer(impl_->upload_cmd) != VK_SUCCESS) return;
-    if (impl_->submit_upload(impl_->upload_cmd, &impl_->last_error)) {
-        t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
+    t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std::uint8_t> dds_bytes) {
@@ -3708,7 +4002,6 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
         return;
     }
 
-    impl_->flush_frame_if_recording();
     const int kind = (view.is_cubemap && view.face_count >= 6U) ? 1 : 0;
     const std::uint32_t layers = (kind == 1) ? 6U : 1U;
     const VkFormat bc_fmt = dds_bc_to_vk(view.format);
@@ -3726,6 +4019,7 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
     const VkFormat vk_fmt = use_bc ? bc_fmt : VK_FORMAT_R8G8B8A8_UNORM;
 
     Impl::TextureObj& t = it->second;
+    impl_->retire_texture_image_locked(t);  // a new image replaces one queued frames may sample
     std::uint32_t out_w = std::max<std::uint32_t>(1U, view.width >> first_mip);
     std::uint32_t out_h = std::max<std::uint32_t>(1U, view.height >> first_mip);
     std::uint32_t out_levels = view.mip_count - first_mip;
@@ -3771,15 +4065,13 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
             copies.push_back(cpy);
         }
     }
-    if (copies.empty() || !impl_->ensure_staging(packed.size(), &impl_->last_error)) return;
-    std::memcpy(impl_->staging_mem.mapped, packed.data(), packed.size());
-    impl_->alloc.flush(impl_->staging_mem, 0, packed.size());
-
-    (void)impl_->vk.reset_cmd_buffer(impl_->upload_cmd, 0U);
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (impl_->vk.begin_cmd_buffer(impl_->upload_cmd, &bi) != VK_SUCCESS) return;
+    VkBuffer sbuf = VK_NULL_HANDLE;
+    VkDeviceSize soff = 0;
+    if (copies.empty() || !impl_->stage_bytes(packed, sbuf, soff)) return;
+    for (VkBufferImageCopy& c : copies) c.bufferOffset += soff;
+    // A new image: no draw of this frame can have sampled it, so it goes before the draws.
+    const VkCommandBuffer cmd = impl_->begin_upload_locked(false);
+    if (cmd == VK_NULL_HANDLE) return;
 
     VkImageMemoryBarrier bar{};
     bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -3790,38 +4082,26 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
     bar.image = t.img;
     bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, out_levels, 0U, layers};
     bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    impl_->vk.cmd_pipeline_barrier(impl_->upload_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    impl_->vk.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
-    impl_->vk.cmd_copy_buffer_to_image(impl_->upload_cmd, impl_->staging_buf, t.img,
-                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    impl_->vk.cmd_copy_buffer_to_image(cmd, sbuf, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                        static_cast<std::uint32_t>(copies.size()), copies.data());
     bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    impl_->vk.cmd_pipeline_barrier(impl_->upload_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    impl_->vk.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                    0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
-    if (impl_->vk.end_cmd_buffer(impl_->upload_cmd) != VK_SUCCESS) return;
-    if (impl_->submit_upload(impl_->upload_cmd, &impl_->last_error)) {
-        t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
+    t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 void VulkanD3d9Backend::destroy_texture(std::uint64_t id) {
     const std::lock_guard<std::mutex> lock(impl_->api_mutex);
     const auto it = impl_->textures.find(id);
     if (it == impl_->textures.end()) return;
-    if (impl_->gpu_ready && it->second.img != VK_NULL_HANDLE) {
-        impl_->flush_frame_if_recording();
-        if (impl_->vk.device_wait_idle != nullptr) (void)impl_->vk.device_wait_idle(impl_->h.device);
-        // Clear descriptor set cache so no set references the destroyed VkImageView.
-        impl_->sampler_set_cache.clear();
-        for (VkDescriptorPool p : impl_->sampler_desc_pools) {
-            (void)impl_->vk.reset_desc_pool(impl_->h.device, p, 0U);
-        }
-        impl_->destroy_texture_gpu(it->second);
-    }
+    // Waits for queued frames and clears the sampler sets that name its view.
+    if (impl_->gpu_ready) impl_->retire_texture_image_locked(it->second);
     impl_->textures.erase(it);
 }
 
@@ -4058,44 +4338,30 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
                                                    1U, &bar);
                     impl_->bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 }
-                if (impl_->vk.end_cmd_buffer(impl_->frame_cmd) != VK_SUCCESS) {
-                    impl_->frame_recording = false;
+                // No wait unless the caller wants the pixels: the next frame records meanwhile.
+                if (!impl_->submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, do_rb)) {
                     ok = false;
-                } else if (impl_->vk.reset_fences(impl_->h.device, 1U, &impl_->frame_fence) != VK_SUCCESS) {
-                    impl_->frame_recording = false;
-                    ok = false;
-                } else {
-                    VkSubmitInfo si{};
-                    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                    si.commandBufferCount = 1U;
-                    si.pCommandBuffers = &impl_->frame_cmd;
-                    if (impl_->vk.queue_submit(impl_->h.graphics_queue, 1U, &si, impl_->frame_fence) != VK_SUCCESS ||
-                        impl_->vk.wait_for_fences(impl_->h.device, 1U, &impl_->frame_fence, VK_TRUE,
-                                                  10'000'000'000ULL) != VK_SUCCESS) {
-                        impl_->frame_recording = false;
-                        ok = false;
-                    } else {
-                        impl_->frame_recording = false;
-                        impl_->free_retired();
-                        if (do_rb) {
-                            impl_->alloc.invalidate(impl_->readback_mem, 0U, rb_bytes);
-                            out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
-                            std::memcpy(out_rgba8->data(), impl_->readback_mem.mapped,
-                                        static_cast<std::size_t>(rb_bytes));
-                        }
-                    }
+                } else if (do_rb) {
+                    impl_->alloc.invalidate(impl_->readback_mem, 0U, rb_bytes);
+                    out_rgba8->resize(static_cast<std::size_t>(rb_bytes));
+                    std::memcpy(out_rgba8->data(), impl_->readback_mem.mapped, static_cast<std::size_t>(rb_bytes));
                 }
             }
+            if (!handled_present && !impl_->frame_recording && impl_->up_recording) {
+                (void)impl_->submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, false);
+            }
 
-            // Reset per-frame ring cursors after the frame fence completed.
-            impl_->ubo_ring.cursor = 0U;
-            impl_->dyn_geom_ring.cursor = 0U;
             impl_->frame_touched_rt = false;
             impl_->pending_clear_color = false;
             impl_->pending_clear_depth = false;
             impl_->bound_pipeline = VK_NULL_HANDLE;
             impl_->bound_sampler_set = VK_NULL_HANDLE;
             ++impl_->frame_index;
+            // Take the next frame slot; waits only for the frame before this one.
+            impl_->advance_frame_slot();
+#ifdef __ANDROID__
+            impl_->show_finished_ahb_locked();
+#endif
         }
 
         if (ok) {

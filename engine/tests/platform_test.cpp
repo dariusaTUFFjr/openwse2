@@ -3073,9 +3073,9 @@ void test_r5a_vulkan_d3d9_backend() {
             bk.create_shader(2, true, ps_bytes);
             bk.create_vertex_decl(3, decl);
             bk.create_buffer(4, false, sizeof(verts), false, 100);
-            bk.update_buffer(4, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)), false);
+            bk.update_buffer(4, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)), 0U);
             bk.create_buffer(5, true, sizeof(indices), false, 101);
-            bk.update_buffer(5, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)), false);
+            bk.update_buffer(5, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)), 0U);
             bk.create_texture(6, 0, 2, 2, 1, 1, 21, 0);
             bk.upload_texture_level(6, 0, 0, tex_bgra, 8);
             D3d9DrawState st;
@@ -3191,9 +3191,9 @@ void test_r5a_vulkan_d3d9_backend() {
             bk.create_shader(2, true, ps_bytes);
             bk.create_vertex_decl(3, decl);
             bk.create_buffer(4, false, sizeof(verts), true, 100);
-            bk.update_buffer(4, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)), true);
+            bk.update_buffer(4, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)), 0x2000U);
             bk.create_buffer(5, true, sizeof(indices), false, 101);
-            bk.update_buffer(5, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)), false);
+            bk.update_buffer(5, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)), 0U);
             bk.create_texture(6, 0, 2, 2, 1, 1, 21, 0);
             bk.upload_texture_level(6, 0, 0, tex_bgra, 8);
 

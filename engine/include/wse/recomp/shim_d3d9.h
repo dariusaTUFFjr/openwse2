@@ -1695,15 +1695,14 @@ inline void D3d9::build_vtables() {
                  first_call(unlock_full);
                  if (backend != nullptr) {
                      if (std::vector<std::uint8_t>* mem = bytes(o, 0); mem != nullptr && !mem->empty()) {
-                         const bool discard = (o.lock_flags & 0x2000U) != 0U;
+                         // The locked range only (a DISCARD no longer sends the whole buffer:
+                         // the game rewrites a small part of a 2.5 MB buffer per lock).
                          const std::size_t off = std::min<std::size_t>(o.lock_offset, mem->size());
                          const std::size_t cnt = (o.lock_size == 0U) ? (mem->size() - off)
                                                                      : std::min<std::size_t>(o.lock_size, mem->size() - off);
-                         if (discard) {
-                             backend->update_buffer(self, 0U, *mem, true);
-                         } else if (cnt != 0U) {
+                         if (cnt != 0U) {
                              backend->update_buffer(self, static_cast<std::uint32_t>(off),
-                                                    std::span<const std::uint8_t>(mem->data() + off, cnt), false);
+                                                    std::span<const std::uint8_t>(mem->data() + off, cnt), o.lock_flags);
                          }
                      }
                  }
