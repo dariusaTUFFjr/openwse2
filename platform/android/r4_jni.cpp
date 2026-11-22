@@ -37,6 +37,7 @@
 #include "d3d9_vulkan.h"
 #include "driver_loader.h"
 #include "saf_jni_util.h"
+#include "wse/platform/caching_vfs.h"
 #include "wse/platform/rhi.h"
 #include "wse/platform/saf_vfs.h"
 #include "wse/platform/vfs.h"
@@ -227,6 +228,9 @@ public:
     bool remove_dir(std::string_view p) override { return locked([&] { return inner_.remove_dir(p); }); }
     bool rename_file(std::string_view f, std::string_view t) override { return locked([&] { return inner_.rename_file(f, t); }); }
     bool file_size(std::string_view p, std::uint64_t& size) override { return locked([&] { return inner_.file_size(p, size); }); }
+    bool file_stamp(std::string_view p, std::uint64_t& size, std::int64_t& mtime_ms) override {
+        return locked([&] { return inner_.file_stamp(p, size, mtime_ms); });
+    }
     bool read_text(std::string_view p, std::string& out) override { return locked([&] { return inner_.read_text(p, out); }); }
 
 private:
@@ -335,6 +339,7 @@ std::chrono::steady_clock::time_point g_last_hud_tp{};
 std::atomic<bool> g_reported_driver_summary{false};
 std::atomic<bool> g_saved_menu_cache{false};
 std::atomic<bool> g_finished_report{false};
+std::atomic<wse::platform::CachingVfs*> g_install_cache{nullptr};
 
 int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir, const std::filesystem::path& work,
                        const std::string& module_name, jint jobs, jlong frames,
@@ -344,6 +349,8 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     // The install: the SAF folder (through the launcher's bridge) or a copy in app storage.
     static std::unique_ptr<wse::platform::Vfs> install_base;
     static std::unique_ptr<LockedVfs> install;
+    static std::unique_ptr<wse::platform::CachingVfs> install_cache;
+    const bool use_install_cache = copy_dir.empty();
     if (!copy_dir.empty()) {
         report("install: the copy in app storage (" + copy_dir + ")\n");
         install_base = std::make_unique<wse::platform::HostVfs>(fs::path(copy_dir));
@@ -372,18 +379,26 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
         install_base = std::move(saf);
     }
     install = std::make_unique<LockedVfs>(*install_base);
+    install_cache.reset();
+    wse::platform::Vfs* game_install = install.get();
+    if (use_install_cache) {
+        install_cache = std::make_unique<wse::platform::CachingVfs>(*install, work / "install-cache");
+        game_install = install_cache.get();
+    }
+    g_install_cache.store(install_cache.get(), std::memory_order_release);
     static wse::platform::HostVfs user(work / "user");
 
     wse::recomp::StartupOptions o;
     if (hud) hud->update("Reading the game…");
-    if (!install->read_file("mb_warband_wse2_x64.exe", o.exe) || !install->read_file("lua5164.dll", o.lua) ||
-        !install->read_file("mb_warband_wse2_x64.pdb", o.pdb)) {
+    if (!game_install->read_file("mb_warband_wse2_x64.exe", o.exe) ||
+        !game_install->read_file("lua5164.dll", o.lua) ||
+        !game_install->read_file("mb_warband_wse2_x64.pdb", o.pdb)) {
         report("setup: mb_warband_wse2_x64.exe, lua5164.dll and mb_warband_wse2_x64.pdb must be in the install's root\n"
                "RESULT setup-error\n");
         if (hud) hud->update("WSE2 isn't installed in this Warband folder.");
         return wse::recomp::kStartupSetupError;
     }
-    o.install = install.get();
+    o.install = game_install;
     o.user = &user;
     o.so_dir = (work / "so").string();
     o.module = module_name.empty() ? std::string("Native") : module_name;
@@ -631,6 +646,11 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
                                    "s files=" + format_fixed1(static_cast<double>(g_file_ns.load()) / 1e9) + "s/" +
                                    std::to_string(g_file_count.load()) + "/" +
                                    std::to_string(g_file_bytes.load() >> 20) + "MiB";
+                if (const auto* cache = g_install_cache.load(std::memory_order_acquire)) {
+                    load += " copy_hits=" + std::to_string(cache->hits()) +
+                            " copied=" + std::to_string(cache->copies()) + "/" +
+                            std::to_string(cache->copied_bytes() >> 20) + "MiB";
+                }
                 if (bk) {
                     const auto tt = bk->texture_timings();
                     load += " textures=" + format_fixed1(tt.seconds) + "s/" + std::to_string(tt.textures) + "/" +
@@ -774,4 +794,20 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
     } else {
         report("RESULT stopped-r5a 0 frames\n");
     }
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_org_wse2_android_launcher_R4Native_installCacheBytes(
+    JNIEnv* env, jclass, jstring jwork_dir) {
+    const std::string raw = jstring_to_utf8(env, jwork_dir);
+    if (raw.empty()) return 0;
+    const std::filesystem::path cache_root = std::filesystem::path(raw) / "r4" / "install-cache";
+    return static_cast<jlong>(wse::platform::CachingVfs::disk_usage(cache_root));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_org_wse2_android_launcher_R4Native_clearInstallCache(
+    JNIEnv* env, jclass, jstring jwork_dir) {
+    const std::string raw = jstring_to_utf8(env, jwork_dir);
+    if (raw.empty()) return JNI_FALSE;
+    const std::filesystem::path cache_root = std::filesystem::path(raw) / "r4" / "install-cache";
+    return wse::platform::CachingVfs::clear(cache_root) ? JNI_TRUE : JNI_FALSE;
 }

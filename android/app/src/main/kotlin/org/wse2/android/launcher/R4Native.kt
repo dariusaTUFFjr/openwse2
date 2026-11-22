@@ -64,4 +64,12 @@ object R4Native {
     // Saves the pipeline cache, detaches the surface, and flushes the final driver + FPS report.
     @JvmStatic
     external fun nativeFinishReport()
+
+    // Size in bytes of the copied game files under `<workDir>/r4/install-cache`.
+    @JvmStatic
+    external fun installCacheBytes(workDir: String): Long
+
+    // Deletes the copied game files under `<workDir>/r4/install-cache`.
+    @JvmStatic
+    external fun clearInstallCache(workDir: String): Boolean
 }

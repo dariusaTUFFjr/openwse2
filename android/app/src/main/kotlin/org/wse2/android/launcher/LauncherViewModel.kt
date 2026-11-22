@@ -194,6 +194,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     fun selectTab(tab: LauncherTab) {
         _selectedTab.value = tab
+        if (tab == LauncherTab.ADVANCED) {
+            r4Runner.refreshInstallCacheSize()
+        }
     }
 
     fun onFolderPicked(uri: Uri) {
@@ -354,6 +357,8 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     fun runR4Startup() = r4Runner.start(_installFolder.value.treeUri)
 
     fun setR4UseCopy(useCopy: Boolean) = r4Runner.setUseCopy(useCopy)
+
+    fun clearInstallCache() = r4Runner.clearInstallCache()
 
     fun dismissR4Report() = r4Runner.dismissReport()
 

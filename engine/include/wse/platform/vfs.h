@@ -26,6 +26,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -143,6 +144,15 @@ public:
         return true;
     }
 
+    // The size and last-modified time (Unix milliseconds; 0 when unknown) of a
+    // file. False when missing.
+    virtual bool file_stamp(std::string_view path,
+                            std::uint64_t& size,
+                            std::int64_t& mtime_ms) {
+        mtime_ms = 0;
+        return file_size(path, size);
+    }
+
     // Same as `read_file`, into a string. Implementations override this to
     // fill `out` directly; the default pays one extra copy.
     virtual bool read_text(std::string_view path, std::string& out) {
@@ -192,6 +202,13 @@ public:
         if (it == files_.end()) return false;
         size = it->second.data.size();
         return true;
+    }
+
+    bool file_stamp(std::string_view path,
+                    std::uint64_t& size,
+                    std::int64_t& mtime_ms) override {
+        mtime_ms = 0;
+        return file_size(path, size);
     }
 
     bool read_file(std::string_view path, std::vector<std::uint8_t>& out) override {
@@ -470,6 +487,22 @@ public:
         return true;
     }
 
+    bool file_stamp(std::string_view path,
+                    std::uint64_t& size,
+                    std::int64_t& mtime_ms) override {
+        const auto real = resolve(path, false);
+        if (!real) return false;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(*real, ec) || ec) return false;
+        const auto n = std::filesystem::file_size(*real, ec);
+        if (ec) return false;
+        const auto ftime = std::filesystem::last_write_time(*real, ec);
+        if (ec) return false;
+        size = n;
+        mtime_ms = file_time_to_unix_ms(ftime);
+        return true;
+    }
+
     bool is_dir(std::string_view path) override {
         const auto real = resolve(path, false);
         std::error_code ec;
@@ -520,6 +553,26 @@ private:
         std::fclose(file);
         if (!ok) out.clear();
         return ok;
+    }
+
+    template <typename FileTime>
+    static std::int64_t file_time_to_unix_ms(FileTime ft) {
+        if constexpr (requires { FileTime::clock::to_sys(ft); }) {
+            const auto sys_tp = FileTime::clock::to_sys(ft);
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       sys_tp.time_since_epoch())
+                .count();
+        } else {
+            static const auto epoch_offset =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()) -
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    FileTime::clock::now().time_since_epoch());
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       ft.time_since_epoch())
+                       .count() +
+                   epoch_offset.count();
+        }
     }
 
     static std::FILE* open(const std::filesystem::path& path, const char* mode) {

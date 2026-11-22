@@ -24,7 +24,8 @@ class WseSafBridge(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
             DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_SIZE
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED
         )
         return try {
             val out = ArrayList<String>()
@@ -33,6 +34,7 @@ class WseSafBridge(
                 val idxName = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 val idxMime = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
                 val idxSize = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val idxMtime = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
                 while (cursor.moveToNext()) {
                     if (idxId < 0 || idxName < 0 || cursor.isNull(idxId) || cursor.isNull(idxName)) {
                         continue
@@ -46,7 +48,12 @@ class WseSafBridge(
                     } else {
                         0L
                     }
-                    out.add("$isDir\t$size\t$docId\t$name")
+                    val mtimeMs = if (idxMtime >= 0 && !cursor.isNull(idxMtime)) {
+                        cursor.getLong(idxMtime).coerceAtLeast(0L)
+                    } else {
+                        0L
+                    }
+                    out.add("$isDir\t$size\t$docId\t$name\t$mtimeMs")
                 }
             } ?: return null
             out.toTypedArray()

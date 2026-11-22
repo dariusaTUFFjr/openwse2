@@ -34,6 +34,7 @@ struct SafChildEntry {
     std::string display_name{};
     bool is_directory = false;
     std::uint64_t size_bytes = 0;
+    std::int64_t last_modified_ms = 0;
 };
 
 // Abstract document-ID backend behind `SafVfs`.
@@ -137,6 +138,7 @@ public:
                 child.display_name,
                 child.is_directory,
                 static_cast<std::uint64_t>(child.bytes.size()),
+                child.last_modified_ms,
             });
         }
         return true;
@@ -299,6 +301,17 @@ public:
         return seed_dir(source, root_rel, "doc:0");
     }
 
+    // Sets a document's reported last-modified timestamp (Unix milliseconds) for tests.
+    [[nodiscard]] bool set_last_modified_ms(std::string_view document_id,
+                                            std::int64_t mtime_ms) {
+        const auto it = nodes_.find(std::string(document_id));
+        if (it == nodes_.end()) {
+            return false;
+        }
+        it->second.last_modified_ms = mtime_ms;
+        return true;
+    }
+
     std::size_t list_children_calls = 0;
     std::size_t read_document_calls = 0;
     std::size_t write_document_calls = 0;
@@ -327,6 +340,7 @@ private:
         std::string parent_document_id{};
         std::string display_name{};
         bool is_directory = false;
+        std::int64_t last_modified_ms = 0;
         std::vector<std::uint8_t> bytes{};
         std::vector<std::string> children{};
     };
@@ -462,6 +476,7 @@ public:
                 node.original_rel_path = child_orig_rel;
                 node.is_directory = child.is_directory;
                 node.size_bytes = child.size_bytes;
+                node.last_modified_ms = child.last_modified_ms;
                 index_.emplace(child_norm, std::move(node));
                 child_keys.push_back(child_norm);
 
@@ -488,6 +503,30 @@ public:
     [[nodiscard]] bool index_complete() const noexcept { return index_complete_; }
     [[nodiscard]] std::size_t index_file_count() const noexcept { return file_count_; }
     [[nodiscard]] std::size_t index_dir_count() const noexcept { return dir_count_; }
+
+    [[nodiscard]] bool file_size(std::string_view path, std::uint64_t& size) override {
+        std::int64_t mtime_ms = 0;
+        return file_stamp(path, size, mtime_ms);
+    }
+
+    [[nodiscard]] bool file_stamp(std::string_view path,
+                                  std::uint64_t& size,
+                                  std::int64_t& mtime_ms) override {
+        if (!index_complete_) {
+            return false;
+        }
+        const auto key = normalize_path(path);
+        if (!key || key->empty()) {
+            return false;
+        }
+        const auto it = index_.find(*key);
+        if (it == index_.end() || it->second.is_directory) {
+            return false;
+        }
+        size = it->second.size_bytes;
+        mtime_ms = it->second.last_modified_ms;
+        return true;
+    }
 
     [[nodiscard]] bool read_file(std::string_view path, std::vector<std::uint8_t>& out) override {
         out.clear();
@@ -875,6 +914,7 @@ private:
         std::string original_rel_path{};
         bool is_directory = false;
         std::uint64_t size_bytes = 0;
+        std::int64_t last_modified_ms = 0;
         std::vector<std::string> children_keys{};
     };
 

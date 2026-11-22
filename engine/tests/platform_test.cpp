@@ -3,6 +3,7 @@
 // Build/run: see AGENTS.md section 2 (CMake/CTest or the shell loop).
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -10,12 +11,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if __has_include("driver_loader.h")
@@ -26,9 +31,16 @@
 #include "../../platform/vulkan/d3d9_vulkan.h"
 #endif
 
+#if __has_include("saf_jni_util.h")
+#include "saf_jni_util.h"
+#else
+#include "../../platform/android/saf_jni_util.h"
+#endif
+
 #include "wse/asset/shader.h"
 #include "wse/asset/shader_compiler.h"
 #include "wse/io/text_stream.h"
+#include "wse/platform/caching_vfs.h"
 #include "wse/platform/clock.h"
 #include "wse/platform/log.h"
 #include "wse/platform/driver_package.h"
@@ -3337,6 +3349,343 @@ void test_r5a_vulkan_d3d9_backend() {
     }
 }
 
+void test_r5b_caching_vfs_and_stamps() {
+    using namespace wse::platform;
+    namespace fs = std::filesystem;
+
+    // 1. parse_child_record: old (4-field) and new (5-field) formats.
+    {
+        SafChildEntry old_entry{};
+        old_entry.last_modified_ms = 999;
+        expect(android_jni::parse_child_record("0\t1234\tdoc:42\tscripts.txt", old_entry) &&
+                   !old_entry.is_directory && old_entry.size_bytes == 1234U &&
+                   old_entry.document_id == "doc:42" && old_entry.display_name == "scripts.txt" &&
+                   old_entry.last_modified_ms == 0,
+               "parse_child_record accepts old 4-field format");
+
+        SafChildEntry new_entry{};
+        expect(android_jni::parse_child_record("0\t5678\tdoc:43\tfoo.dds\t1700000000123", new_entry) &&
+                   !new_entry.is_directory && new_entry.size_bytes == 5678U &&
+                   new_entry.document_id == "doc:43" && new_entry.display_name == "foo.dds" &&
+                   new_entry.last_modified_ms == 1700000000123LL,
+               "parse_child_record parses new 5-field format with mtime");
+
+        SafChildEntry dir_entry{};
+        expect(android_jni::parse_child_record("1\t0\tdoc:44\tTextures\t0", dir_entry) &&
+                   dir_entry.is_directory && dir_entry.size_bytes == 0U &&
+                   dir_entry.document_id == "doc:44" && dir_entry.display_name == "Textures" &&
+                   dir_entry.last_modified_ms == 0,
+               "parse_child_record parses directory with zero mtime");
+
+        SafChildEntry bad_entry{};
+        expect(!android_jni::parse_child_record("0\t10\tdoc:1", bad_entry),
+               "parse_child_record rejects truncated record");
+        expect(!android_jni::parse_child_record("0\t10\t\tname\t123", bad_entry),
+               "parse_child_record rejects empty document id");
+    }
+
+    // 2. SafVfs::file_stamp from MemorySafBackend (no backend calls).
+    {
+        auto backend = std::make_shared<MemorySafBackend>();
+        std::string dir_id;
+        std::string file_id;
+        expect(backend->create_directory(backend->root_document_id(), "Modules", dir_id),
+               "SafVfs stamp: create Modules");
+        const std::string payload = "hello saf stamp";
+        expect(backend->write_document(
+                   dir_id, {}, "data.txt",
+                   std::span<const std::uint8_t>(
+                       reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()),
+                   file_id),
+               "SafVfs stamp: write data.txt");
+        expect(backend->set_last_modified_ms(file_id, 1700123456789LL),
+               "SafVfs stamp: set mtime on MemorySafBackend");
+
+        SafVfs saf(backend);
+        expect(saf.index_complete(), "SafVfs stamp: index complete");
+        backend->reset_call_counts();
+
+        std::uint64_t sz = 0;
+        std::int64_t mtime = -1;
+        expect(saf.file_stamp("modules/DATA.TXT", sz, mtime) &&
+                   sz == payload.size() && mtime == 1700123456789LL,
+               "SafVfs::file_stamp returns indexed size and mtime");
+        expect(!saf.file_stamp("Modules", sz, mtime),
+               "SafVfs::file_stamp rejects directories");
+        expect(!saf.file_stamp("Modules/missing.txt", sz, mtime),
+               "SafVfs::file_stamp rejects missing files");
+        expect(backend->list_children_calls == 0 && backend->read_document_calls == 0,
+               "SafVfs::file_stamp makes zero backend calls");
+    }
+
+    // 3. MemoryVfs::file_stamp and HostVfs::file_stamp.
+    {
+        MemoryVfs mem;
+        expect(mem.write_text("a/b.txt", "12345"), "MemoryVfs stamp: write");
+        std::uint64_t sz = 0;
+        std::int64_t mtime = 99;
+        expect(mem.file_stamp("A/B.TXT", sz, mtime) && sz == 5U && mtime == 0,
+               "MemoryVfs::file_stamp returns size and 0 mtime");
+        expect(!mem.file_stamp("a", sz, mtime) && !mem.file_stamp("a/missing.txt", sz, mtime),
+               "MemoryVfs::file_stamp rejects dirs and missing files");
+
+        std::error_code ec;
+        const fs::path host_root = fs::temp_directory_path(ec) / "wse_platform_test_stamp_host";
+        fs::remove_all(host_root, ec);
+        fs::create_directories(host_root, ec);
+        HostVfs host(host_root);
+        expect(host.write_text("stamp.bin", "ABCDEF"), "HostVfs stamp: write");
+        std::uint64_t hsz = 0;
+        std::int64_t hmtime1 = 0;
+        std::int64_t hmtime2 = 0;
+        expect(host.file_stamp("STAMP.BIN", hsz, hmtime1) && hsz == 6U &&
+                   hmtime1 > 1'500'000'000'000LL,
+               "HostVfs::file_stamp returns size and Unix ms");
+        expect(host.file_stamp("stamp.bin", hsz, hmtime2) && hmtime1 == hmtime2,
+               "HostVfs::file_stamp is deterministic on unchanged file");
+
+        const auto prev_ft = fs::last_write_time(host_root / "stamp.bin", ec);
+        fs::last_write_time(host_root / "stamp.bin", prev_ft + std::chrono::seconds(5), ec);
+        std::int64_t hmtime3 = 0;
+        expect(!ec && host.file_stamp("stamp.bin", hsz, hmtime3) && hmtime3 >= hmtime1 + 4000,
+               "HostVfs::file_stamp tracks last_write_time changes");
+        expect(!host.file_stamp("missing.bin", hsz, hmtime3),
+               "HostVfs::file_stamp rejects missing file");
+        fs::remove_all(host_root, ec);
+    }
+
+    // Counting wrapper around MemoryVfs with controllable mtime_ms per normalized path.
+    class StampedCountingVfs final : public Vfs {
+    public:
+        MemoryVfs inner;
+        std::mutex mu;
+        std::unordered_map<std::string, std::int64_t> mtimes;
+        std::atomic<std::uint64_t> read_calls{0};
+
+        void set_mtime(std::string_view path, std::int64_t mtime_ms) {
+            const auto norm = normalize_path(path);
+            if (!norm) return;
+            const std::lock_guard<std::mutex> lock(mu);
+            mtimes[*norm] = mtime_ms;
+        }
+
+        bool read_file(std::string_view path, std::vector<std::uint8_t>& out) override {
+            read_calls.fetch_add(1, std::memory_order_relaxed);
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.read_file(path, out);
+        }
+
+        bool read_text(std::string_view path, std::string& out) override {
+            read_calls.fetch_add(1, std::memory_order_relaxed);
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.read_text(path, out);
+        }
+
+        bool write_file(std::string_view path, std::span<const std::uint8_t> data) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.write_file(path, data);
+        }
+
+        bool remove_file(std::string_view path) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.remove_file(path);
+        }
+
+        bool list_dir(std::string_view path, std::vector<VfsEntry>& out) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.list_dir(path, out);
+        }
+
+        bool is_file(std::string_view path) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.is_file(path);
+        }
+
+        bool is_dir(std::string_view path) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.is_dir(path);
+        }
+
+        bool make_dir(std::string_view path) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.make_dir(path);
+        }
+
+        bool remove_dir(std::string_view path) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.remove_dir(path);
+        }
+
+        bool rename_file(std::string_view from, std::string_view to) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.rename_file(from, to);
+        }
+
+        bool file_size(std::string_view path, std::uint64_t& size) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            return inner.file_size(path, size);
+        }
+
+        bool file_stamp(std::string_view path,
+                        std::uint64_t& size,
+                        std::int64_t& mtime_ms) override {
+            const std::lock_guard<std::mutex> lock(mu);
+            if (!inner.file_size(path, size)) {
+                return false;
+            }
+            const auto norm = normalize_path(path);
+            const auto it = norm ? mtimes.find(*norm) : mtimes.end();
+            mtime_ms = (it != mtimes.end()) ? it->second : 0;
+            return true;
+        }
+    };
+
+    // 4. CachingVfs: miss -> copy, hit -> inner unchanged, size/mtime invalidation,
+    //    manifest persistence + malformed lines + last-line-wins, concurrency, and clear.
+    std::error_code ec;
+    const fs::path cache_root = fs::temp_directory_path(ec) / "wse_platform_test_caching_vfs";
+    fs::remove_all(cache_root, ec);
+
+    {
+        StampedCountingVfs backing;
+        expect(backing.write_text("Modules/Native/scripts.txt", "scripts-v1"),
+               "CachingVfs: seed scripts.txt");
+        backing.set_mtime("Modules/Native/scripts.txt", 1000);
+        const std::vector<std::uint8_t> dds_v1{1, 2, 3, 4, 5, 6};
+        expect(backing.write_file("Textures/A.DDS", dds_v1), "CachingVfs: seed Textures/A.DDS");
+        backing.set_mtime("Textures/A.DDS", 2000);
+
+        CachingVfs cache(backing, cache_root);
+
+        std::string txt;
+        expect(cache.read_text("Modules\\Native\\SCRIPTS.txt", txt) && txt == "scripts-v1",
+               "CachingVfs: first read_text succeeds");
+        expect(backing.read_calls.load() == 1U && cache.copies() == 1U &&
+                   cache.hits() == 0U && cache.copied_bytes() == txt.size(),
+               "CachingVfs: first read_text copies");
+
+        txt.clear();
+        expect(cache.read_text("modules/native/scripts.txt", txt) && txt == "scripts-v1",
+               "CachingVfs: second read_text succeeds");
+        expect(backing.read_calls.load() == 1U && cache.hits() == 1U && cache.copies() == 1U,
+               "CachingVfs: second read_text hits without calling inner");
+
+        std::vector<std::uint8_t> bin;
+        expect(cache.read_file("textures/a.dds", bin) && bin == dds_v1,
+               "CachingVfs: first read_file succeeds");
+        expect(backing.read_calls.load() == 2U && cache.copies() == 2U && cache.hits() == 1U,
+               "CachingVfs: first read_file copies");
+        bin.clear();
+        expect(cache.read_file("Textures\\A.dds", bin) && bin == dds_v1,
+               "CachingVfs: second read_file hits");
+        expect(backing.read_calls.load() == 2U && cache.hits() == 2U,
+               "CachingVfs: second read_file leaves inner read count unchanged");
+
+        // Changed size triggers re-copy.
+        expect(backing.write_text("Modules/Native/scripts.txt", "scripts-v2-longer"),
+               "CachingVfs: grow scripts.txt");
+        expect(cache.read_text("Modules/Native/scripts.txt", txt) && txt == "scripts-v2-longer",
+               "CachingVfs: size change reads updated contents");
+        expect(backing.read_calls.load() == 3U && cache.copies() == 3U,
+               "CachingVfs: size change triggers copy");
+        expect(cache.read_text("Modules/Native/scripts.txt", txt) && txt == "scripts-v2-longer" &&
+                   backing.read_calls.load() == 3U && cache.hits() == 3U,
+               "CachingVfs: updated file hits on next read");
+
+        // Changed mtime (same size) triggers re-copy.
+        const std::vector<std::uint8_t> dds_v2{9, 8, 7, 6, 5, 4};
+        expect(backing.write_file("Textures/A.DDS", dds_v2), "CachingVfs: overwrite same size");
+        backing.set_mtime("Textures/A.DDS", 3000);
+        expect(cache.read_file("Textures/A.DDS", bin) && bin == dds_v2,
+               "CachingVfs: mtime change reads updated bytes");
+        expect(backing.read_calls.load() == 4U && cache.copies() == 4U,
+               "CachingVfs: mtime change triggers copy");
+
+        expect(CachingVfs::disk_usage(cache_root) > 0U,
+               "CachingVfs::disk_usage reports non-zero bytes");
+
+        // Corrupt/malformed manifest lines are ignored and last line wins across instances.
+        {
+            std::ofstream mfs(cache_root / "manifest.tsv", std::ios::binary | std::ios::app);
+            mfs << "malformed-no-tabs\n"
+                << "textures/a.dds\tnotanumber\t3000\n"
+                << "textures/a.dds\t6\tnotanumber\n"
+                << "\t6\t3000\n"
+                << "textures/a.dds\t6\t3000\textra\n"
+                << "modules/native/scripts.txt\t999\t1000\n"
+                << "modules/native/scripts.txt\t17\t1000\n";
+        }
+        backing.read_calls.store(0);
+        CachingVfs reloaded(backing, cache_root);
+        expect(reloaded.read_text("Modules/Native/scripts.txt", txt) && txt == "scripts-v2-longer" &&
+                   reloaded.read_file("Textures/A.DDS", bin) && bin == dds_v2 &&
+                   backing.read_calls.load() == 0U && reloaded.hits() == 2U &&
+                   reloaded.copies() == 0U,
+               "CachingVfs: manifest survives reload, ignores malformed lines, last line wins");
+
+        // Copy failure (cache_root is an existing regular file) must not fail the read.
+        const fs::path bad_root = fs::temp_directory_path(ec) / "wse_platform_test_bad_cache_root";
+        fs::remove_all(bad_root, ec);
+        {
+            std::ofstream f(bad_root, std::ios::binary);
+            f << "not a directory";
+        }
+        CachingVfs unwriteable_cache(backing, bad_root);
+        expect(unwriteable_cache.read_text("Modules/Native/scripts.txt", txt) &&
+                   txt == "scripts-v2-longer" && unwriteable_cache.copies() == 0U,
+               "CachingVfs: copy failure does not fail the read");
+        fs::remove_all(bad_root, ec);
+    }
+
+    // 5. Concurrent reads from 8 threads of 50 files.
+    fs::remove_all(cache_root, ec);
+    {
+        StampedCountingVfs backing;
+        std::vector<std::vector<std::uint8_t>> expected(50);
+        for (std::size_t i = 0; i < 50; ++i) {
+            expected[i].resize(64U + i * 17U);
+            for (std::size_t j = 0; j < expected[i].size(); ++j) {
+                expected[i][j] = static_cast<std::uint8_t>((i * 31U + j * 13U) & 0xFFU);
+            }
+            const std::string p = "Batch/File_" + std::to_string(i) + ".bin";
+            expect(backing.write_file(p, expected[i]), "CachingVfs concurrent: seed");
+            backing.set_mtime(p, static_cast<std::int64_t>(5000 + i));
+        }
+
+        CachingVfs cache(backing, cache_root);
+        std::atomic<int> bad_reads{0};
+        std::vector<std::thread> threads;
+        threads.reserve(8);
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&, t]() {
+                std::vector<std::uint8_t> got;
+                for (int pass = 0; pass < 2; ++pass) {
+                    for (std::size_t k = 0; k < 50; ++k) {
+                        const std::size_t idx = (k + static_cast<std::size_t>(t) * 7U) % 50U;
+                        const std::string p = (pass == 0)
+                                                  ? ("batch\\file_" + std::to_string(idx) + ".bin")
+                                                  : ("BATCH/FILE_" + std::to_string(idx) + ".BIN");
+                        if (!cache.read_file(p, got) || got != expected[idx]) {
+                            bad_reads.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        expect(bad_reads.load() == 0 && cache.copies() == 50U && cache.hits() > 0U,
+               "CachingVfs: 8 threads x 50 files concurrent reads all match");
+
+        expect(CachingVfs::clear(cache_root), "CachingVfs::clear succeeds");
+        expect(CachingVfs::disk_usage(cache_root) == 0U && fs::is_empty(cache_root, ec) && !ec,
+               "CachingVfs::clear empties cache directory");
+    }
+
+    fs::remove_all(cache_root, ec);
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -3362,6 +3711,7 @@ int run_platform_suite(const char* fixture_path) {
     test_p10_launcher_settings();
     test_p4_vulkan_gpu_rendering();
     test_r5a_vulkan_d3d9_backend();
+    test_r5b_caching_vfs_and_stamps();
     if (failures != 0) {
         std::printf("platform tests: FAIL (%d)\n", failures);
         return 1;
