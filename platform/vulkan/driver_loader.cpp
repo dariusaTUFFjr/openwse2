@@ -5,6 +5,7 @@
 // and carries no PE/PDB citations.
 
 #include "driver_loader.h"
+#include "driver_loader_internal.h"
 
 #include "wse/asset/brf.h"
 #include "wse/asset/dds.h"
@@ -864,6 +865,7 @@ struct VulkanDriverLoader::Impl {
     VulkanMockConfig mock_config{};
 
     PFN_vkGetInstanceProcAddr gipa = nullptr;
+    PFN_vkGetDeviceProcAddr gdpa = nullptr;
     HalDevice* hal_device = nullptr;
 
     VkInstance instance = VK_NULL_HANDLE;
@@ -871,10 +873,13 @@ struct VulkanDriverLoader::Impl {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue graphics_queue = VK_NULL_HANDLE;
     VkCommandPool command_pool = VK_NULL_HANDLE;
+    std::uint32_t graphics_queue_family = 0;
     std::uint32_t max_image_dimension_2d = 0;
     VkDeviceSize non_coherent_atom_size = 1U;
     VkDeviceSize min_ubo_offset_alignment = 256U;
     bool can_execute_gpu = false;
+    bool sampler_anisotropy = false;
+    bool fill_mode_non_solid = false;
 
     PFN_vkDestroyInstance fn_destroy_instance = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties fn_get_phys_mem_props = nullptr;
@@ -1248,6 +1253,9 @@ struct VulkanDriverLoader::Impl {
         fn_destroy_image = nullptr;
         fn_create_shader_module = nullptr;
         fn_destroy_shader_module = nullptr;
+        gdpa = nullptr;
+        sampler_anisotropy = false;
+        fill_mode_non_solid = false;
         clear_gpu_procs();
     }
 
@@ -1796,9 +1804,14 @@ bool VulkanDriverLoader::probe_and_create_device(VulkanDriverProbeResult& out) {
     if (get_phys_features != nullptr) {
         get_phys_features(impl_->physical_device, &features);
     }
-    // Enable BC sampling when present so P5 can upload Warband `.dds` blocks as-is.
+    // Enable BC sampling, anisotropy, and wireframe when present so R5 D3D9 can use them directly.
     VkPhysicalDeviceFeatures enabled{};
     enabled.textureCompressionBC = features.textureCompressionBC;
+    enabled.samplerAnisotropy = features.samplerAnisotropy;
+    enabled.fillModeNonSolid = features.fillModeNonSolid;
+    impl_->sampler_anisotropy = (features.samplerAnisotropy == VK_TRUE);
+    impl_->fill_mode_non_solid = (features.fillModeNonSolid == VK_TRUE);
+    impl_->graphics_queue_family = chosen_q_family;
 
     const float q_priority = 1.0f;
     VkDeviceQueueCreateInfo q_info{};
@@ -1855,6 +1868,7 @@ bool VulkanDriverLoader::probe_and_create_device(VulkanDriverProbeResult& out) {
 
     PFN_vkGetDeviceProcAddr gdpa = nullptr;
     impl_->resolve_inst("vkGetDeviceProcAddr", gdpa);
+    impl_->gdpa = gdpa;
 
     impl_->resolve_dev(gdpa, "vkDestroyDevice", impl_->fn_destroy_device);
     impl_->resolve_dev(gdpa, "vkDeviceWaitIdle", impl_->fn_device_wait_idle);
@@ -4762,6 +4776,30 @@ VulkanDriverProbeResult run_vulkan_mesh_smoke_test(
     }
     out_frame_hash = hash_rgba8_frame(frame);
     return probe;
+}
+
+bool vulkan_loader_extract_handles(const VulkanDriverLoader& loader,
+                                   VulkanRawHandles& out) noexcept {
+    out = VulkanRawHandles{};
+    if (!loader.impl_ || loader.impl_->device == VK_NULL_HANDLE) {
+        return false;
+    }
+    const auto& im = *loader.impl_;
+    out.instance = im.instance;
+    out.physical_device = im.physical_device;
+    out.device = im.device;
+    out.graphics_queue = im.graphics_queue;
+    out.command_pool = im.command_pool;
+    out.graphics_queue_family = im.graphics_queue_family;
+    out.gipa = im.gipa;
+    out.gdpa = im.gdpa;
+    out.is_mock = im.is_mock;
+    out.can_execute_gpu = im.can_execute_gpu;
+    out.sampler_anisotropy = im.sampler_anisotropy;
+    out.fill_mode_non_solid = im.fill_mode_non_solid;
+    out.generation = im.device_generation;
+    out.probe = im.probe;
+    return true;
 }
 
 }  // namespace wse::platform

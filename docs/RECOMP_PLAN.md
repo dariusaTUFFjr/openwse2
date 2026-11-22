@@ -868,16 +868,21 @@ own, and none blocks another.
        measured instructions first, D3D9 rules kept (constant registers, `mova`/relative addressing,
        `texkill`, `dsx`/`dsy`, half-pixel offset, clip-space depth 0..1). Host tests on hand-assembled
        synthetic bytecode; locally, all 776 shaders compile and the per-shader check passes.
-    3. **Capture and PC reference:** `r4_run --capture` and `tools/r5_replay_d3d9.cpp` (above). Capture landed 2026-11-22 (`wse/recomp/d3d9_capture.h`, set up through `D3d9::created_hook` so the startup code and the translator fingerprint stay unchanged).
-    4. **The Vulkan D3D9 device:** a new D3D9-shaped Vulkan layer beside `RhiDevice` (which is too
-       narrow: RGBA8 textures only, one vertex layout, one pipeline shape) behind `shim_d3d9.h`:
-       resources (vertex/index buffers with `D3DLOCK_DISCARD`/`NOOVERWRITE` rings, textures with
-       native BC when `textureCompressionBC` exists, else RGBA8 + P10.7 mip cap for now, render targets
-       and depth in the census formats), vertex declarations, render/sampler states mapped to cached
-       pipelines (`VkPipelineCache` kept on disk), `IDirect3DStateBlock9`, `SetStreamSourceFreq`
-       instancing, `Clear`/`Draw*`/`Present`; growable rings sized for 1,000+ troop battles and no
-       per-draw descriptor allocation. Host test: replaying captured frames matches the D3D9 reference
-       within tolerance.
+    3. **Capture and PC reference (done 2026-11-22, `wse/recomp/d3d9_capture.h` + `tools/r5_replay_d3d9.cpp`):** `r4_run --capture` (set up through `D3d9::created_hook` so startup code and `translator_fingerprint` stay unchanged; buffer unlocks delta-encoded so 3,000 frames fit in 102 MB) and `tools/r5_replay_d3d9.cpp` replayed 3,000 captured frames (483,404 calls, 0 failures) on real `d3d9.dll`/`d3dx9_43.dll` reaching Warband's main menu by frame 1,250 through frame 3,000 (`175c656`, 7/7 Engine CI green).
+    4. **The Vulkan D3D9 device (done 2026-11-22, `wse/recomp/d3d9_backend.h` + `platform/vulkan/d3d9_vulkan.{h,cpp}` + `tools/r5_replay_vulkan.cpp`):**
+       a D3D9-shaped Vulkan 1.1 core layer beside `RhiDevice` (isolated from `engine/include/` behind
+       `D3d9Backend` and wired into `shim_d3d9.h` for live runs and `D3d9CaptureReplayer` for capture
+       replay): growable dynamic UBO and VB/IB rings, shared-block device-local memory allocator,
+       native `BC1`/`BC2`/`BC3` DDS upload with RGBA8 + P10.7 mip-cap fallback (plus adaptive
+       mip-drop on tight VRAM), native `B8G8R8A8_UNORM` vertex fetch with shader BGRA swizzle
+       fallback (`posfix.z`), dynamic 8-bit pixel alpha-test (`posfix.xy`), `CTAB` + `PRES` (`FXLC`)
+       preshader evaluation in `D3d9EffectInstance`, 2 descriptor sets (`<= 4`) with cached sampler
+       sets and zero per-draw UBO descriptor allocations, `VkPipelineCache` persisted to disk,
+       `IDirect3DStateBlock9`, `SetStreamSourceFreq` instancing, lazy shader compilation (optional
+       eager mode), capability report (`D3d9DriverReport`), and `Clear`/`Draw*`/`Present` with
+       readback. Replayed the 3,000-frame Warband capture on Intel HD 520 Vulkan matching real D3D9
+       pixel-for-pixel on every main-menu frame (`STATUS.md` §5; offscreen `SetRenderTarget`
+       surfaces for shadow/post-fx passes land with R5b).
     5. **On the phone, on every driver the app offers:** the main menu drawn with System Vulkan
        (`VK_KHR_android_surface` swapchain) **and** with the custom drivers the user picks in
        Advanced, PanVK on Mali and Turnip on Adreno, which present through the

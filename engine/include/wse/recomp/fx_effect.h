@@ -374,4 +374,102 @@ inline bool parse(std::span<const std::uint8_t> file, Effect& out, std::string* 
     return n;
 }
 
+// Finds an object's payload by id (empty span when absent).
+[[nodiscard]] inline std::span<const std::uint8_t> find_object(const Effect& e, std::uint32_t id) noexcept {
+    for (const Object& o : e.objects) {
+        if (o.id == id) return o.data;
+    }
+    return {};
+}
+
+// Resolves a pass's vertex (`state_op == 146`) or pixel (`state_op == 147`) shader bytecode.
+// Checks inline pass resources (`usage == 0`), named parameter references (`usage == 1`, including
+// array indexing `"name[idx]"`), and direct object ids stored in the pass state's value.
+[[nodiscard]] inline std::span<const std::uint8_t> resolve_pass_shader(const Effect& e,
+                                                                       std::uint32_t tech_idx,
+                                                                       std::uint32_t pass_idx,
+                                                                       std::uint32_t state_op) noexcept {
+    if (tech_idx >= e.techniques.size()) return {};
+    const Technique& tech = e.techniques[tech_idx];
+    if (pass_idx >= tech.passes.size()) return {};
+    const Pass& pass = tech.passes[pass_idx];
+    for (std::uint32_t si = 0; si < pass.states.size(); ++si) {
+        const State& st = pass.states[si];
+        if (st.operation != state_op) continue;
+        for (const Resource& r : e.resources) {
+            if (r.technique != tech_idx || r.pass != pass_idx || r.state != si) continue;
+            if (r.usage == 0 && is_shader_bytecode(r.data)) return r.data;
+            if (r.usage == 1 && !r.name.empty()) {
+                std::string_view pname = r.name;
+                std::uint32_t elem_idx = 0;
+                const std::size_t lb = pname.find('[');
+                if (lb != std::string_view::npos) {
+                    const std::size_t rb = pname.find(']', lb + 1);
+                    if (rb != std::string_view::npos) {
+                        std::uint32_t parsed = 0;
+                        bool ok = rb > lb + 1;
+                        for (std::size_t k = lb + 1; ok && k < rb; ++k) {
+                            const char ch = pname[k];
+                            if (ch < '0' || ch > '9') {
+                                ok = false;
+                                break;
+                            }
+                            parsed = parsed * 10U + static_cast<std::uint32_t>(ch - '0');
+                        }
+                        if (ok) elem_idx = parsed;
+                    }
+                    pname = pname.substr(0, lb);
+                }
+                const Parameter* param = e.parameter(pname);
+                if (param != nullptr && static_cast<std::size_t>(elem_idx) * 4U + 4U <= param->value.size()) {
+                    std::uint32_t oid = 0;
+                    std::memcpy(&oid, param->value.data() + static_cast<std::size_t>(elem_idx) * 4U, 4);
+                    const auto obj = find_object(e, oid);
+                    if (is_shader_bytecode(obj)) return obj;
+                }
+            }
+        }
+        if (st.value.size() >= 4) {
+            std::uint32_t oid = 0;
+            std::memcpy(&oid, st.value.data(), 4);
+            const auto obj = find_object(e, oid);
+            if (is_shader_bytecode(obj)) return obj;
+        }
+    }
+    return {};
+}
+
+struct ResolvedSampler {
+    int texture_param = -1;  // index into Effect::parameters for the referenced Texture parameter
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> sampler_states;  // (D3DSAMPLERSTATETYPE 1..11, value)
+};
+
+// Resolves a sampler parameter's linked texture parameter (op 164 resource) and inline sampler states.
+[[nodiscard]] inline ResolvedSampler resolve_sampler(const Effect& e, std::uint32_t param_idx) {
+    ResolvedSampler out;
+    if (param_idx >= e.parameters.size()) return out;
+    const Parameter& p = e.parameters[param_idx];
+    for (std::uint32_t si = 0; si < p.sampler_states.size(); ++si) {
+        const State& st = p.sampler_states[si];
+        if (st.operation == 164U) {
+            for (const Resource& r : e.resources) {
+                if (r.technique == kNoTechnique && r.pass == param_idx && r.state == si && r.usage == 1) {
+                    for (std::uint32_t pi = 0; pi < e.parameters.size(); ++pi) {
+                        if (e.parameters[pi].type.name == r.name) {
+                            out.texture_param = static_cast<int>(pi);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        } else if (st.operation >= 165U && st.operation <= 175U && st.value.size() >= 4) {
+            std::uint32_t val = 0;
+            std::memcpy(&val, st.value.data(), 4);
+            out.sampler_states.emplace_back(st.operation - 164U, val);
+        }
+    }
+    return out;
+}
+
 }  // namespace wse::recomp::fx

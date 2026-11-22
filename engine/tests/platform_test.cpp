@@ -20,8 +20,10 @@
 
 #if __has_include("driver_loader.h")
 #include "driver_loader.h"
+#include "d3d9_vulkan.h"
 #else
 #include "../../platform/vulkan/driver_loader.h"
+#include "../../platform/vulkan/d3d9_vulkan.h"
 #endif
 
 #include "wse/asset/shader.h"
@@ -2984,6 +2986,182 @@ void test_p8_performance_and_frame_pacing() {
     }
 }
 
+// Phase 5 R5a step 4: VulkanD3d9Backend lifecycle on Mock PanVK ICD (always runs, zero leaks)
+// and real GPU readback test (alpha test + textured quad + native & software-swizzled D3DCOLOR)
+// when WSE_TEST_SYSTEM_VULKAN=1.
+void test_r5a_vulkan_d3d9_backend() {
+    using namespace wse::platform;
+    using namespace wse::recomp;
+
+    auto dst_tok = [](std::uint32_t ty, std::uint32_t num, std::uint32_t mask = 0xFU) -> std::uint32_t {
+        return 0x80000000U | ((ty & 7U) << 28) | ((ty & 0x18U) << 8) | ((mask & 0xFU) << 16) | (num & 0x7FFU);
+    };
+    auto src_tok = [](std::uint32_t ty, std::uint32_t num, std::uint32_t swz = 0xE4U) -> std::uint32_t {
+        return 0x80000000U | ((ty & 7U) << 28) | ((ty & 0x18U) << 8) | ((swz & 0xFFU) << 16) | (num & 0x7FFU);
+    };
+    // vs_2_0: dcl_position v0; dcl_color v1; dcl_texcoord v2; mov oPos, v0; mov oD0, v1; mov oT0, v2; end
+    const std::vector<std::uint32_t> vs_words = {
+        0xFFFE0200U,
+        0x0200001FU, 0x80000000U, dst_tok(1, 0),
+        0x0200001FU, 0x8000000AU, dst_tok(1, 1),
+        0x0200001FU, 0x80000005U, dst_tok(1, 2),
+        0x02000001U, dst_tok(4, 0), src_tok(1, 0),
+        0x02000001U, dst_tok(5, 0), src_tok(1, 1),
+        0x02000001U, dst_tok(6, 0), src_tok(1, 2),
+        0x0000FFFFU,
+    };
+    // ps_2_0: dcl v0; dcl t0.xy; dcl_2d s0; texld r0, t0, s0; mul oC0, r0, v0; end
+    const std::vector<std::uint32_t> ps_words = {
+        0xFFFF0200U,
+        0x0200001FU, 0x80000000U, dst_tok(1, 0),
+        0x0200001FU, 0x80000000U, dst_tok(3, 0, 0x3U),
+        0x0200001FU, 0x90000000U, dst_tok(10, 0),
+        0x03000042U, dst_tok(0, 0), src_tok(3, 0), src_tok(10, 0),
+        0x03000005U, dst_tok(8, 0), src_tok(0, 0), src_tok(1, 0),
+        0x0000FFFFU,
+    };
+    const auto vs_bytes = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(vs_words.data()),
+                                                        vs_words.size() * 4U);
+    const auto ps_bytes = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(ps_words.data()),
+                                                        ps_words.size() * 4U);
+
+    struct QuadVtx {
+        float x, y, z, w;
+        std::uint32_t color_bgra;  // D3DCOLOR (0xAARRGGBB -> bytes B,G,R,A on LE)
+        float u, v;
+    };
+    // Fullscreen-ish quad covering [-0.75, +0.75] in D3D9 clip space.
+    // D3DCOLOR 0xFFDC3214 -> R=220, G=50, B=20, A=255.
+    const std::array<QuadVtx, 4> verts{{
+        {-0.75F,  0.75F, 0.5F, 1.0F, 0xFFDC3214U, 0.0F, 0.0F},
+        { 0.75F,  0.75F, 0.5F, 1.0F, 0xFFDC3214U, 1.0F, 0.0F},
+        { 0.75F, -0.75F, 0.5F, 1.0F, 0xFFDC3214U, 1.0F, 1.0F},
+        {-0.75F, -0.75F, 0.5F, 1.0F, 0xFFDC3214U, 0.0F, 1.0F},
+    }};
+    const std::array<std::uint16_t, 6> indices{0, 1, 2, 0, 2, 3};
+    const std::array<D3d9VertexElement, 3> decl{{
+        {0, 0,  3 /* FLOAT4 */,   0, 0 /* POSITION */, 0},
+        {0, 16, 4 /* D3DCOLOR */, 0, 10 /* COLOR */,   0},
+        {0, 20, 1 /* FLOAT2 */,   0, 5 /* TEXCOORD */, 0},
+    }};
+    // 2x2 A8R8G8B8 texture (BGRA byte order): left col alpha=64 (discarded by alpha test >= 128),
+    // right col white alpha=255 (passes alpha test, tinted by D3DCOLOR -> R=220, G=50, B=20).
+    const std::array<std::uint8_t, 16> tex_bgra{
+        255, 255, 255, 64,   255, 255, 255, 255,
+        255, 255, 255, 64,   255, 255, 255, 255,
+    };
+
+    // 1. Mock PanVK ICD: capability report, shader compilation, lifecycle, zero leaked mock objects.
+    {
+        const MockVulkanObjectStats before = mock_vulkan_object_stats();
+        {
+            auto loader = std::make_shared<VulkanDriverLoader>();
+            VulkanMockConfig mc{};
+            mc.mode = DriverMode::panvk;
+            mc.direct_icd = true;
+            mc.device_name = "Mock PanVK R5a";
+            VulkanDriverProbeResult probe{};
+            expect(loader->load_mock_icd(mc) && loader->probe_and_create_device(probe),
+                   "R5a VulkanD3d9Backend: open Mock PanVK ICD");
+
+            VulkanD3d9Backend bk(loader);
+            std::string err;
+            expect(bk.init(64, 64, 22, 75, &err) && bk.report().ok && bk.report().is_mock &&
+                       bk.report().format_summary().find("Mock PanVK R5a") != std::string::npos,
+                   "R5a VulkanD3d9Backend: init succeeds on Mock ICD with driver report");
+            bk.create_shader(1, false, vs_bytes);
+            bk.create_shader(2, true, ps_bytes);
+            bk.create_vertex_decl(3, decl);
+            bk.create_buffer(4, false, sizeof(verts), false, 100);
+            bk.update_buffer(4, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)), false);
+            bk.create_buffer(5, true, sizeof(indices), false, 101);
+            bk.update_buffer(5, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)), false);
+            bk.create_texture(6, 0, 2, 2, 1, 1, 21, 0);
+            bk.upload_texture_level(6, 0, 0, tex_bgra, 8);
+            D3d9DrawState st;
+            st.vs = 1; st.ps = 2; st.decl = 3; st.indices = 5;
+            st.streams[0] = {4, 0, sizeof(QuadVtx), 1};
+            st.textures[0] = 6;
+            st.viewport = {0, 0, 64, 64, 0.0F, 1.0F};
+            bk.clear(st, 3, 0xFF102040U, 1.0F, 0, {});
+            bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+            std::vector<std::uint8_t> rgba;
+            std::uint32_t rw = 0, rh = 0;
+            expect(bk.present(&rgba, &rw, &rh) && rw == 64 && rh == 64 && rgba.size() == 64U * 64U * 4U &&
+                       bk.compiled_shader_count() == 2U && bk.failed_shader_count() == 0U,
+                   "R5a VulkanD3d9Backend: mock shaders compile cleanly and present succeeds");
+        }
+        const MockVulkanObjectStats after = mock_vulkan_object_stats();
+        expect(after.live_objects == before.live_objects &&
+                   after.leaked_at_device_destroy == before.leaked_at_device_destroy &&
+                   after.invalid_destroys == before.invalid_destroys,
+               "R5a VulkanD3d9Backend: zero leaked mock Vulkan objects on teardown");
+    }
+
+    // 2. Real system Vulkan GPU (WSE_TEST_SYSTEM_VULKAN=1): draw alpha-tested, D3DCOLOR-tinted,
+    // textured quad in BOTH native B8G8R8A8_UNORM and forced shader-swizzle modes and verify pixels.
+    if (system_vulkan_tests_enabled()) {
+        for (const bool allow_bgra_vtx : {true, false}) {
+            auto loader = std::make_shared<VulkanDriverLoader>();
+            std::string err;
+            VulkanDriverProbeResult probe{};
+            if (!loader->load_system(&err) || !loader->probe_and_create_device(probe)) {
+                expect(false, "R5a VulkanD3d9Backend (system): open real Vulkan device");
+                break;
+            }
+            VulkanD3d9Config cfg{};
+            cfg.prefer_bgra_vertex_format = allow_bgra_vtx;
+            VulkanD3d9Backend bk(loader, cfg);
+            expect(bk.init(64, 64, 22, 75, &err) && bk.report().ok && !bk.report().is_mock,
+                   allow_bgra_vtx ? "R5a VulkanD3d9Backend (system): init native BGRA"
+                                  : "R5a VulkanD3d9Backend (system): init shader BGRA swizzle fallback");
+            bk.create_shader(1, false, vs_bytes);
+            bk.create_shader(2, true, ps_bytes);
+            bk.create_vertex_decl(3, decl);
+            bk.create_buffer(4, false, sizeof(verts), true, 100);
+            bk.update_buffer(4, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(verts.data()), sizeof(verts)), true);
+            bk.create_buffer(5, true, sizeof(indices), false, 101);
+            bk.update_buffer(5, 0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(indices.data()), sizeof(indices)), false);
+            bk.create_texture(6, 0, 2, 2, 1, 1, 21, 0);
+            bk.upload_texture_level(6, 0, 0, tex_bgra, 8);
+
+            D3d9DrawState st;
+            st.vs = 1; st.ps = 2; st.decl = 3; st.indices = 5;
+            st.streams[0] = {4, 0, sizeof(QuadVtx), 1};
+            st.textures[0] = 6;
+            st.samplers[0].address_u = 3;  // CLAMP
+            st.samplers[0].address_v = 3;
+            st.samplers[0].mag_filter = 1;  // POINT
+            st.samplers[0].min_filter = 1;
+            st.rs[7] = 0;    // ZENABLE = FALSE
+            st.rs[15] = 1;   // ALPHATESTENABLE = TRUE
+            st.rs[24] = 128; // ALPHAREF = 128
+            st.rs[25] = 7;   // D3DCMP_GREATEREQUAL
+            st.rs[22] = 1;   // CULLMODE = NONE
+            st.viewport = {0, 0, 64, 64, 0.0F, 1.0F};
+
+            bk.clear(st, 3, 0xFF102040U, 1.0F, 0, {});
+            bk.draw_indexed(st, 4, 0, 0, 4, 0, 2);
+            std::vector<std::uint8_t> rgba;
+            std::uint32_t rw = 0, rh = 0;
+            const bool pok = bk.present(&rgba, &rw, &rh) && rw == 64 && rh == 64 && rgba.size() == 64U * 64U * 4U;
+            // Pixel (16, 32) is on left half of quad (u ~ 0.17 -> texel alpha 64 -> discarded -> clear color 16,32,64).
+            // Pixel (48, 32) is on right half of quad (u ~ 0.83 -> texel alpha 255 -> D3DCOLOR R=220,G=50,B=20).
+            // Pixel (2, 2) is outside quad -> clear color 16,32,64.
+            const std::size_t left = (32U * 64U + 16U) * 4U;
+            const std::size_t right = (32U * 64U + 48U) * 4U;
+            const std::size_t bg = (2U * 64U + 2U) * 4U;
+            const bool px_ok = pok &&
+                               rgba[bg + 0] == 16 && rgba[bg + 1] == 32 && rgba[bg + 2] == 64 &&
+                               rgba[left + 0] == 16 && rgba[left + 1] == 32 && rgba[left + 2] == 64 &&
+                               rgba[right + 0] == 220 && rgba[right + 1] == 50 && rgba[right + 2] == 20;
+            expect(px_ok && bk.compiled_shader_count() == 2U && bk.failed_shader_count() == 0U,
+                   allow_bgra_vtx ? "R5a VulkanD3d9Backend (system): exact alpha-test + textured D3DCOLOR pixels (native BGRA)"
+                                  : "R5a VulkanD3d9Backend (system): exact alpha-test + textured D3DCOLOR pixels (shader BGRA swizzle)");
+        }
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -3008,6 +3186,7 @@ int run_platform_suite(const char* fixture_path) {
     test_p8_performance_and_frame_pacing();
     test_p10_launcher_settings();
     test_p4_vulkan_gpu_rendering();
+    test_r5a_vulkan_d3d9_backend();
     if (failures != 0) {
         std::printf("platform tests: FAIL (%d)\n", failures);
         return 1;

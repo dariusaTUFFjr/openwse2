@@ -5848,6 +5848,330 @@ void test_fx_effects() {
     }
 }
 
+// R5a step 4: CTAB + PRES preshader parsing/evaluation, fx pass/sampler resolution,
+// D3d9EffectInstance + D3d9CaptureReplayer, and live shim::D3d9 -> D3d9Backend forwarding.
+void test_d3d9_backend_and_preshader() {
+    namespace fx = wse::recomp::fx;
+    namespace sh = wse::recomp::d3d9sh;
+    namespace cap = wse::recomp::d3dcap;
+    namespace comi = wse::recomp::com;
+    using wse::recomp::D3d9Backend;
+    using wse::recomp::D3d9CaptureReplayer;
+    using wse::recomp::D3d9DrawState;
+    using wse::recomp::D3d9DriverReport;
+    using wse::recomp::D3d9EffectInstance;
+    using wse::recomp::D3d9Rect;
+    using wse::recomp::D3d9VertexElement;
+
+    // 1. Build a synthetic vs_2_0 bytecode containing both CTAB and PRES (FXLC) comment chunks.
+    auto put32 = [](std::vector<std::uint8_t>& b, std::uint32_t v) {
+        const std::size_t at = b.size();
+        b.resize(at + 4);
+        std::memcpy(b.data() + at, &v, 4);
+    };
+    auto put16 = [](std::vector<std::uint8_t>& b, std::uint16_t v) {
+        const std::size_t at = b.size();
+        b.resize(at + 2);
+        std::memcpy(b.data() + at, &v, 2);
+    };
+    auto putf = [&](std::vector<std::uint8_t>& b, float f) {
+        std::uint32_t v = 0;
+        std::memcpy(&v, &f, 4);
+        put32(b, v);
+    };
+    auto make_comment = [&](std::uint32_t fourcc, const std::vector<std::uint8_t>& payload) {
+        std::vector<std::uint8_t> pad = payload;
+        while (pad.size() % 4 != 0) pad.push_back(0);
+        const std::uint32_t dwords = static_cast<std::uint32_t>(1 + pad.size() / 4);
+        std::vector<std::uint8_t> out;
+        put32(out, 0x0000FFFEU | (dwords << 16));
+        put32(out, fourcc);
+        out.insert(out.end(), pad.begin(), pad.end());
+        return out;
+    };
+    // Helper to build a CTAB payload with (name, reg_set, reg_index, reg_count, cls, type, rows, cols).
+    struct CtabSpec {
+        const char* name;
+        std::uint16_t reg_set, reg_index, reg_count, cls, type, rows, cols;
+    };
+    auto build_ctab = [&](const std::vector<CtabSpec>& specs) {
+        std::vector<std::uint8_t> p(28, 0);
+        const std::uint32_t sz = 28, cnt = static_cast<std::uint32_t>(specs.size()), info_off = 28;
+        std::memcpy(p.data() + 0, &sz, 4);
+        std::memcpy(p.data() + 12, &cnt, 4);
+        std::memcpy(p.data() + 16, &info_off, 4);
+        p.resize(28 + cnt * 20, 0);
+        for (std::size_t i = 0; i < specs.size(); ++i) {
+            const std::uint32_t name_off = static_cast<std::uint32_t>(p.size());
+            const char* nm = specs[i].name;
+            p.insert(p.end(), nm, nm + std::strlen(nm) + 1);
+            while (p.size() % 4 != 0) p.push_back(0);
+            const std::uint32_t type_off = static_cast<std::uint32_t>(p.size());
+            put16(p, specs[i].cls);
+            put16(p, specs[i].type);
+            put16(p, specs[i].rows);
+            put16(p, specs[i].cols);
+            put16(p, 1);  // elements
+            put16(p, 0);  // struct members
+            put32(p, 0);  // member info offset
+            const std::size_t e = 28 + i * 20;
+            std::memcpy(p.data() + e + 0, &name_off, 4);
+            std::memcpy(p.data() + e + 4, &specs[i].reg_set, 2);
+            std::memcpy(p.data() + e + 6, &specs[i].reg_index, 2);
+            std::memcpy(p.data() + e + 8, &specs[i].reg_count, 2);
+            std::memcpy(p.data() + e + 12, &type_off, 4);
+        }
+        return p;
+    };
+
+    // Main CTAB: matWVP at c0..c3 (col-major matrix, cls=3), vScale at c4 (vector, cls=1), sDiff at s0 (reg_set=3).
+    const std::vector<std::uint8_t> main_ctab = build_ctab({
+        {"matWVP", 2, 0, 4, 3, 3, 4, 4},
+        {"vScale", 2, 4, 1, 1, 3, 1, 4},
+        {"sDiff", 3, 0, 1, 4, 10, 1, 1},
+    });
+    // Preshader: input vScale at c0 (scalar slots 0..3), CLIT = {2.0f, -1.0f, 0.0f, 3.0f}.
+    // FXLC insn 1: scalar-broadcast mul (0x80000A05, ncomp=1) r0.x = c0.x * clit[0]
+    // FXLC insn 2: add (0x00000204, ncomp=1) oc[40] (c10.x) = r0.x + clit[3]
+    // FXLC insn 3: lt (0x00000A02, ncomp=1) ob[0] (b0.x) = (clit[1] < c0.x)
+    std::vector<std::uint8_t> clit;
+    putf(clit, 2.0F);
+    putf(clit, -1.0F);
+    putf(clit, 0.0F);
+    putf(clit, 3.0F);
+    std::vector<std::uint8_t> fxlc;
+    put32(fxlc, 3);  // 3 instructions
+    // insn 1: mul_s r[0] = c[0] * clit[0]
+    put32(fxlc, 0x80000000U | (0x205U << 20) | 1U);
+    put32(fxlc, 2);  // 2 srcs
+    put32(fxlc, 0); put32(fxlc, 2); put32(fxlc, 0);  // INPUT[0]
+    put32(fxlc, 0); put32(fxlc, 1); put32(fxlc, 0);  // CLIT[0]
+    put32(fxlc, 0); put32(fxlc, 7); put32(fxlc, 0);  // dst TEMP[0]
+    // insn 2: add oc[40] = r[0] + clit[3]
+    put32(fxlc, (0x204U << 20) | 1U);
+    put32(fxlc, 2);
+    put32(fxlc, 0); put32(fxlc, 7); put32(fxlc, 0);  // TEMP[0]
+    put32(fxlc, 0); put32(fxlc, 1); put32(fxlc, 3);  // CLIT[3]
+    put32(fxlc, 0); put32(fxlc, 4); put32(fxlc, 40); // dst OUT_F[40] -> c10.x
+    // insn 3: lt ob[0] = clit[1] < c[0]
+    put32(fxlc, (0x202U << 20) | 1U);
+    put32(fxlc, 2);
+    put32(fxlc, 0); put32(fxlc, 1); put32(fxlc, 1);  // CLIT[1] = -1.0
+    put32(fxlc, 0); put32(fxlc, 2); put32(fxlc, 0);  // INPUT[0]
+    put32(fxlc, 0); put32(fxlc, 5); put32(fxlc, 0);  // dst OUT_B[0] -> b0.x
+    put32(fxlc, 0xF0F0F0F0U);  // end marker
+
+    std::vector<std::uint8_t> pres_body;
+    put32(pres_body, 0x46580200U);  // preshader header
+    const auto p_ctab = make_comment(0x42415443U, build_ctab({{"vScale", 2, 0, 1, 1, 3, 1, 4}}));
+    const auto p_clit = make_comment(0x54494C43U, clit);
+    const auto p_fxlc = make_comment(0x434C5846U, fxlc);
+    pres_body.insert(pres_body.end(), p_ctab.begin(), p_ctab.end());
+    pres_body.insert(pres_body.end(), p_clit.begin(), p_clit.end());
+    pres_body.insert(pres_body.end(), p_fxlc.begin(), p_fxlc.end());
+    put32(pres_body, 0x0000FFFFU);
+
+    // Full vs_2_0 bytecode with CTAB + PRES + minimal valid body.
+    std::vector<std::uint8_t> vs_bc;
+    put32(vs_bc, 0xFFFE0200U);
+    const auto c_ctab = make_comment(0x42415443U, main_ctab);
+    const auto c_pres = make_comment(0x53455250U, pres_body);
+    vs_bc.insert(vs_bc.end(), c_ctab.begin(), c_ctab.end());
+    vs_bc.insert(vs_bc.end(), c_pres.begin(), c_pres.end());
+    put32(vs_bc, 0x0200001FU); put32(vs_bc, 0x80000000U); put32(vs_bc, 0x900F0000U);  // dcl_position v0
+    put32(vs_bc, 0x02000001U); put32(vs_bc, 0xC00F0000U); put32(vs_bc, 0x90E40000U);  // mov oPos, v0
+    put32(vs_bc, 0x0000FFFFU);
+
+    sh::Ctab parsed_ctab;
+    sh::Preshader parsed_pres;
+    const bool ctab_ok = sh::parse_ctab(vs_bc, parsed_ctab);
+    const bool pres_ok = sh::parse_preshader(vs_bc, parsed_pres);
+    std::array<float, 1024> in_c{}, out_c{};
+    std::array<std::int32_t, 64> out_i{}, out_b{};
+    in_c[0] = 5.0F;
+    if (pres_ok) sh::eval_preshader(parsed_pres, in_c, out_c, out_i, out_b);
+    expect(ctab_ok && parsed_ctab.entries.size() == 3 && parsed_ctab.entries[0].name == "matWVP" &&
+               parsed_ctab.entries[0].cls == 3 && parsed_ctab.entries[2].reg_set == 3,
+           "d3d9 ctab: parses matrix, vector, and sampler entries");
+    expect(pres_ok && parsed_pres.insns.size() == 3 && std::fabs(out_c[40] - 13.0F) < 1e-5F && out_b[0] == 1,
+           "d3d9 preshader: parses and evaluates FXLC (5.0 * 2.0 + 3.0 == 13.0, -1.0 < 5.0 -> b0=1)");
+
+    // 2. Recording mock D3d9Backend to test D3d9CaptureReplayer + live shim::D3d9 forwarding.
+    struct MockBackend final : D3d9Backend {
+        D3d9DriverReport rep{};
+        bool inited = false;
+        std::uint32_t init_w = 0, init_h = 0;
+        std::map<std::uint64_t, std::vector<std::uint8_t>> bufs;
+        std::size_t shaders = 0, decls = 0, clears = 0, draws = 0, presents = 0;
+        D3d9DrawState last_draw{};
+        bool init(std::uint32_t w, std::uint32_t h, std::uint32_t, std::uint32_t, std::string*) override {
+            inited = true; init_w = w; init_h = h; rep.ok = true; return true;
+        }
+        bool reset(std::uint32_t w, std::uint32_t h, std::uint32_t, std::uint32_t, std::string*) override {
+            init_w = w; init_h = h; return true;
+        }
+        const D3d9DriverReport& report() const noexcept override { return rep; }
+        void create_buffer(std::uint64_t id, bool, std::uint32_t sz, bool, std::uint32_t) override { bufs[id].assign(sz, 0); }
+        void update_buffer(std::uint64_t id, std::uint32_t off, std::span<const std::uint8_t> b, bool) override {
+            auto& dst = bufs[id];
+            if (dst.size() < off + b.size()) dst.resize(off + b.size(), 0);
+            if (!b.empty()) std::memcpy(dst.data() + off, b.data(), b.size());
+        }
+        void destroy_buffer(std::uint64_t id) override { bufs.erase(id); }
+        void create_texture(std::uint64_t, int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) override {}
+        void upload_texture_level(std::uint64_t, std::uint32_t, std::uint32_t, std::span<const std::uint8_t>, std::uint32_t) override {}
+        void upload_texture_dds(std::uint64_t, std::span<const std::uint8_t>) override {}
+        void destroy_texture(std::uint64_t) override {}
+        void create_surface(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, std::uint32_t, std::uint32_t) override {}
+        void destroy_surface(std::uint64_t) override {}
+        void create_vertex_decl(std::uint64_t, std::span<const D3d9VertexElement>) override { ++decls; }
+        void destroy_vertex_decl(std::uint64_t) override {}
+        void create_shader(std::uint64_t, bool, std::span<const std::uint8_t>) override { ++shaders; }
+        void destroy_shader(std::uint64_t) override {}
+        void clear(const D3d9DrawState&, std::uint32_t, std::uint32_t, float, std::uint32_t, std::span<const D3d9Rect>) override { ++clears; }
+        void draw_indexed(const D3d9DrawState& st, std::uint32_t, std::int32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) override {
+            ++draws; last_draw = st;
+        }
+        void draw_primitive(const D3d9DrawState& st, std::uint32_t, std::uint32_t, std::uint32_t) override {
+            ++draws; last_draw = st;
+        }
+        bool present(std::vector<std::uint8_t>* out, std::uint32_t* w, std::uint32_t* h) override {
+            ++presents;
+            if (w != nullptr) *w = init_w;
+            if (h != nullptr) *h = init_h;
+            if (out != nullptr) out->assign(static_cast<std::size_t>(init_w) * init_h * 4U, 0x7FU);
+            return true;
+        }
+    };
+
+    // 3. Test D3d9EffectInstance CTAB matrix (SetMatrixTranspose + cls=3) + PRES evaluation.
+    {
+        fx::Effect eff;
+        fx::Parameter p_mat{};
+        p_mat.type.name = "matWVP";
+        p_mat.type.cls = fx::ParamClass::matrix_columns;
+        p_mat.type.type = fx::kFloat;
+        p_mat.type.rows = 4;
+        p_mat.type.columns = 4;
+        p_mat.value.assign(64, 0);
+        fx::Parameter p_scale{};
+        p_scale.type.name = "vScale";
+        p_scale.type.cls = fx::ParamClass::vector;
+        p_scale.type.type = fx::kFloat;
+        p_scale.type.rows = 1;
+        p_scale.type.columns = 4;
+        p_scale.value.assign(16, 0);
+        eff.parameters.push_back(p_mat);
+        eff.parameters.push_back(p_scale);
+        fx::Technique tech{};
+        tech.name = "t0";
+        fx::Pass pass{};
+        pass.name = "p0";
+        fx::State st_vs{};
+        st_vs.operation = 146;
+        st_vs.value.resize(4);
+        const std::uint32_t obj1 = 1;
+        std::memcpy(st_vs.value.data(), &obj1, 4);
+        pass.states.push_back(st_vs);
+        tech.passes.push_back(pass);
+        eff.techniques.push_back(tech);
+        eff.objects.push_back(fx::Object{1, vs_bc});
+
+        MockBackend mock;
+        std::uint64_t next_sh = 100;
+        D3d9EffectInstance inst;
+        inst.init(std::move(eff), mock, next_sh);
+        // SetMatrixTranspose of row-major M where row 3 is (-1, -1, 0.5, 1) -> stored transposed.
+        float m[16] = {1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  -1.0F, -1.0F, 0.5F, 1.0F};
+        float tr[16];
+        for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) tr[r * 4 + c] = m[c * 4 + r];
+        inst.set_param_bytes(0, tr, 64);
+        const float sc[4] = {4.0F, 0.0F, 0.0F, 0.0F};
+        inst.set_param_bytes(1, sc, 16);
+        inst.current_tech = 0;
+        inst.current_pass = 0;
+        inst.in_pass = true;
+        D3d9DrawState ds;
+        inst.commit(ds);
+        // c3 should hold row 3 of M = (-1, -1, 0.5, 1); preshader c10.x = 4.0*2.0 + 3.0 = 11.0; b0 = 1.
+        expect(mock.shaders == 1 && ds.vs == 101 &&
+                   std::fabs(ds.vs_const.c[12] + 1.0F) < 1e-5F && std::fabs(ds.vs_const.c[14] - 0.5F) < 1e-5F &&
+                   std::fabs(ds.vs_const.c[40] - 11.0F) < 1e-5F && ds.vs_const.b[0] == 1,
+               "d3d9 effect instance: packs SetMatrixTranspose into c0..c3 and evaluates PRES into c10/b0");
+    }
+
+    // 4. Live shim::D3d9 with attached D3d9Backend + capture -> D3d9CaptureReplayer round-trip.
+    {
+        using d3d_test::com;
+        using u32_test::call;
+        namespace d3s = wse::recomp::shim;
+        Runtime rt;
+        d3s::D3d9 d3d(rt);
+        MockBackend live_mock;
+        d3d.backend = &live_mock;
+        std::vector<cap::Call> captured_calls;
+        d3d.on_call = [&](const cap::Call& c) { captured_calls.push_back(c); };
+        (void)d3d.install();
+        GuestStack stack(256 * 1024);
+        CpuState s;
+        stack.prepare(s);
+        rt.attach(s);
+        auto va = [](const void* p) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p)); };
+
+        const std::uint64_t d9 = call(rt, s, "d3d9.dll", "Direct3DCreate9", {32});
+        alignas(8) std::uint8_t pp[64] = {};
+        const std::uint32_t w = 320, h = 240, one = 1, d24 = d3s::kD3dFmtD24S8;
+        std::memcpy(pp, &w, 4);
+        std::memcpy(pp + 4, &h, 4);
+        std::memcpy(pp + 44, &one, 4);
+        std::memcpy(pp + 48, &d24, 4);
+        std::uint64_t dev = 0, vb = 0, decl = 0, vsh = 0, sb = 0, ptr = 0;
+        (void)com(s, d9, comi::kIDirect3D9, "CreateDevice", {0, 1, 0, 0x40, va(pp), va(&dev)});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "CreateVertexBuffer", {32, 0x200, 0, 0, va(&vb), 0});
+        (void)com(s, vb, comi::kIDirect3DVertexBuffer9, "Lock", {4, 8, va(&ptr), 0});
+        if (ptr != 0) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(ptr)), 0x5A, 8);
+        (void)com(s, vb, comi::kIDirect3DVertexBuffer9, "Unlock", {});
+        const D3d9VertexElement elems[2] = {{0, 0, 2, 0, 0, 0}, {0xFF, 0, 17, 0, 0, 0}};
+        (void)com(s, dev, comi::kIDirect3DDevice9, "CreateVertexDeclaration", {va(elems), va(&decl)});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "CreateVertexShader", {va(vs_bc.data()), va(&vsh)});
+        // Record a StateBlock setting ALPHABLENDENABLE = 1 without mutating live state yet.
+        (void)com(s, dev, comi::kIDirect3DDevice9, "SetRenderState", {27, 0});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "BeginStateBlock", {});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "SetRenderState", {27, 1});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "EndStateBlock", {va(&sb)});
+        std::uint32_t blend_before = 99;
+        (void)com(s, dev, comi::kIDirect3DDevice9, "GetRenderState", {27, va(&blend_before)});
+        (void)com(s, sb, comi::kIDirect3DStateBlock9, "Apply", {});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "Clear", {0, 0, 3, 0xFF112233U, 0x3F800000U, 0});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "DrawPrimitive", {4, 0, 1});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "Present", {0, 0, 0, 0});
+
+        expect(live_mock.inited && live_mock.init_w == 320 && live_mock.init_h == 240 &&
+                   live_mock.bufs[vb].size() == 32 && live_mock.bufs[vb][4] == 0x5A &&
+                   live_mock.decls == 1 && live_mock.shaders == 1 && blend_before == 0 &&
+                   live_mock.clears == 1 && live_mock.draws == 1 && live_mock.last_draw.rs[27] == 1 &&
+                   live_mock.presents == 1,
+               "shim::D3d9 live backend: forwards device, buffers, stateblocks, clear, draw, present");
+
+        // Replay the exact captured calls through D3d9CaptureReplayer onto a fresh MockBackend.
+        MockBackend replay_mock;
+        D3d9CaptureReplayer rep(replay_mock);
+        std::uint64_t cb_frame = 0;
+        rep.want_frame = [](std::uint64_t f) { return f == 1; };
+        rep.on_frame = [&](std::uint64_t f, std::uint32_t rw, std::uint32_t rh, const std::vector<std::uint8_t>& rgba) {
+            if (rw == 320 && rh == 240 && rgba.size() == 320U * 240U * 4U) cb_frame = f;
+        };
+        bool rep_ok = true;
+        for (const cap::Call& c : captured_calls) {
+            if (!rep.run_call(c)) rep_ok = false;
+        }
+        expect(rep_ok && replay_mock.inited && replay_mock.bufs[vb][4] == 0x5A &&
+                   replay_mock.decls == 1 && replay_mock.shaders == 1 && replay_mock.clears == 1 &&
+                   replay_mock.draws == 1 && replay_mock.last_draw.rs[27] == 1 && cb_frame == 1,
+               "D3d9CaptureReplayer: reproduces live shim stateblock, delta buffer, draw, and frame readback");
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -5894,6 +6218,7 @@ int run_recomp_suite(const char* fixture_path) {
     test_r4_shim_edge_cases();
     test_fx_effects();
     test_d3d9_capture();
+    test_d3d9_backend_and_preshader();
     test_unwinder();
     if (g_failures == 0) {
         std::printf("recomp tests: PASS\n");

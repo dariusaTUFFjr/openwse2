@@ -299,6 +299,14 @@ Write-Host "building     driver_loader"
 if ($LASTEXITCODE -ne 0) {
     throw "driver_loader build failed"
 }
+$d3d9VulkanObj = Join-Path $out "d3d9_vulkan.o"
+Write-Host "building     d3d9_vulkan"
+& $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Werror `
+    -I $include -I $vulkanInclude -I $vkHeadersInclude `
+    -c (Join-Path $vulkanInclude "d3d9_vulkan.cpp") -o $d3d9VulkanObj
+if ($LASTEXITCODE -ne 0) {
+    throw "d3d9_vulkan build failed"
+}
 
 foreach ($test in $tests) {
     $binary = Join-Path $out ("{0}_test.exe" -f $test.Name)
@@ -311,7 +319,7 @@ foreach ($test in $tests) {
         $extraLibs += @($wseAudioLib)
     }
     if ($test.ContainsKey("LinkDriverLoader") -and $test.LinkDriverLoader) {
-        $extraLibs += @($driverLoaderObj)
+        $extraLibs += @($driverLoaderObj, $d3d9VulkanObj)
     }
     if ($test.ContainsKey("LinkShader") -and $test.LinkShader) {
         $extraLibs += @($wseShaderLib, $glslangLib)
@@ -350,7 +358,7 @@ foreach ($src in $selftestSources) {
 $selftestBinary = Join-Path $out "selftest_host_test.exe"
 & $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Werror `
     -I $include -o $selftestBinary (Join-Path $here "tests\selftest_host_test.cpp") `
-    @selftestObjs $driverLoaderObj $wseLuaLib $luaLib $wseAudioLib $wseShaderLib $glslangLib
+    @selftestObjs $driverLoaderObj $d3d9VulkanObj $wseLuaLib $luaLib $wseAudioLib $wseShaderLib $glslangLib
 if ($LASTEXITCODE -ne 0) {
     throw "selftest_host link failed"
 }
@@ -373,6 +381,15 @@ Write-Host "building     wse_brf"
     -I $include -o $brfTool (Join-Path $here "tools\wse_brf.cpp") $wseShaderLib $glslangLib
 if ($LASTEXITCODE -ne 0) {
     throw "wse_brf build failed"
+}
+
+$replayVulkanTool = Join-Path $out "r5_replay_vulkan.exe"
+Write-Host "building     r5_replay_vulkan"
+& $zig c++ -target x86_64-windows-gnu -std=c++20 -O2 -Wall -Wextra -Werror `
+    -I $include -I $vulkanInclude -o $replayVulkanTool (Join-Path $here "..\tools\r5_replay_vulkan.cpp") `
+    $driverLoaderObj $d3d9VulkanObj $wseShaderLib $glslangLib
+if ($LASTEXITCODE -ne 0) {
+    throw "r5_replay_vulkan build failed"
 }
 
 Write-Host "engine host tests: PASS"

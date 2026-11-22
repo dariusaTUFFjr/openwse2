@@ -39,6 +39,7 @@
 
 #include "wse/recomp/com_vtables.h"
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/d3d9_backend.h"
 #include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/fx_effect.h"
 #include "wse/recomp/runtime.h"
@@ -93,6 +94,9 @@ public:
     // After each Present (device or swap chain), with the frame count so far: the R4 startup
     // runner stops after a set number of frames.
     std::function<void(std::uint64_t frames)> on_present;
+    // Optional rendering backend (Phase 5 R5a step 4, e.g. `VulkanD3d9Backend`). When set,
+    // live D3D9/D3DX calls drive it directly; when null, the device stays headless (R4).
+    D3d9Backend* backend = nullptr;
 
     [[nodiscard]] std::uint64_t frames() const noexcept { return frames_; }
     // The current value of a parsed effect's parameter (the R5 device uploads these; tests read
@@ -158,7 +162,11 @@ private:
             Desc d = texture_desc(size_or(win64_arg(s, 1), 256), size_or(win64_arg(s, 2), 256), 1,
                                   static_cast<std::uint32_t>(win64_arg(s, 3)), fmt == 0 || fmt == kD3dxDefault ? kD3dFmtA8R8G8B8 : fmt,
                                   static_cast<std::uint32_t>(win64_arg(s, 4)), static_cast<std::uint32_t>(win64_arg(s, 6)));
-            win64_return(s, out_object(out, Kind::texture, d));
+            const std::uint32_t hr = out_object(out, Kind::texture, d, win64_arg(s, 0));
+            if (hr == kD3dOk && backend != nullptr) {
+                backend->create_texture(crt_detail::get<std::uint64_t>(out), 0, d.width, d.height, 1, d.levels, d.format, d.usage);
+            }
+            win64_return(s, hr);
         });
         // D3DXCreateTextureFromFileExA(dev, file, w, h, mips, usage, fmt, pool, filter, mipfilter, key, info, pal, ppTex)
         dx("D3DXCreateTextureFromFileExA", [this](CpuState& s) {
@@ -191,7 +199,14 @@ private:
                                   fmt == 0 || fmt == kD3dxDefault ? img.format : fmt, static_cast<std::uint32_t>(win64_arg(s, 4)),
                                   static_cast<std::uint32_t>(win64_arg(s, 6)));
             put_image_info(win64_arg(s, 10), img);
-            win64_return(s, out_object(win64_arg(s, 12), Kind::cube, d));
+            const std::uint64_t out = win64_arg(s, 12);
+            const std::uint32_t hr = out_object(out, Kind::cube, d, win64_arg(s, 0));
+            if (hr == kD3dOk && backend != nullptr) {
+                const std::uint64_t id = crt_detail::get<std::uint64_t>(out);
+                backend->create_texture(id, 1, d.width, d.height, 1, d.levels, d.format, d.usage);
+                if (!bytes.empty()) backend->upload_texture_dds(id, bytes);
+            }
+            win64_return(s, hr);
         });
         dx("D3DXFilterTexture", [](CpuState& s) { win64_return(s, 0); });
         dx("D3DXSaveSurfaceToFileA", [](CpuState& s) { win64_return(s, 0); });  // nothing is written
@@ -210,9 +225,13 @@ private:
                     st = std::make_shared<EffectState>();
                     if (!fx::parse(bytes, st->effect)) return win64_return(s, kD3dxErrInvalidData);
                     index_effect(*st);
+                    if (backend != nullptr) {
+                        st->inst = std::make_unique<D3d9EffectInstance>();
+                        st->inst->init(st->effect, *backend, next_effect_shader_);
+                    }
                 }
             }
-            const std::uint64_t obj_addr = create(Kind::effect);
+            const std::uint64_t obj_addr = create(Kind::effect, 0, {}, win64_arg(s, 0));
             if (st) {
                 const std::lock_guard<std::mutex> lock(m_);
                 objs_[obj_addr]->fx = std::move(st);
@@ -241,6 +260,7 @@ private:
         std::vector<std::vector<std::uint64_t>> passes;
         std::map<std::uint64_t, Ref> refs;
         std::uint32_t current = 0;  // the technique SetTechnique chose
+        std::unique_ptr<D3d9EffectInstance> inst;  // live backend binder (when `backend != nullptr`)
     };
     struct Obj {
         Kind kind = Kind::d3d;
@@ -253,10 +273,17 @@ private:
         std::map<std::uint64_t, std::uint64_t> children;  // level/face -> surface object
         std::uint64_t parent = 0;   // a surface's texture, an object's device
         std::uint64_t memory_index = 0;  // a surface: which entry of its parent's memory
+        std::uint32_t lock_offset = 0, lock_size = 0, lock_flags = 0;  // active VB/IB Lock range
         std::shared_ptr<EffectState> fx;  // an effect read from a compiled fx_2_0 file
     };
     struct Image {
         std::uint32_t width = 256, height = 256, depth = 1, levels = 1, format = kD3dFmtA8R8G8B8, type = 3, file_format = 1;
+    };
+    enum class SbOpKind { rs, sampler, texture, decl, vs, ps, indices, stream, stream_freq };
+    struct SbOp {
+        SbOpKind kind = SbOpKind::rs;
+        std::uint32_t a = 0, b = 0, c = 0;
+        std::uint64_t obj = 0;
     };
     struct DeviceState {
         std::map<std::uint32_t, std::uint32_t> render, sampler, stage;
@@ -269,6 +296,10 @@ private:
         std::uint64_t backbuffer = 0, depth = 0, swapchain = 0, d3d = 0, focus = 0;
         std::uint32_t behavior = 0;
         std::vector<std::uint8_t> present;  // D3DPRESENT_PARAMETERS
+        D3d9DrawState draw;
+        bool recording_sb = false;
+        std::vector<SbOp> open_sb;
+        std::map<std::uint64_t, std::vector<SbOp>> state_blocks;
     };
     using Method = std::function<void(CpuState&, Obj&, std::uint64_t self)>;
 
@@ -491,6 +522,7 @@ private:
         std::vector<std::uint8_t>& v = st.values[static_cast<std::size_t>(i)];
         const std::size_t count = std::min(n, v.size());
         if (count != 0) std::memcpy(v.data(), src, count);  // samplers have no plain value
+        if (st.inst) st.inst->set_param_bytes(static_cast<int>(i), src, n);
     }
     static std::uint32_t size_or(std::uint64_t v, std::uint32_t fallback) {
         const auto x = static_cast<std::uint32_t>(v);
@@ -626,9 +658,61 @@ private:
         }
         return bytes(o, 0);
     }
+    // Applies a state mutation to both the legacy query mirrors and `DeviceState::draw`.
+    static void apply_sb_op(DeviceState& st, const SbOp& op) {
+        switch (op.kind) {
+        case SbOpKind::rs:
+            st.render[op.a] = op.b;
+            if (op.a < st.draw.rs.size()) st.draw.rs[op.a] = op.b;
+            break;
+        case SbOpKind::sampler:
+            st.sampler[op.a * 64U + op.b] = op.c;
+            if (op.a < st.draw.samplers.size()) st.draw.samplers[op.a].set(op.b, op.c);
+            break;
+        case SbOpKind::texture:
+            st.textures[op.a] = op.obj;
+            if (op.a < st.draw.textures.size()) st.draw.textures[op.a] = op.obj;
+            break;
+        case SbOpKind::decl:
+            st.decl = op.obj;
+            st.draw.decl = op.obj;
+            break;
+        case SbOpKind::vs:
+            st.vs = op.obj;
+            st.draw.vs = op.obj;
+            break;
+        case SbOpKind::ps:
+            st.ps = op.obj;
+            st.draw.ps = op.obj;
+            break;
+        case SbOpKind::indices:
+            st.indices = op.obj;
+            st.draw.indices = op.obj;
+            break;
+        case SbOpKind::stream:
+            st.streams[op.a] = {op.obj, op.b, op.c};
+            if (op.a < st.draw.streams.size()) {
+                st.draw.streams[op.a].buffer = op.obj;
+                st.draw.streams[op.a].offset = op.b;
+                st.draw.streams[op.a].stride = op.c;
+            }
+            break;
+        case SbOpKind::stream_freq:
+            if (op.a < st.draw.streams.size()) st.draw.streams[op.a].freq = op.b;
+            break;
+        }
+    }
+    static void record_or_apply_sb(DeviceState& st, const SbOp& op) {
+        if (st.recording_sb) {
+            st.open_sb.push_back(op);
+        } else {
+            apply_sb_op(st, op);
+        }
+    }
+
     // The back buffer, the automatic depth surface and the swap chain, from D3DPRESENT_PARAMETERS
     // (BackBufferWidth Height Format Count ... EnableAutoDepthStencil@44 AutoDepthStencilFormat@48).
-    void reset_buffers(std::uint64_t device, DeviceState& st) {
+    void reset_buffers(std::uint64_t device, DeviceState& st, bool is_reset = false) {
         auto u32 = [&](std::size_t off) {
             std::uint32_t v = 0;
             if (off + 4 <= st.present.size()) std::memcpy(&v, st.present.data() + off, 4);
@@ -640,9 +724,10 @@ private:
         d.format = u32(8) != 0 ? u32(8) : kD3dFmtX8R8G8B8;
         d.usage = 1;  // D3DUSAGE_RENDERTARGET
         st.backbuffer = create(Kind::surface, 0, d, device);
+        const std::uint32_t depth_fmt = u32(44) != 0 ? u32(48) : kD3dFmtD24S8;
         if (u32(44) != 0) {
             Desc z = d;
-            z.format = u32(48);
+            z.format = depth_fmt;
             z.usage = 2;  // D3DUSAGE_DEPTHSTENCIL
             st.depth = create(Kind::surface, 0, z, device);
         }
@@ -651,6 +736,16 @@ private:
         st.viewport = {0, 0, d.width, d.height, 0, 0};
         std::memcpy(&st.viewport[4], zr, 8);
         st.scissor = {0, 0, static_cast<std::int32_t>(d.width), static_cast<std::int32_t>(d.height)};
+        st.draw.reset_defaults();
+        st.draw.viewport = {0, 0, d.width, d.height, 0.0F, 1.0F};
+        st.draw.scissor = {0, 0, static_cast<std::int32_t>(d.width), static_cast<std::int32_t>(d.height)};
+        if (backend != nullptr) {
+            if (is_reset) {
+                (void)backend->reset(d.width, d.height, d.format, depth_fmt);
+            } else {
+                (void)backend->init(d.width, d.height, d.format, depth_fmt);
+            }
+        }
     }
     // CreateRenderTarget / CreateDepthStencilSurface (w, h, fmt, ms, msq, flag, pp, sh) and
     // CreateOffscreenPlainSurface (w, h, fmt, pool, pp, sh); `which`: 0 offscreen, 1 target, 2 depth.
@@ -661,7 +756,12 @@ private:
         d.format = static_cast<std::uint32_t>(win64_arg(s, 3));
         d.usage = which == 1 ? 1U : which == 2 ? 2U : 0U;
         d.pool = which == 0 ? static_cast<std::uint32_t>(win64_arg(s, 4)) : 0U;
-        return out_object(win64_arg(s, out), Kind::surface, d, device);
+        const std::uint64_t out_ptr = win64_arg(s, out);
+        const std::uint32_t hr = out_object(out_ptr, Kind::surface, d, device);
+        if (hr == kD3dOk && backend != nullptr && which != 0) {
+            backend->create_surface(crt_detail::get<std::uint64_t>(out_ptr), d.width, d.height, d.format, d.usage, 0, 0, 0);
+        }
+        return hr;
     }
     // D3DSURFACE_DESC: Format Type Usage Pool MultiSampleType MultiSampleQuality Width Height.
     static void put_surface_desc(std::uint64_t p, const Desc& d, std::uint32_t type) {
@@ -731,7 +831,14 @@ private:
                               fmt == 0 || fmt == kD3dxDefault ? img.format : fmt, static_cast<std::uint32_t>(win64_arg(s, first + 3)),
                               static_cast<std::uint32_t>(win64_arg(s, first + 5)));
         put_image_info(win64_arg(s, info), img);
-        win64_return(s, out_object(win64_arg(s, out), kind, d));
+        const std::uint64_t out_ptr = win64_arg(s, out);
+        const std::uint32_t hr = out_object(out_ptr, kind, d, win64_arg(s, 0));
+        if (hr == kD3dOk && backend != nullptr) {
+            const std::uint64_t id = crt_detail::get<std::uint64_t>(out_ptr);
+            backend->create_texture(id, kind == Kind::cube ? 1 : 0, d.width, d.height, 1, d.levels, d.format, d.usage);
+            if (!bytes.empty()) backend->upload_texture_dds(id, bytes);
+        }
+        win64_return(s, hr);
     }
 
     // --- vtables ----------------------------------------------------------------------------
@@ -830,6 +937,7 @@ private:
     std::set<std::string> seen_;
     std::uint64_t frames_ = 0;
     std::uint64_t next_handle_ = 0x7E000000;
+    std::uint64_t next_effect_shader_ = 0xE000000000000000ULL;
     // Effect parameter handles: the name each was looked up by (stable storage: the guest reads
     // D3DXPARAMETER_DESC::Name through a pointer into it).
     std::map<std::uint64_t, std::string> handle_names_;
@@ -970,10 +1078,11 @@ inline void D3d9::build_vtables() {
              DeviceState* st = dev(self);
              st->present.assign(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(pp)),
                                 reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(pp)) + 64);
-             reset_buffers(self, *st);
+             reset_buffers(self, *st, true);
              ret(s, 0);
          }},
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
+             if (backend != nullptr) (void)backend->present();
              ++frames_;
              if (on_present) on_present(frames_);
              ret(s, 0);
@@ -1002,7 +1111,12 @@ inline void D3d9::build_vtables() {
              const Desc d = texture_desc(static_cast<std::uint32_t>(win64_arg(s, 1)), static_cast<std::uint32_t>(win64_arg(s, 2)), 1,
                                          static_cast<std::uint32_t>(win64_arg(s, 3)), static_cast<std::uint32_t>(win64_arg(s, 5)),
                                          static_cast<std::uint32_t>(win64_arg(s, 4)), static_cast<std::uint32_t>(win64_arg(s, 6)));
-             ret(s, out_object(win64_arg(s, 7), Kind::texture, d, self));
+             const std::uint64_t out = win64_arg(s, 7);
+             const std::uint32_t hr = out_object(out, Kind::texture, d, self);
+             if (hr == kD3dOk && backend != nullptr) {
+                 backend->create_texture(crt_detail::get<std::uint64_t>(out), 0, d.width, d.height, 1, d.levels, d.format, d.usage);
+             }
+             ret(s, hr);
          }},
         // CreateVolumeTexture(w, h, depth, levels, usage, fmt, pool, pp, sh)
         {"CreateVolumeTexture", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1010,14 +1124,24 @@ inline void D3d9::build_vtables() {
                                          static_cast<std::uint32_t>(win64_arg(s, 3)), static_cast<std::uint32_t>(win64_arg(s, 4)),
                                          static_cast<std::uint32_t>(win64_arg(s, 6)), static_cast<std::uint32_t>(win64_arg(s, 5)),
                                          static_cast<std::uint32_t>(win64_arg(s, 7)));
-             ret(s, out_object(win64_arg(s, 8), Kind::volume, d, self));
+             const std::uint64_t out = win64_arg(s, 8);
+             const std::uint32_t hr = out_object(out, Kind::volume, d, self);
+             if (hr == kD3dOk && backend != nullptr) {
+                 backend->create_texture(crt_detail::get<std::uint64_t>(out), 2, d.width, d.height, d.depth, d.levels, d.format, d.usage);
+             }
+             ret(s, hr);
          }},
         // CreateCubeTexture(edge, levels, usage, fmt, pool, pp, sh)
         {"CreateCubeTexture", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
              const auto e = static_cast<std::uint32_t>(win64_arg(s, 1));
              const Desc d = texture_desc(e, e, 1, static_cast<std::uint32_t>(win64_arg(s, 2)), static_cast<std::uint32_t>(win64_arg(s, 4)),
                                          static_cast<std::uint32_t>(win64_arg(s, 3)), static_cast<std::uint32_t>(win64_arg(s, 5)));
-             ret(s, out_object(win64_arg(s, 6), Kind::cube, d, self));
+             const std::uint64_t out = win64_arg(s, 6);
+             const std::uint32_t hr = out_object(out, Kind::cube, d, self);
+             if (hr == kD3dOk && backend != nullptr) {
+                 backend->create_texture(crt_detail::get<std::uint64_t>(out), 1, d.width, d.height, 1, d.levels, d.format, d.usage);
+             }
+             ret(s, hr);
          }},
         // CreateVertexBuffer(length, usage, fvf, pool, pp, sh)
         {"CreateVertexBuffer", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1027,7 +1151,12 @@ inline void D3d9::build_vtables() {
              d.fvf = static_cast<std::uint32_t>(win64_arg(s, 3));
              d.pool = static_cast<std::uint32_t>(win64_arg(s, 4));
              d.format = 100;  // D3DFMT_VERTEXDATA
-             ret(s, out_object(win64_arg(s, 5), Kind::vbuffer, d, self));
+             const std::uint64_t out = win64_arg(s, 5);
+             const std::uint32_t hr = out_object(out, Kind::vbuffer, d, self);
+             if (hr == kD3dOk && backend != nullptr) {
+                 backend->create_buffer(crt_detail::get<std::uint64_t>(out), false, d.size, (d.usage & 0x200U) != 0U, d.format);
+             }
+             ret(s, hr);
          }},
         // CreateIndexBuffer(length, usage, fmt, pool, pp, sh)
         {"CreateIndexBuffer", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1036,7 +1165,12 @@ inline void D3d9::build_vtables() {
              d.usage = static_cast<std::uint32_t>(win64_arg(s, 2));
              d.format = static_cast<std::uint32_t>(win64_arg(s, 3));
              d.pool = static_cast<std::uint32_t>(win64_arg(s, 4));
-             ret(s, out_object(win64_arg(s, 5), Kind::ibuffer, d, self));
+             const std::uint64_t out = win64_arg(s, 5);
+             const std::uint32_t hr = out_object(out, Kind::ibuffer, d, self);
+             if (hr == kD3dOk && backend != nullptr) {
+                 backend->create_buffer(crt_detail::get<std::uint64_t>(out), true, d.size, (d.usage & 0x200U) != 0U, d.format);
+             }
+             ret(s, hr);
          }},
         // CreateRenderTarget(w, h, fmt, ms, msq, lockable, pp, sh) / CreateDepthStencilSurface(w, h, fmt, ms, msq, discard, pp, sh)
         {"CreateRenderTarget", [this, ret](CpuState& s, Obj&, std::uint64_t self) { ret(s, plain_surface(s, self, 7, 1)); }},
@@ -1053,8 +1187,21 @@ inline void D3d9::build_vtables() {
              put_ref(*this, win64_arg(s, 1), dev(self)->depth);
              ret(s, dev(self)->depth != 0 ? 0 : kD3dErrNotAvailable);
          }},
+        {"SetRenderTarget", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetRenderTarget");
+             DeviceState* st = dev(self);
+             if (win64_arg(s, 1) == 0) st->draw.render_target = (win64_arg(s, 2) == st->backbuffer) ? 0 : win64_arg(s, 2);
+             ret(s, 0);
+         }},
+        {"SetDepthStencilSurface", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetDepthStencilSurface");
+             DeviceState* st = dev(self);
+             st->draw.depth_stencil = (win64_arg(s, 1) == st->depth) ? 0 : win64_arg(s, 1);
+             ret(s, 0);
+         }},
         {"SetRenderState", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
-             dev(self)->render[static_cast<std::uint32_t>(win64_arg(s, 1))] = static_cast<std::uint32_t>(win64_arg(s, 2));
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::rs, static_cast<std::uint32_t>(win64_arg(s, 1)),
+                                                 static_cast<std::uint32_t>(win64_arg(s, 2)), 0, 0});
              ret(s, 0);
          }},
         {"GetRenderState", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1063,8 +1210,9 @@ inline void D3d9::build_vtables() {
              ret(s, 0);
          }},
         {"SetSamplerState", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
-             dev(self)->sampler[static_cast<std::uint32_t>(win64_arg(s, 1)) * 64 + static_cast<std::uint32_t>(win64_arg(s, 2))] =
-                 static_cast<std::uint32_t>(win64_arg(s, 3));
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::sampler, static_cast<std::uint32_t>(win64_arg(s, 1)),
+                                                 static_cast<std::uint32_t>(win64_arg(s, 2)),
+                                                 static_cast<std::uint32_t>(win64_arg(s, 3)), 0});
              ret(s, 0);
          }},
         {"GetSamplerState", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1103,7 +1251,14 @@ inline void D3d9::build_vtables() {
         // D3DVIEWPORT9: X Y Width Height MinZ MaxZ
         {"SetViewport", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
              if (win64_arg(s, 1) == 0) return ret(s, kD3dErrInvalidCall);
-             std::memcpy(dev(self)->viewport.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(win64_arg(s, 1))), 24);
+             DeviceState* st = dev(self);
+             std::memcpy(st->viewport.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(win64_arg(s, 1))), 24);
+             st->draw.viewport.x = st->viewport[0];
+             st->draw.viewport.y = st->viewport[1];
+             st->draw.viewport.width = st->viewport[2];
+             st->draw.viewport.height = st->viewport[3];
+             std::memcpy(&st->draw.viewport.min_z, &st->viewport[4], 4);
+             std::memcpy(&st->draw.viewport.max_z, &st->viewport[5], 4);
              ret(s, 0);
          }},
         {"GetViewport", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1112,7 +1267,11 @@ inline void D3d9::build_vtables() {
              ret(s, 0);
          }},
         {"SetScissorRect", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
-             if (win64_arg(s, 1) != 0) std::memcpy(dev(self)->scissor.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(win64_arg(s, 1))), 16);
+             if (win64_arg(s, 1) != 0) {
+                 DeviceState* st = dev(self);
+                 std::memcpy(st->scissor.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(win64_arg(s, 1))), 16);
+                 st->draw.scissor = {st->scissor[0], st->scissor[1], st->scissor[2], st->scissor[3]};
+             }
              ret(s, 0);
          }},
         {"GetScissorRect", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1121,29 +1280,49 @@ inline void D3d9::build_vtables() {
              ret(s, 0);
          }},
         {"SetTexture", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
-             dev(self)->textures[static_cast<std::uint32_t>(win64_arg(s, 1))] = win64_arg(s, 2);
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::texture, static_cast<std::uint32_t>(win64_arg(s, 1)), 0, 0, win64_arg(s, 2)});
              ret(s, 0);
          }},
         {"GetTexture", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
              put_ref(*this, win64_arg(s, 2), dev(self)->textures[static_cast<std::uint32_t>(win64_arg(s, 1))]);
              ret(s, 0);
          }},
-        {"SetVertexDeclaration", [this, ret](CpuState& s, Obj&, std::uint64_t self) { dev(self)->decl = win64_arg(s, 1); ret(s, 0); }},
+        {"SetVertexDeclaration", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::decl, 0, 0, 0, win64_arg(s, 1)});
+             ret(s, 0);
+         }},
         {"GetVertexDeclaration", [this, ret](CpuState& s, Obj&, std::uint64_t self) { put_ref(*this, win64_arg(s, 1), dev(self)->decl); ret(s, 0); }},
         {"SetFVF", [this, ret](CpuState& s, Obj&, std::uint64_t self) { dev(self)->fvf = win64_arg(s, 1); ret(s, 0); }},
         {"GetFVF", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
              if (win64_arg(s, 1) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 1), static_cast<std::uint32_t>(dev(self)->fvf));
              ret(s, 0);
          }},
-        {"SetVertexShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) { dev(self)->vs = win64_arg(s, 1); ret(s, 0); }},
+        {"SetVertexShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::vs, 0, 0, 0, win64_arg(s, 1)});
+             ret(s, 0);
+         }},
         {"GetVertexShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) { put_ref(*this, win64_arg(s, 1), dev(self)->vs); ret(s, 0); }},
-        {"SetPixelShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) { dev(self)->ps = win64_arg(s, 1); ret(s, 0); }},
+        {"SetPixelShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::ps, 0, 0, 0, win64_arg(s, 1)});
+             ret(s, 0);
+         }},
         {"GetPixelShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) { put_ref(*this, win64_arg(s, 1), dev(self)->ps); ret(s, 0); }},
-        {"SetIndices", [this, ret](CpuState& s, Obj&, std::uint64_t self) { dev(self)->indices = win64_arg(s, 1); ret(s, 0); }},
+        {"SetIndices", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::indices, 0, 0, 0, win64_arg(s, 1)});
+             ret(s, 0);
+         }},
         {"GetIndices", [this, ret](CpuState& s, Obj&, std::uint64_t self) { put_ref(*this, win64_arg(s, 1), dev(self)->indices); ret(s, 0); }},
         // SetStreamSource(stream, vb, offset, stride) / GetStreamSource(stream, ppVB, pOffset, pStride)
         {"SetStreamSource", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
-             dev(self)->streams[static_cast<std::uint32_t>(win64_arg(s, 1))] = {win64_arg(s, 2), win64_arg(s, 3) & 0xFFFFFFFF, win64_arg(s, 4) & 0xFFFFFFFF};
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::stream, static_cast<std::uint32_t>(win64_arg(s, 1)),
+                                                 static_cast<std::uint32_t>(win64_arg(s, 3)),
+                                                 static_cast<std::uint32_t>(win64_arg(s, 4)), win64_arg(s, 2)});
+             ret(s, 0);
+         }},
+        {"SetStreamSourceFreq", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetStreamSourceFreq");
+             record_or_apply_sb(*dev(self), SbOp{SbOpKind::stream_freq, static_cast<std::uint32_t>(win64_arg(s, 1)),
+                                                 static_cast<std::uint32_t>(win64_arg(s, 2)), 0, 0});
              ret(s, 0);
          }},
         {"GetStreamSource", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1153,11 +1332,175 @@ inline void D3d9::build_vtables() {
              if (win64_arg(s, 4) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 4), static_cast<std::uint32_t>(st[2]));
              ret(s, 0);
          }},
-        {"CreateVertexDeclaration", [this, ret](CpuState& s, Obj&, std::uint64_t self) { ret(s, out_object(win64_arg(s, 2), Kind::decl, {}, self)); }},
-        {"CreateVertexShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) { ret(s, out_object(win64_arg(s, 2), Kind::vshader, {}, self)); }},
-        {"CreatePixelShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) { ret(s, out_object(win64_arg(s, 2), Kind::pshader, {}, self)); }},
+        {"SetVertexShaderConstantF", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetVertexShaderConstantF");
+             const std::uint64_t p = win64_arg(s, 2);
+             const auto reg = static_cast<std::size_t>(win64_arg(s, 1)) * 4U;
+             const auto cnt = static_cast<std::size_t>(win64_arg(s, 3)) * 4U;
+             auto& dst = dev(self)->draw.vs_const.c;
+             if (p != 0 && reg < dst.size()) {
+                 std::memcpy(dst.data() + reg, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p)),
+                             std::min(cnt, dst.size() - reg) * 4U);
+             }
+             ret(s, 0);
+         }},
+        {"SetPixelShaderConstantF", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetPixelShaderConstantF");
+             const std::uint64_t p = win64_arg(s, 2);
+             const auto reg = static_cast<std::size_t>(win64_arg(s, 1)) * 4U;
+             const auto cnt = static_cast<std::size_t>(win64_arg(s, 3)) * 4U;
+             auto& dst = dev(self)->draw.ps_const.c;
+             if (p != 0 && reg < dst.size()) {
+                 std::memcpy(dst.data() + reg, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p)),
+                             std::min(cnt, dst.size() - reg) * 4U);
+             }
+             ret(s, 0);
+         }},
+        {"SetVertexShaderConstantI", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetVertexShaderConstantI");
+             const std::uint64_t p = win64_arg(s, 2);
+             const auto reg = static_cast<std::size_t>(win64_arg(s, 1)) * 4U;
+             const auto cnt = static_cast<std::size_t>(win64_arg(s, 3)) * 4U;
+             auto& dst = dev(self)->draw.vs_const.i;
+             if (p != 0 && reg < dst.size()) {
+                 std::memcpy(dst.data() + reg, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p)),
+                             std::min(cnt, dst.size() - reg) * 4U);
+             }
+             ret(s, 0);
+         }},
+        {"SetPixelShaderConstantI", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetPixelShaderConstantI");
+             const std::uint64_t p = win64_arg(s, 2);
+             const auto reg = static_cast<std::size_t>(win64_arg(s, 1)) * 4U;
+             const auto cnt = static_cast<std::size_t>(win64_arg(s, 3)) * 4U;
+             auto& dst = dev(self)->draw.ps_const.i;
+             if (p != 0 && reg < dst.size()) {
+                 std::memcpy(dst.data() + reg, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p)),
+                             std::min(cnt, dst.size() - reg) * 4U);
+             }
+             ret(s, 0);
+         }},
+        {"SetVertexShaderConstantB", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetVertexShaderConstantB");
+             const std::uint64_t p = win64_arg(s, 2);
+             const auto reg = static_cast<std::size_t>(win64_arg(s, 1));
+             const auto cnt = static_cast<std::size_t>(win64_arg(s, 3));
+             auto& dst = dev(self)->draw.vs_const.b;
+             if (p != 0) {
+                 for (std::size_t k = 0; k < cnt && reg + k < 16U; ++k) {
+                     dst[(reg + k) * 4U] = crt_detail::get<std::uint32_t>(p + k * 4U) != 0U ? 1 : 0;
+                 }
+             }
+             ret(s, 0);
+         }},
+        {"SetPixelShaderConstantB", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::SetPixelShaderConstantB");
+             const std::uint64_t p = win64_arg(s, 2);
+             const auto reg = static_cast<std::size_t>(win64_arg(s, 1));
+             const auto cnt = static_cast<std::size_t>(win64_arg(s, 3));
+             auto& dst = dev(self)->draw.ps_const.b;
+             if (p != 0) {
+                 for (std::size_t k = 0; k < cnt && reg + k < 16U; ++k) {
+                     dst[(reg + k) * 4U] = crt_detail::get<std::uint32_t>(p + k * 4U) != 0U ? 1 : 0;
+                 }
+             }
+             ret(s, 0);
+         }},
+        {"CreateVertexDeclaration", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             const std::uint64_t p = win64_arg(s, 1), out = win64_arg(s, 2);
+             const std::uint32_t hr = out_object(out, Kind::decl, {}, self);
+             if (hr == kD3dOk && backend != nullptr && p != 0) {
+                 std::vector<D3d9VertexElement> elems;
+                 for (std::size_t n = 0; n < 64; ++n) {
+                     D3d9VertexElement el{};
+                     std::memcpy(&el, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(p + 8 * n)), 8);
+                     if (el.stream == 0xFF) break;
+                     elems.push_back(el);
+                 }
+                 backend->create_vertex_decl(crt_detail::get<std::uint64_t>(out), elems);
+             }
+             ret(s, hr);
+         }},
+        {"CreateVertexShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             const std::uint64_t p = win64_arg(s, 1), out = win64_arg(s, 2);
+             const std::uint32_t hr = out_object(out, Kind::vshader, {}, self);
+             if (hr == kD3dOk && backend != nullptr && p != 0) {
+                 std::size_t n = 1;
+                 while (n < (1U << 16) && crt_detail::get<std::uint32_t>(p + 4 * (n - 1)) != 0x0000FFFFU) ++n;
+                 const auto* b = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(p));
+                 backend->create_shader(crt_detail::get<std::uint64_t>(out), false, std::span<const std::uint8_t>(b, n * 4));
+             }
+             ret(s, hr);
+         }},
+        {"CreatePixelShader", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             const std::uint64_t p = win64_arg(s, 1), out = win64_arg(s, 2);
+             const std::uint32_t hr = out_object(out, Kind::pshader, {}, self);
+             if (hr == kD3dOk && backend != nullptr && p != 0) {
+                 std::size_t n = 1;
+                 while (n < (1U << 16) && crt_detail::get<std::uint32_t>(p + 4 * (n - 1)) != 0x0000FFFFU) ++n;
+                 const auto* b = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(p));
+                 backend->create_shader(crt_detail::get<std::uint64_t>(out), true, std::span<const std::uint8_t>(b, n * 4));
+             }
+             ret(s, hr);
+         }},
         {"CreateStateBlock", [this, ret](CpuState& s, Obj&, std::uint64_t self) { ret(s, out_object(win64_arg(s, 2), Kind::stateblock, {}, self)); }},
-        {"EndStateBlock", [this, ret](CpuState& s, Obj&, std::uint64_t self) { ret(s, out_object(win64_arg(s, 1), Kind::stateblock, {}, self)); }},
+        {"BeginStateBlock", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::BeginStateBlock");
+             DeviceState* st = dev(self);
+             st->recording_sb = true;
+             st->open_sb.clear();
+             ret(s, 0);
+         }},
+        {"EndStateBlock", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             DeviceState* st = dev(self);
+             st->recording_sb = false;
+             const std::uint64_t out = win64_arg(s, 1);
+             const std::uint32_t hr = out_object(out, Kind::stateblock, {}, self);
+             if (hr == kD3dOk) st->state_blocks[crt_detail::get<std::uint64_t>(out)] = std::move(st->open_sb);
+             st->open_sb.clear();
+             ret(s, hr);
+         }},
+        {"Clear", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::Clear");
+             if (backend != nullptr) {
+                 const auto cnt = static_cast<std::uint32_t>(win64_arg(s, 1));
+                 const std::uint64_t prects = win64_arg(s, 2);
+                 const auto flags = static_cast<std::uint32_t>(win64_arg(s, 3));
+                 const auto argb = static_cast<std::uint32_t>(win64_arg(s, 4));
+                 float z = 1.0F;
+                 const auto zbits = static_cast<std::uint32_t>(win64_arg(s, 5));
+                 std::memcpy(&z, &zbits, 4);
+                 const auto stencil = static_cast<std::uint32_t>(win64_arg(s, 6));
+                 std::vector<D3d9Rect> rects;
+                 if (cnt > 0 && prects != 0) {
+                     rects.resize(cnt);
+                     std::memcpy(rects.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(prects)), cnt * 16U);
+                 }
+                 backend->clear(dev(self)->draw, flags, argb, z, stencil, rects);
+             }
+             ret(s, 0);
+         }},
+        {"DrawIndexedPrimitive", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::DrawIndexedPrimitive");
+             if (backend != nullptr) {
+                 backend->draw_indexed(dev(self)->draw, static_cast<std::uint32_t>(win64_arg(s, 1)),
+                                       static_cast<std::int32_t>(win64_arg(s, 2)),
+                                       static_cast<std::uint32_t>(win64_arg(s, 3)),
+                                       static_cast<std::uint32_t>(win64_arg(s, 4)),
+                                       static_cast<std::uint32_t>(win64_arg(s, 5)),
+                                       static_cast<std::uint32_t>(win64_arg(s, 6)));
+             }
+             ret(s, 0);
+         }},
+        {"DrawPrimitive", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
+             first_call("IDirect3DDevice9::DrawPrimitive");
+             if (backend != nullptr) {
+                 backend->draw_primitive(dev(self)->draw, static_cast<std::uint32_t>(win64_arg(s, 1)),
+                                         static_cast<std::uint32_t>(win64_arg(s, 2)),
+                                         static_cast<std::uint32_t>(win64_arg(s, 3)));
+             }
+             ret(s, 0);
+         }},
         // CreateQuery(type, ppQuery): a NULL ppQuery asks whether the type is supported.
         {"CreateQuery", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
              if (win64_arg(s, 2) == 0) return ret(s, 0);
@@ -1175,6 +1518,7 @@ inline void D3d9::build_vtables() {
     // IDirect3DSwapChain9
     make_table(Kind::swapchain, 0, com::kIDirect3DSwapChain9, {
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
+             if (backend != nullptr) (void)backend->present();
              ++frames_;
              if (on_present) on_present(frames_);
              ret(s, 0);
@@ -1198,6 +1542,22 @@ inline void D3d9::build_vtables() {
         // LockRect(D3DLOCKED_RECT*, RECT*, flags)
         {"LockRect", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
              ret(s, lock_rect(win64_arg(s, 1), surface_memory(o), o.desc.format, o.desc.width, win64_arg(s, 2)));
+         }},
+        {"UnlockRect", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
+             first_call("IDirect3DSurface9::UnlockRect");
+             if (backend != nullptr && o.child && o.parent != 0) {
+                 Obj* p = obj(o.parent);
+                 std::vector<std::uint8_t>* mem = surface_memory(o);
+                 if (p != nullptr && mem != nullptr) {
+                     const std::uint32_t lvls = std::max<std::uint32_t>(1U, p->desc.levels);
+                     const std::uint32_t face = p->kind == Kind::cube ? static_cast<std::uint32_t>(o.memory_index / lvls) : 0U;
+                     const std::uint32_t level = p->kind == Kind::cube ? static_cast<std::uint32_t>(o.memory_index % lvls)
+                                                                       : static_cast<std::uint32_t>(o.memory_index);
+                     backend->upload_texture_level(o.parent, face, level, *mem,
+                                                   pitch_of(p->desc.format, level_dim(p->desc.width, level)));
+                 }
+             }
+             ret(s, 0);
          }},
         {"GetContainer", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
              if (o.parent == 0 || obj(o.parent)->kind == Kind::device) return ret(s, kENoInterface);
@@ -1239,6 +1599,17 @@ inline void D3d9::build_vtables() {
             if (l >= o.desc.levels) return ret(s, kD3dErrInvalidCall);
             ret(s, lock_rect(win64_arg(s, 2), bytes(o, l), o.desc.format, level_dim(o.desc.width, l), win64_arg(s, 3)));
         };
+        m["UnlockRect"] = [this, ret](CpuState& s, Obj& o, std::uint64_t self) {
+            first_call("IDirect3DTexture9::UnlockRect");
+            if (backend != nullptr) {
+                const auto l = static_cast<std::uint32_t>(win64_arg(s, 1));
+                std::vector<std::uint8_t>* mem = bytes(o, l);
+                if (l < o.desc.levels && mem != nullptr) {
+                    backend->upload_texture_level(self, 0U, l, *mem, pitch_of(o.desc.format, level_dim(o.desc.width, l)));
+                }
+            }
+            ret(s, 0);
+        };
         make_table(Kind::texture, 0, com::kIDirect3DTexture9, m);
     }
     {
@@ -1262,6 +1633,18 @@ inline void D3d9::build_vtables() {
             const auto f = static_cast<std::uint32_t>(win64_arg(s, 1)), l = static_cast<std::uint32_t>(win64_arg(s, 2));
             if (f >= 6 || l >= o.desc.levels) return ret(s, kD3dErrInvalidCall);
             ret(s, lock_rect(win64_arg(s, 3), bytes(o, f * o.desc.levels + l), o.desc.format, level_dim(o.desc.width, l), win64_arg(s, 4)));
+        };
+        m["UnlockRect"] = [this, ret](CpuState& s, Obj& o, std::uint64_t self) {
+            first_call("IDirect3DCubeTexture9::UnlockRect");
+            if (backend != nullptr) {
+                const auto f = static_cast<std::uint32_t>(win64_arg(s, 1)), l = static_cast<std::uint32_t>(win64_arg(s, 2));
+                if (f < 6U && l < o.desc.levels) {
+                    if (std::vector<std::uint8_t>* mem = bytes(o, f * o.desc.levels + l); mem != nullptr) {
+                        backend->upload_texture_level(self, f, l, *mem, pitch_of(o.desc.format, level_dim(o.desc.width, l)));
+                    }
+                }
+            }
+            ret(s, 0);
         };
         make_table(Kind::cube, 0, com::kIDirect3DCubeTexture9, m);
     }
@@ -1290,16 +1673,40 @@ inline void D3d9::build_vtables() {
         make_table(Kind::volume, 0, com::kIDirect3DVolumeTexture9, m);
     }
 
-    // Buffers: Lock(offset, size, void**, flags), GetDesc
+    // Buffers: Lock(offset, size, void**, flags), Unlock, GetDesc
     auto buffer = [&](Kind k, const com::Interface& iface) {
+        const std::string unlock_full = std::string(iface.name) + "::Unlock";
         make_table(k, 0, iface, {
             {"GetDevice", get_device},
             {"GetType", [ret, k](CpuState& s, Obj&, std::uint64_t) { ret(s, k == Kind::vbuffer ? 6 : 7); }},
             {"Lock", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
                  const auto off = static_cast<std::uint32_t>(win64_arg(s, 1));
+                 const auto sz = static_cast<std::uint32_t>(win64_arg(s, 2));
+                 const auto fl = static_cast<std::uint32_t>(win64_arg(s, 4));
                  std::vector<std::uint8_t>* mem = bytes(o, 0);
                  if (win64_arg(s, 3) == 0 || mem == nullptr || (off >= mem->size() && !mem->empty())) return ret(s, kD3dErrInvalidCall);
+                 o.lock_offset = off;
+                 o.lock_size = sz;
+                 o.lock_flags = fl;
                  crt_detail::put<std::uint64_t>(win64_arg(s, 3), static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mem->data() + off)));
+                 ret(s, 0);
+             }},
+            {"Unlock", [this, ret, unlock_full](CpuState& s, Obj& o, std::uint64_t self) {
+                 first_call(unlock_full);
+                 if (backend != nullptr) {
+                     if (std::vector<std::uint8_t>* mem = bytes(o, 0); mem != nullptr && !mem->empty()) {
+                         const bool discard = (o.lock_flags & 0x2000U) != 0U;
+                         const std::size_t off = std::min<std::size_t>(o.lock_offset, mem->size());
+                         const std::size_t cnt = (o.lock_size == 0U) ? (mem->size() - off)
+                                                                     : std::min<std::size_t>(o.lock_size, mem->size() - off);
+                         if (discard) {
+                             backend->update_buffer(self, 0U, *mem, true);
+                         } else if (cnt != 0U) {
+                             backend->update_buffer(self, static_cast<std::uint32_t>(off),
+                                                    std::span<const std::uint8_t>(mem->data() + off, cnt), false);
+                         }
+                     }
+                 }
                  ret(s, 0);
              }},
             {"GetDesc", [ret, k](CpuState& s, Obj& o, std::uint64_t) {
@@ -1316,7 +1723,18 @@ inline void D3d9::build_vtables() {
     make_table(Kind::decl, 0, com::kIDirect3DVertexDeclaration9, {{"GetDevice", get_device}});
     make_table(Kind::vshader, 0, com::kIDirect3DVertexShader9, {{"GetDevice", get_device}});
     make_table(Kind::pshader, 0, com::kIDirect3DPixelShader9, {{"GetDevice", get_device}});
-    make_table(Kind::stateblock, 0, com::kIDirect3DStateBlock9, {{"GetDevice", get_device}});
+    make_table(Kind::stateblock, 0, com::kIDirect3DStateBlock9, {
+        {"GetDevice", get_device},
+        {"Apply", [this, ret](CpuState& s, Obj& o, std::uint64_t self) {
+             first_call("IDirect3DStateBlock9::Apply");
+             if (DeviceState* st = dev(o.parent); st != nullptr) {
+                 if (const auto it = st->state_blocks.find(self); it != st->state_blocks.end()) {
+                     for (const SbOp& op : it->second) apply_sb_op(*st, op);
+                 }
+             }
+             ret(s, 0);
+         }},
+    });
     make_table(Kind::query, 0, com::kIDirect3DQuery9, {
         {"GetDevice", get_device},
         {"GetType", [ret](CpuState& s, Obj& o, std::uint64_t) { ret(s, o.desc.format); }},
@@ -1477,6 +1895,7 @@ inline void D3d9::build_vtables() {
              const long t = resolve(st, win64_arg(s, 1), 1);
              if (t < 0) return ret(s, kD3dErrInvalidCall);
              st.current = static_cast<std::uint32_t>(t);
+             if (st.inst) st.inst->current_tech = st.current;
              ret(s, 0);
          })},
         {"GetPool", [this, ret](CpuState& s, Obj&, std::uint64_t) {
@@ -1500,10 +1919,37 @@ inline void D3d9::build_vtables() {
              if (win64_arg(s, 1) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 1), 1);
              ret(s, 0);
          }, [ret](CpuState& s, EffectState& st) {
+             if (st.inst) st.inst->in_pass = false;
              const std::size_t n = st.current < st.effect.techniques.size() ? st.effect.techniques[st.current].passes.size() : 0;
              if (win64_arg(s, 1) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 1), static_cast<std::uint32_t>(n));
              ret(s, 0);
          })},
+        {"BeginPass", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
+             first_call("ID3DXEffect::BeginPass");
+             if (o.fx && o.fx->inst) {
+                 o.fx->inst->current_pass = static_cast<std::uint32_t>(win64_arg(s, 1));
+                 o.fx->inst->in_pass = true;
+                 if (DeviceState* ds = dev(device_of(o)); ds != nullptr) o.fx->inst->commit(ds->draw);
+             }
+             ret(s, 0);
+         }},
+        {"CommitChanges", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
+             first_call("ID3DXEffect::CommitChanges");
+             if (o.fx && o.fx->inst) {
+                 if (DeviceState* ds = dev(device_of(o)); ds != nullptr) o.fx->inst->commit(ds->draw);
+             }
+             ret(s, 0);
+         }},
+        {"EndPass", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
+             first_call("ID3DXEffect::EndPass");
+             if (o.fx && o.fx->inst) o.fx->inst->in_pass = false;
+             ret(s, 0);
+         }},
+        {"End", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
+             first_call("ID3DXEffect::End");
+             if (o.fx && o.fx->inst) o.fx->inst->in_pass = false;
+             ret(s, 0);
+         }},
         {"IsParameterUsed", [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 1); }},
         // Setters (handle first): values the R5 device will upload. SetMatrixTranspose stores the
         // transposed matrix, as D3DX does.
@@ -1515,7 +1961,9 @@ inline void D3d9::build_vtables() {
              ret(s, 0);
          })},
         {"SetBool", set_word()},
+        {"SetBoolArray", set_array(4)},
         {"SetInt", set_word()},
+        {"SetIntArray", set_array(4)},
         // SetFloat(handle, float): the float is the third argument, in xmm2.
         {"SetFloat", either(ok, [ret](CpuState& s, EffectState& st) {
              const long i = resolve(st, win64_arg(s, 1), 0);
@@ -1540,11 +1988,29 @@ inline void D3d9::build_vtables() {
              set_value(st, i, t, sizeof(t));
              ret(s, 0);
          })},
+        {"SetMatrixTransposeArray", either(ok, [ret](CpuState& s, EffectState& st) {
+             const long i = resolve(st, win64_arg(s, 1), 0);
+             const std::uint64_t m = win64_arg(s, 2);
+             const auto cnt = static_cast<std::uint32_t>(win64_arg(s, 3));
+             if (i < 0 || m == 0) return ret(s, kD3dErrInvalidCall);
+             std::vector<float> tr(static_cast<std::size_t>(cnt) * 16U);
+             const auto* src = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(m));
+             for (std::uint32_t k = 0; k < cnt; ++k) {
+                 for (int r = 0; r < 4; ++r) {
+                     for (int c = 0; c < 4; ++c) tr[static_cast<std::size_t>(k) * 16U + r * 4 + c] = src[static_cast<std::size_t>(k) * 16U + c * 4 + r];
+                 }
+             }
+             set_value(st, i, tr.data(), tr.size() * 4U);
+             ret(s, 0);
+         })},
         // SetTexture(handle, texture): remembered per parameter for the R5 device's samplers.
         {"SetTexture", either(ok, [ret](CpuState& s, EffectState& st) {
              const long i = resolve(st, win64_arg(s, 1), 0);
              if (i < 0) return ret(s, kD3dErrInvalidCall);
              st.textures[static_cast<std::size_t>(i)] = win64_arg(s, 2);
+             if (st.inst && static_cast<std::size_t>(i) < st.inst->textures.size()) {
+                 st.inst->textures[static_cast<std::size_t>(i)] = win64_arg(s, 2);
+             }
              ret(s, 0);
          })},
     });

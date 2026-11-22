@@ -192,6 +192,7 @@ Newest first. One line per landed milestone; details belong in the commit and in
 | Date | Commit | Milestone |
 | --- | --- | --- |
 | 2026-11-22 | — | R5a step 3 done: 3,000 captured frames of the recompiled game replay on the real D3D9 (483,404 calls, 0 failures) and draw Warband's main menu; buffer unlocks are captured as changes only |
+| 2026-11-22 | — | R5a step 4: Vulkan 1.1 D3D9 device (`wse/recomp/d3d9_backend.h`, `platform/vulkan/d3d9_vulkan.{h,cpp}`, `CTAB`/`PRES` preshader & BGRA/alpha-test in `d3d9_shader.h`, wired into `shim_d3d9.h` + `tools/r5_replay_vulkan.cpp`); replays the 3,000-frame Warband capture on Intel HD 520 Vulkan matching real D3D9 bit-for-bit (`max=0`) on main menu frames `1250..2750` in both native BGRA and shader-swizzle fallback modes (`198/198` `mb_wse2_3_0.fxo` shaders compile, `0` failures; `STATUS.md` §5) |
 | 2026-11-22 | — | R5a step 3: the PC reference works: 60 captured frames of the recompiled game replay on the real D3D9 (14,263 calls, 0 failures) and draw Warband's loading screen |
 | 2026-11-22 | — | R5 plan: PanVK and Turnip are first-class from R5a (the user): the D3D9 layer uses only what System Vulkan, PanVK and Turnip all provide, logs the driver and missing features, and the main menu must render on PanVK as well as System Vulkan; R5c becomes driver hardening |
 | 2026-11-22 | — | R5a step 3, part 1: D3D9/D3DX call capture (`wse/recomp/d3d9_capture.h`, `r4_run --capture`), with per-method data rules; the replay on real D3D9 comes next |

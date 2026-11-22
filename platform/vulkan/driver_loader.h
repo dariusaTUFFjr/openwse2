@@ -20,6 +20,8 @@
 
 namespace wse::platform {
 
+struct VulkanRawHandles;
+
 struct VulkanDriverProbeResult {
     bool ok = false;
     DriverMode mode = DriverMode::system;
@@ -194,6 +196,8 @@ public:
 
 private:
     friend class VulkanRhiDevice;
+    friend bool vulkan_loader_extract_handles(const VulkanDriverLoader& loader,
+                                              VulkanRawHandles& out) noexcept;
     std::unique_ptr<Impl> impl_;
 };
 

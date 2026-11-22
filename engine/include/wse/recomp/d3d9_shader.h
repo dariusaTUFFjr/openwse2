@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -272,6 +273,7 @@ private:
             temps_.insert(p.num);
             return "r" + n;
         case kInput:
+            if (!s_.pixel && !for_write) return "wse_vin(v" + n + ", " + n + "u)";
             return "v" + n;
         case kConst:
         case kConst2:
@@ -574,6 +576,7 @@ private:
         std::string prologue;
         std::string epilogue;
         if (!s_.pixel) {
+            g += "vec4 wse_vin(vec4 v, uint idx) { return ((uint(u.posfix.z) & (1u << idx)) != 0u) ? v.bgra : v; }\n";
             for (const Semantic& in : s_.inputs) {
                 g += "layout(location = " + std::to_string(in.reg) + ") in vec4 v" + std::to_string(in.reg) + ";\n";
             }
@@ -633,6 +636,15 @@ private:
                 prologue += "    vec4 oC" + std::to_string(n) + " = vec4(0.0);\n";
                 if (written_out_.count((kColorOut << 8) | static_cast<std::uint32_t>(n)) != 0) {
                     g += "layout(location = " + std::to_string(n) + ") out vec4 out_oC" + std::to_string(n) + ";\n";
+                    if (n == 0) {
+                        // D3D9 alpha test (D3DRS_ALPHATESTENABLE / ALPHAFUNC / ALPHAREF): u.posfix.x is
+                        // D3DCMPFUNC 1..7 (0 = disabled or ALWAYS), u.posfix.y is the 8-bit reference 0..255.
+                        epilogue +=
+                            "    { int af = int(u.posfix.x + 0.5); if (af != 0) { float a8 = floor(clamp(oC0.a, 0.0, 1.0) * 255.0 + 0.5); "
+                            "float ar = u.posfix.y; bool ok = true; if (af == 1) ok = false; else if (af == 2) ok = a8 < ar; "
+                            "else if (af == 3) ok = a8 == ar; else if (af == 4) ok = a8 <= ar; else if (af == 5) ok = a8 > ar; "
+                            "else if (af == 6) ok = a8 != ar; else if (af == 7) ok = a8 >= ar; if (!ok) discard; } }\n";
+                    }
                     epilogue += "    out_oC" + std::to_string(n) + " = oC" + std::to_string(n) + ";\n";
                 }
             }
@@ -676,6 +688,304 @@ inline bool translate(std::span<const std::uint8_t> bytes, Shader& out) {
     std::vector<std::uint32_t> words(bytes.size() / 4);
     if (!words.empty()) std::memcpy(words.data(), bytes.data(), words.size() * 4);
     return translate(std::span<const std::uint32_t>(words), out);
+}
+
+// --- D3D9 CTAB constant table & PRES/FXLC preshader evaluator (R5a step 4) -------------------
+
+struct CtabEntry {
+    std::string name;
+    std::uint16_t reg_set = 0;    // 0 bool, 1 int4, 2 float4, 3 sampler
+    std::uint16_t reg_index = 0;
+    std::uint16_t reg_count = 0;
+    std::uint16_t cls = 0;        // 0 scalar, 1 vector, 2 matrix_rows, 3 matrix_columns, 4 object, 5 struct
+    std::uint16_t type = 0;       // 1 bool, 2 int, 3 float, 10..14 sampler
+    std::uint16_t rows = 0;
+    std::uint16_t cols = 0;
+    std::uint16_t elements = 0;
+    std::vector<std::uint8_t> default_value;
+};
+
+struct Ctab {
+    std::vector<CtabEntry> entries;
+};
+
+// Parses the body of a CTAB comment chunk (starting right after the 4-byte "CTAB" FourCC).
+inline bool parse_ctab_payload(std::span<const std::uint8_t> payload, Ctab& out) {
+    out.entries.clear();
+    if (payload.size() < 28) return false;
+    auto u32 = [&](std::size_t off, std::uint32_t& v) -> bool {
+        if (off > payload.size() || payload.size() - off < 4) return false;
+        std::memcpy(&v, payload.data() + off, 4);
+        return true;
+    };
+    auto u16 = [&](std::size_t off, std::uint16_t& v) -> bool {
+        if (off > payload.size() || payload.size() - off < 2) return false;
+        std::memcpy(&v, payload.data() + off, 2);
+        return true;
+    };
+    std::uint32_t hdr_size = 0, nconst = 0, cinfo_off = 0;
+    if (!u32(0, hdr_size) || hdr_size < 28 || !u32(12, nconst) || !u32(16, cinfo_off)) return false;
+    if (nconst > 4096U || cinfo_off > payload.size() || static_cast<std::size_t>(nconst) * 20U > payload.size() - cinfo_off) {
+        return false;
+    }
+    out.entries.reserve(nconst);
+    for (std::uint32_t i = 0; i < nconst; ++i) {
+        const std::size_t base = static_cast<std::size_t>(cinfo_off) + static_cast<std::size_t>(i) * 20U;
+        std::uint32_t name_off = 0, type_off = 0, def_off = 0;
+        CtabEntry e;
+        if (!u32(base, name_off) || !u16(base + 4, e.reg_set) || !u16(base + 6, e.reg_index) ||
+            !u16(base + 8, e.reg_count) || !u32(base + 12, type_off) || !u32(base + 16, def_off)) {
+            return false;
+        }
+        if (name_off >= payload.size()) return false;
+        std::size_t end = name_off;
+        while (end < payload.size() && payload[end] != 0) ++end;
+        e.name.assign(reinterpret_cast<const char*>(payload.data() + name_off), end - name_off);
+        if (!u16(type_off, e.cls) || !u16(type_off + 2, e.type) || !u16(type_off + 4, e.rows) ||
+            !u16(type_off + 6, e.cols) || !u16(type_off + 8, e.elements)) {
+            return false;
+        }
+        if (def_off != 0 && def_off < payload.size()) {
+            const std::size_t want = static_cast<std::size_t>(e.reg_count) * 16U;
+            const std::size_t avail = std::min(want, payload.size() - def_off);
+            e.default_value.assign(payload.begin() + static_cast<std::ptrdiff_t>(def_off),
+                                   payload.begin() + static_cast<std::ptrdiff_t>(def_off + avail));
+        }
+        out.entries.push_back(std::move(e));
+    }
+    return true;
+}
+
+// Scans a D3D9 shader bytecode stream for its top-level CTAB comment chunk.
+inline bool parse_ctab(std::span<const std::uint8_t> bytecode, Ctab& out) {
+    out.entries.clear();
+    if (bytecode.size() < 8) return false;
+    std::size_t p = 4;
+    while (p + 4 <= bytecode.size()) {
+        std::uint32_t tok = 0;
+        std::memcpy(&tok, bytecode.data() + p, 4);
+        p += 4;
+        const std::uint32_t op = tok & 0xFFFFU;
+        if (op == 0xFFFFU) break;
+        if (op == 0xFFFEU) {
+            const std::size_t bytes = static_cast<std::size_t>((tok >> 16) & 0x7FFFU) * 4U;
+            if (bytes > bytecode.size() - p) return false;
+            if (bytes >= 32 && std::memcmp(bytecode.data() + p, "CTAB", 4) == 0) {
+                return parse_ctab_payload(bytecode.subspan(p + 4, bytes - 4), out);
+            }
+            p += bytes;
+        } else {
+            const std::size_t len = static_cast<std::size_t>((tok >> 24) & 0xFU) * 4U;
+            if (len > bytecode.size() - p) return false;
+            p += len;
+        }
+    }
+    return false;
+}
+
+struct PreshaderOperand {
+    bool indexed = false;
+    std::uint32_t idx_type = 0;
+    std::uint32_t idx_num = 0;
+    std::uint32_t reg_type = 0;  // 1 CLIT, 2 INPUT c[], 4 OUT_F c[], 5 OUT_B b[], 6 OUT_I i[], 7 TEMP r[]
+    std::uint32_t reg_num = 0;   // scalar index (vec4_reg * 4 + component)
+};
+
+struct PreshaderInsn {
+    std::uint32_t op = 0;        // bit 31 = scalar broadcast src0; bits 20..30 = opcode; bits 0..7 = lane count
+    std::uint32_t nsrc = 0;
+    std::array<PreshaderOperand, 4> src{};
+    PreshaderOperand dst{};
+};
+
+struct Preshader {
+    Ctab ctab;
+    std::vector<float> literals;
+    std::vector<PreshaderInsn> insns;
+
+    [[nodiscard]] bool empty() const noexcept { return insns.empty(); }
+};
+
+// Scans a D3D9 shader bytecode stream for its PRES comment chunk (CTAB + CLIT + FXLC).
+inline bool parse_preshader(std::span<const std::uint8_t> bytecode, Preshader& out) {
+    out = Preshader{};
+    if (bytecode.size() < 8) return false;
+    std::size_t p = 4;
+    while (p + 4 <= bytecode.size()) {
+        std::uint32_t tok = 0;
+        std::memcpy(&tok, bytecode.data() + p, 4);
+        p += 4;
+        const std::uint32_t op = tok & 0xFFFFU;
+        if (op == 0xFFFFU) break;
+        if (op == 0xFFFEU) {
+            const std::size_t bytes = static_cast<std::size_t>((tok >> 16) & 0x7FFFU) * 4U;
+            if (bytes > bytecode.size() - p) return false;
+            if (bytes >= 12 && std::memcmp(bytecode.data() + p, "PRES", 4) == 0) {
+                const auto pres = bytecode.subspan(p + 4, bytes - 4);
+                std::size_t q = 4;  // skip preshader version word
+                while (q + 4 <= pres.size()) {
+                    std::uint32_t ptok = 0;
+                    std::memcpy(&ptok, pres.data() + q, 4);
+                    q += 4;
+                    const std::uint32_t pop = ptok & 0xFFFFU;
+                    if (pop == 0xFFFFU) break;
+                    if (pop == 0xFFFEU) {
+                        const std::size_t cbytes = static_cast<std::size_t>((ptok >> 16) & 0x7FFFU) * 4U;
+                        if (cbytes > pres.size() - q) return false;
+                        const auto chunk = pres.subspan(q, cbytes);
+                        q += cbytes;
+                        if (cbytes >= 32 && std::memcmp(chunk.data(), "CTAB", 4) == 0) {
+                            (void)parse_ctab_payload(chunk.subspan(4), out.ctab);
+                        } else if (cbytes >= 4 && std::memcmp(chunk.data(), "CLIT", 4) == 0) {
+                            const std::size_t nflt = (cbytes - 4) / 4;
+                            out.literals.resize(nflt);
+                            if (nflt != 0) std::memcpy(out.literals.data(), chunk.data() + 4, nflt * 4);
+                        } else if (cbytes >= 8 && std::memcmp(chunk.data(), "FXLC", 4) == 0) {
+                            auto rd32 = [&](std::size_t& off, std::uint32_t& v) -> bool {
+                                if (off > chunk.size() || chunk.size() - off < 4) return false;
+                                std::memcpy(&v, chunk.data() + off, 4);
+                                off += 4;
+                                return true;
+                            };
+                            auto rd_opnd = [&](std::size_t& off, PreshaderOperand& opnd) -> bool {
+                                std::uint32_t is_arr = 0;
+                                if (!rd32(off, is_arr)) return false;
+                                opnd.indexed = is_arr != 0;
+                                if (opnd.indexed) {
+                                    if (!rd32(off, opnd.idx_type) || !rd32(off, opnd.idx_num)) return false;
+                                }
+                                return rd32(off, opnd.reg_type) && rd32(off, opnd.reg_num);
+                            };
+                            std::size_t off = 4;
+                            std::uint32_t nins = 0;
+                            if (!rd32(off, nins) || nins > 4096U) return false;
+                            out.insns.reserve(nins);
+                            for (std::uint32_t k = 0; k < nins; ++k) {
+                                PreshaderInsn ins;
+                                if (!rd32(off, ins.op) || !rd32(off, ins.nsrc) || ins.nsrc > 4U) return false;
+                                for (std::uint32_t s = 0; s < ins.nsrc; ++s) {
+                                    if (!rd_opnd(off, ins.src[s])) return false;
+                                }
+                                if (!rd_opnd(off, ins.dst)) return false;
+                                out.insns.push_back(ins);
+                            }
+                        }
+                    } else {
+                        const std::size_t plen = static_cast<std::size_t>((ptok >> 24) & 0xFU) * 4U;
+                        if (plen > pres.size() - q) return false;
+                        q += plen;
+                    }
+                }
+                return !out.insns.empty();
+            }
+            p += bytes;
+        } else {
+            const std::size_t len = static_cast<std::size_t>((tok >> 24) & 0xFU) * 4U;
+            if (len > bytecode.size() - p) return false;
+            p += len;
+        }
+    }
+    return false;
+}
+
+// Evaluates a parsed FXLC preshader. `in_c` holds the preshader's own CTAB float inputs (256 vec4s
+// = 1024 floats); results are written into the main shader's `out_c` (1024 floats), `out_i`
+// (64 ints), and `out_b` (16 bool slots stored in `out_b[r * 4]`).
+inline void eval_preshader(const Preshader& ps,
+                           std::span<const float, 1024> in_c,
+                           std::span<float, 1024> out_c,
+                           std::span<std::int32_t, 64> out_i,
+                           std::span<std::int32_t, 64> out_b) {
+    if (ps.insns.empty()) return;
+    std::array<float, 1024> temps{};
+    auto read_raw = [&](std::uint32_t rtype, std::uint32_t idx) -> float {
+        switch (rtype) {
+        case 1: return idx < ps.literals.size() ? ps.literals[idx] : 0.0F;
+        case 2: return idx < in_c.size() ? in_c[idx] : 0.0F;
+        case 4: return idx < out_c.size() ? out_c[idx] : 0.0F;
+        case 5: return idx < out_b.size() ? static_cast<float>(out_b[idx]) : 0.0F;
+        case 6: return idx < out_i.size() ? static_cast<float>(out_i[idx]) : 0.0F;
+        case 7: return idx < temps.size() ? temps[idx] : 0.0F;
+        default: return 0.0F;
+        }
+    };
+    auto resolve_idx = [&](const PreshaderOperand& opnd, std::uint32_t lane) -> std::uint32_t {
+        std::int64_t idx = static_cast<std::int64_t>(opnd.reg_num) + static_cast<std::int64_t>(lane);
+        if (opnd.indexed) {
+            idx += static_cast<std::int64_t>(read_raw(opnd.idx_type, opnd.idx_num));
+        }
+        return idx < 0 ? 0xFFFFFFFFU : static_cast<std::uint32_t>(idx);
+    };
+    auto rd = [&](const PreshaderOperand& opnd, std::uint32_t lane) -> float {
+        const std::uint32_t idx = resolve_idx(opnd, lane);
+        return read_raw(opnd.reg_type, idx);
+    };
+    auto wr = [&](const PreshaderOperand& opnd, std::uint32_t lane, float val) {
+        const std::uint32_t idx = resolve_idx(opnd, lane);
+        switch (opnd.reg_type) {
+        case 4:
+            if (idx < out_c.size()) out_c[idx] = val;
+            break;
+        case 5: {
+            const std::uint32_t breg = idx / 4U;
+            if (breg < 16U) out_b[breg * 4U] = (val != 0.0F) ? 1 : 0;
+            break;
+        }
+        case 6:
+            if (idx < out_i.size()) out_i[idx] = static_cast<std::int32_t>(val);
+            break;
+        case 7:
+            if (idx < temps.size()) temps[idx] = val;
+            break;
+        default:
+            break;
+        }
+    };
+    for (const PreshaderInsn& ins : ps.insns) {
+        const bool scalar0 = (ins.op & 0x80000000U) != 0U;
+        const std::uint32_t code = (ins.op >> 20) & 0x7FFU;
+        const std::uint32_t count = std::max<std::uint32_t>(1U, ins.op & 0xFFU);
+        if (code == 0x500U) {  // dot
+            float sum = 0.0F;
+            for (std::uint32_t k = 0; k < count; ++k) {
+                sum += rd(ins.src[0], scalar0 ? 0U : k) * rd(ins.src[1], k);
+            }
+            wr(ins.dst, 0U, sum);
+            continue;
+        }
+        for (std::uint32_t lane = 0; lane < count; ++lane) {
+            const float a = ins.nsrc >= 1 ? rd(ins.src[0], scalar0 ? 0U : lane) : 0.0F;
+            const float b = ins.nsrc >= 2 ? rd(ins.src[1], lane) : 0.0F;
+            const float c = ins.nsrc >= 3 ? rd(ins.src[2], lane) : 0.0F;
+            float res = 0.0F;
+            switch (code) {
+            case 0x100U: res = a; break;                                           // mov
+            case 0x101U: res = -a; break;                                          // neg
+            case 0x102U: res = std::clamp(a, 0.0F, 1.0F); break;                   // sat
+            case 0x103U: res = a == 0.0F ? 0.0F : 1.0F / a; break;                 // rcp
+            case 0x104U: res = a - std::floor(a); break;                           // frc
+            case 0x105U: res = std::exp2(a); break;                                // exp
+            case 0x106U: res = a == 0.0F ? 0.0F : std::log2(std::fabs(a)); break;  // log
+            case 0x107U: res = a == 0.0F ? 0.0F : 1.0F / std::sqrt(std::fabs(a)); break;  // rsq
+            case 0x108U: res = std::sin(a); break;                                 // sin
+            case 0x109U: res = std::cos(a); break;                                 // cos
+            case 0x10AU: res = std::asin(std::clamp(a, -1.0F, 1.0F)); break;       // asin
+            case 0x10BU: res = std::acos(std::clamp(a, -1.0F, 1.0F)); break;       // acos
+            case 0x10CU: res = std::atan(a); break;                                // atan
+            case 0x200U: res = std::min(a, b); break;                              // min
+            case 0x201U: res = std::max(a, b); break;                              // max
+            case 0x202U: res = (a < b) ? 1.0F : 0.0F; break;                       // lt
+            case 0x203U: res = (a >= b) ? 1.0F : 0.0F; break;                      // ge
+            case 0x204U: res = a + b; break;                                       // add
+            case 0x205U: res = a * b; break;                                       // mul
+            case 0x206U: res = std::atan2(a, b); break;                            // atan2
+            case 0x208U: res = b == 0.0F ? 0.0F : a / b; break;                    // div
+            case 0x300U: res = (a >= 0.0F) ? b : c; break;                         // cmp
+            default: res = 0.0F; break;
+            }
+            wr(ins.dst, lane, res);
+        }
+    }
 }
 
 }  // namespace wse::recomp::d3d9sh

@@ -383,9 +383,12 @@ target_include_directories(wse_shader PRIVATE
 target_link_libraries(wse_shader PRIVATE wse_engine wse_glslang)
 wse_apply_strict_warnings(wse_shader)
 
-# Vulkan runtime driver loader + VulkanRhiDevice (slice P4). Its <vulkan/vulkan.h>
-# comes from the vendored headers and stays private: callers see only rhi.h.
-add_library(wse_vulkan STATIC platform/vulkan/driver_loader.cpp)
+# Vulkan runtime driver loader + VulkanRhiDevice (slice P4) + VulkanD3d9Backend (Phase 5 R5a).
+# Its <vulkan/vulkan.h> comes from the vendored headers and stays private: callers see only rhi.h / d3d9_vulkan.h.
+add_library(wse_vulkan STATIC
+    platform/vulkan/driver_loader.cpp
+    platform/vulkan/d3d9_vulkan.cpp
+)
 set_target_properties(wse_vulkan PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(wse_vulkan
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/platform/vulkan"
@@ -738,6 +741,10 @@ if(WSE_BUILD_TOOLS)
     add_executable(wse_brf engine/tools/wse_brf.cpp)
     target_link_libraries(wse_brf PRIVATE wse_engine wse_shader)
     wse_apply_strict_warnings(wse_brf)
+
+    add_executable(r5_replay_vulkan tools/r5_replay_vulkan.cpp)
+    target_link_libraries(r5_replay_vulkan PRIVATE wse_vulkan wse_engine)
+    wse_apply_strict_warnings(r5_replay_vulkan)
 endif()
 
 if(WSE_BUILD_ANDROID_APP)

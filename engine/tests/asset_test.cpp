@@ -2520,12 +2520,14 @@ void test_d3d9_shader_translation() {
     auto has = [](const sh::Shader& s, const char* text) { return s.glsl.find(text) != std::string::npos; };
     expect(vs_ok && !v.pixel && v.inputs.size() == 2 && v.inputs[1].usage == sh::kTexCoord && v.inputs[1].reg == 1 &&
                has(v, "layout(location = 1) in vec4 v1;") && has(v, "vec4(1.0, 0.5, 0.0, 2.0)") &&
+               has(v, "wse_vin(v0, 0u)") &&
                has(v, "clamp(") && has(v, "gl_Position = oPos;") && has(v, "gl_Position.y = -gl_Position.y;") &&
                has(v, "layout(location = 0) out vec4 out_oT0;"),
-           "d3d9 shader: vs_2_0 inputs by register, def literal, saturate, position flip, texcoord varying");
+           "d3d9 shader: vs_2_0 inputs by register, BGRA swizzle helper, def literal, saturate, position flip, texcoord varying");
     expect(ps_ok && p.pixel && p.samplers[0] == 2 && has(p, "uniform sampler2D s0;") && has(p, "texture(s0, (t0).xy)") &&
+               has(p, "u.posfix.x") &&
                has(p, "discard;") && has(p, "layout(location = 0) in vec4 t0;") && has(p, "layout(location = 0) out vec4 out_oC0;"),
-           "d3d9 shader: ps_2_0 texcoord input links to the vertex output, texld, texkill, colour output");
+           "d3d9 shader: ps_2_0 texcoord input links to the vertex output, texld, texkill, alpha-test epilogue, colour output");
     expect(!sh::translate(std::span<const std::uint32_t>(unsupported), bad) && bad.error.find("unsupported instruction 25") != std::string::npos,
            "d3d9 shader: an instruction outside the scope is refused by name");
     expect(sh::link_location(sh::kTexCoord, 3) == 3 && sh::link_location(sh::kColor, 1) == 11 && sh::link_location(sh::kFog, 0) == 12,
