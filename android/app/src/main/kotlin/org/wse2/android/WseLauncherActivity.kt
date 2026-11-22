@@ -218,6 +218,10 @@ class WseLauncherActivity : ComponentActivity() {
             putExtra(RecompGameActivity.EXTRA_NATIVE_LIB_DIR, event.nativeLibDir)
             putExtra(RecompGameActivity.EXTRA_SHADER_CACHE_DIR, event.shaderCacheDir)
             putExtra(RecompGameActivity.EXTRA_MAX_TEXTURE_SIZE, event.maxTextureSize)
+            putExtra(RecompGameActivity.EXTRA_RENDER_SCALE, event.renderScale)
+            putExtra(RecompGameActivity.EXTRA_AUTO_RESOLUTION, event.autoResolution)
+            putExtra(RecompGameActivity.EXTRA_SHARPNESS, event.sharpness)
+            putExtra(RecompGameActivity.EXTRA_FXAA, event.fxaa)
         }
         recompVulkanLauncher.launch(intent)
     }

@@ -334,6 +334,9 @@ data class AdvancedUiState(
     val selectedModule: ModuleChoice? = null,
     val driverState: DriverUiState = DriverUiState(),
     val showFpsOverlay: Boolean = false,
+    val pictureResolutionIndex: Int = 0,
+    val pictureSharpen: Boolean = true,
+    val pictureFxaa: Boolean = false,
     val statusLog: String = "Ready."
 )
 
@@ -367,6 +370,10 @@ sealed interface LauncherEvent {
         val customIcdPath: String,
         val nativeLibDir: String,
         val shaderCacheDir: String,
-        val maxTextureSize: Int
+        val maxTextureSize: Int,
+        val renderScale: Float,
+        val autoResolution: Boolean,
+        val sharpness: Float,
+        val fxaa: Boolean
     ) : LauncherEvent
 }

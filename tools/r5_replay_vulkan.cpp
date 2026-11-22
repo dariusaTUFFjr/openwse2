@@ -208,7 +208,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s <capture> <install dir> <out dir> [--frames 250,1000,1250,3000] "
                      "[--ref <ref_dir>] [--save-diff] [--no-bc] [--max-tex <px>] "
-                     "[--pipeline-cache <file>] [--driver system|mock|panvk|turnip] [--driver-path <path>] [--screen <w>x<h>]\n",
+                     "[--pipeline-cache <file>] [--driver system|mock|panvk|turnip] [--driver-path <path>] "
+                     "[--screen <w>x<h>] [--render-scale <s>] [--auto-res] [--sharpen <x>] [--fxaa]\n",
                      argv[0]);
         return 2;
     }
@@ -230,6 +231,10 @@ int main(int argc, char** argv) {
     std::string texcache_dir;
     std::string driver_kind = "system";
     std::string driver_path;
+    float render_scale = 1.0F;
+    bool auto_res = false;
+    float sharpen = 0.0F;
+    bool fxaa = false;
 
     for (int i = 4; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -267,6 +272,14 @@ int main(int argc, char** argv) {
         } else if (arg == "--screen" && i + 1 < argc) {  // the r4_run --screen of the captured run
             int sw = 0, sh = 0;
             if (std::sscanf(argv[++i], "%dx%d", &sw, &sh) == 2) wse::recomp::shim::set_screen_size(sw, sh);
+        } else if (arg == "--render-scale" && i + 1 < argc) {
+            render_scale = std::strtof(argv[++i], nullptr);
+        } else if (arg == "--auto-res") {
+            auto_res = true;
+        } else if (arg == "--sharpen" && i + 1 < argc) {
+            sharpen = std::strtof(argv[++i], nullptr);
+        } else if (arg == "--fxaa") {
+            fxaa = true;
         }
     }
 
@@ -320,6 +333,10 @@ int main(int argc, char** argv) {
     cfg.eager_shader_compile = eager_shaders;
     cfg.max_texture_size = max_tex;
     cfg.pipeline_cache_path = pipeline_cache;
+    cfg.render_scale = std::clamp(render_scale, 0.5F, 1.0F);
+    cfg.auto_resolution = auto_res;
+    cfg.sharpness = std::max(0.0F, sharpen);
+    cfg.fxaa = fxaa;
     wse::platform::VulkanD3d9Backend backend(loader, std::move(cfg));
 
     wse::recomp::D3d9CaptureReplayer replayer(backend);

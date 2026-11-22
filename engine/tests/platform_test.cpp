@@ -3269,6 +3269,79 @@ void test_r5a_vulkan_d3d9_backend() {
         std::filesystem::remove_all(tex_cache, ec);
     }
 
+    // 1a-fsr. R5b FSR upscaling, sharpening, FXAA, scale_rect helper, and dynamic resolution on Mock ICD.
+    {
+        const auto ext = wse::platform::scaled_render_extent(2412U, 1080U, 0.5F);
+        expect(ext.first == 1206U && ext.second == 540U, "R5b scaled_render_extent: 2412x1080 * 0.5 == 1206x540");
+        const auto sr = wse::platform::scale_rect(100, 50, 1920, 1080, 0.5F, 960U, 540U);
+        expect(sr.left == 50 && sr.top == 25 && sr.right == 960 && sr.bottom == 540,
+               "R5b scale_rect: scales and clamps rect inside scaled extent");
+
+        auto loader = std::make_shared<VulkanDriverLoader>();
+        VulkanMockConfig mc{};
+        mc.mode = DriverMode::panvk;
+        mc.device_name = "Mock PanVK R5b FSR";
+        VulkanDriverProbeResult probe{};
+        expect(loader->load_mock_icd(mc) && loader->probe_and_create_device(probe) && probe.ok,
+               "R5b FSR: open Mock PanVK ICD");
+
+        {
+            VulkanD3d9Config cfg{};
+            cfg.render_scale = 0.5F;
+            cfg.sharpness = 0.2F;
+            VulkanD3d9Backend bk(loader, cfg);
+            expect(bk.init(64, 64, 21, 75), "R5b FSR: init with render_scale=0.5 sharpness=0.2");
+            expect(std::fabs(bk.current_render_scale() - 0.5F) < 1e-4F,
+                   "R5b FSR: current_render_scale() == 0.5");
+            const std::string sum = bk.report().format_summary();
+            expect(sum.find("easu+rcas") != std::string::npos &&
+                       sum.find("post_shaders=ok") != std::string::npos,
+                   "R5b FSR: report shows easu+rcas passes and post_shaders=ok");
+
+            D3d9DrawState st{};
+            st.viewport = {0, 0, 64, 64, 0.0F, 1.0F};
+            bk.clear(st, 3, 0xFF102030U, 1.0F, 0, {});
+            bk.draw_primitive(st, 4, 0, 1);
+            std::vector<std::uint8_t> rgba;
+            std::uint32_t rw = 0, rh = 0;
+            expect(bk.present(&rgba, &rw, &rh) && rw == 64U && rh == 64U &&
+                       rgba.size() == 64U * 64U * 4U && bk.failed_shader_count() == 0U,
+                   "R5b FSR: clear + draw + present returns full 64x64 readback with 0 failed shaders");
+        }
+
+        {
+            VulkanD3d9Config cfg{};
+            cfg.auto_resolution = true;
+            cfg.target_fps = 60.0F;
+            cfg.min_render_scale = 0.5F;
+            VulkanD3d9Backend bk(loader, cfg);
+            expect(bk.init(64, 64, 21, 75), "R5b DynRes: init with auto_resolution=true");
+            for (int i = 0; i < 32; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(22));
+                expect(bk.present(), "R5b DynRes: present succeeds");
+            }
+            expect(bk.current_render_scale() < 1.0F,
+                   "R5b DynRes: slow frame times drive current_render_scale() below 1.0");
+            bk.set_thermal_status(ThermalStatus::Severe);
+            expect(bk.present(), "R5b DynRes: present after thermal Severe");
+            expect(bk.current_render_scale() <= 0.75F + 1e-4F,
+                   "R5b DynRes: thermal Severe caps current_render_scale() at 0.75");
+        }
+
+        {
+            VulkanD3d9Config cfg{};
+            cfg.fxaa = true;
+            VulkanD3d9Backend bk(loader, cfg);
+            expect(bk.init(64, 64, 21, 75), "R5b FXAA: init with fxaa=true");
+            expect(bk.report().format_summary().find("passes=fxaa") != std::string::npos,
+                   "R5b FXAA: report shows passes=fxaa");
+            std::vector<std::uint8_t> rgba;
+            std::uint32_t rw = 0, rh = 0;
+            expect(bk.present(&rgba, &rw, &rh) && rw == 64U && rh == 64U && bk.failed_shader_count() == 0U,
+                   "R5b FXAA: present succeeds");
+        }
+    }
+
     // 1b. Direct-ICD Mock PanVK / Turnip AHB presentation extension negotiation & fallback (R5a step 5).
     {
         const MockVulkanObjectStats before = mock_vulkan_object_stats();

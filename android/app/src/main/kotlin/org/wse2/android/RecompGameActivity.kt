@@ -190,6 +190,10 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback {
         val nativeLibDir = intent.getStringExtra(EXTRA_NATIVE_LIB_DIR).orEmpty()
         val shaderCacheDir = intent.getStringExtra(EXTRA_SHADER_CACHE_DIR).orEmpty()
         val maxTextureSize = intent.getIntExtra(EXTRA_MAX_TEXTURE_SIZE, 0).coerceAtLeast(0)
+        val renderScale = intent.getFloatExtra(EXTRA_RENDER_SCALE, 1.0f).coerceIn(0.5f, 1.0f)
+        val autoResolution = intent.getBooleanExtra(EXTRA_AUTO_RESOLUTION, true)
+        val sharpness = intent.getFloatExtra(EXTRA_SHARPNESS, 0.2f).coerceAtLeast(0.0f)
+        val fxaa = intent.getBooleanExtra(EXTRA_FXAA, false)
 
         val hudListener = object : R4Native.HudListener {
             override fun onHudUpdate(text: String) {
@@ -218,6 +222,10 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback {
                     nativeLibDir,
                     shaderCacheDir,
                     maxTextureSize,
+                    renderScale,
+                    autoResolution,
+                    sharpness,
+                    fxaa,
                     hudListener
                 )
             } catch (t: Throwable) {
@@ -307,5 +315,9 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback {
         const val EXTRA_NATIVE_LIB_DIR = "wse2.r5a.NATIVE_LIB_DIR"
         const val EXTRA_SHADER_CACHE_DIR = "wse2.r5a.SHADER_CACHE_DIR"
         const val EXTRA_MAX_TEXTURE_SIZE = "wse2.r5a.MAX_TEXTURE_SIZE"
+        const val EXTRA_RENDER_SCALE = "wse2.r5b.RENDER_SCALE"
+        const val EXTRA_AUTO_RESOLUTION = "wse2.r5b.AUTO_RESOLUTION"
+        const val EXTRA_SHARPNESS = "wse2.r5b.SHARPNESS"
+        const val EXTRA_FXAA = "wse2.r5b.FXAA"
     }
 }

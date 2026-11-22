@@ -13,10 +13,13 @@
 #include "wse/asset/shader.h"
 #include "wse/asset/shader_compiler.h"
 #include "wse/asset/texture_cache.h"
+#include "wse/platform/dynres.h"
+#include "wse/platform/postfx_shaders.h"
 #include "wse/recomp/d3d9_shader.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -320,6 +323,7 @@ struct VkProcs {
     PFN_vkGetPhysicalDeviceFeatures get_phys_features = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties get_phys_mem_props = nullptr;
     PFN_vkGetPhysicalDeviceFormatProperties get_phys_format_props = nullptr;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties get_phys_queue_family_props = nullptr;
 
     PFN_vkDeviceWaitIdle device_wait_idle = nullptr;
     PFN_vkAllocateMemory allocate_memory = nullptr;
@@ -397,6 +401,12 @@ struct VkProcs {
     PFN_vkCmdBindIndexBuffer cmd_bind_index_buffer = nullptr;
     PFN_vkCmdDraw cmd_draw = nullptr;
     PFN_vkCmdDrawIndexed cmd_draw_indexed = nullptr;
+    PFN_vkCmdPushConstants cmd_push_constants = nullptr;
+    PFN_vkCreateQueryPool create_query_pool = nullptr;
+    PFN_vkDestroyQueryPool destroy_query_pool = nullptr;
+    PFN_vkGetQueryPoolResults get_query_pool_results = nullptr;
+    PFN_vkCmdResetQueryPool cmd_reset_query_pool = nullptr;
+    PFN_vkCmdWriteTimestamp cmd_write_timestamp = nullptr;
 
 #ifdef __ANDROID__
     // Optional WSI + Android AHardwareBuffer presentation entry points.
@@ -433,6 +443,7 @@ struct VkProcs {
         ri("vkGetPhysicalDeviceFeatures", get_phys_features);
         ri("vkGetPhysicalDeviceMemoryProperties", get_phys_mem_props);
         ri("vkGetPhysicalDeviceFormatProperties", get_phys_format_props);
+        ri("vkGetPhysicalDeviceQueueFamilyProperties", get_phys_queue_family_props);
 
         rd("vkDeviceWaitIdle", device_wait_idle);
         rd("vkAllocateMemory", allocate_memory);
@@ -510,6 +521,12 @@ struct VkProcs {
         rd("vkCmdBindIndexBuffer", cmd_bind_index_buffer);
         rd("vkCmdDraw", cmd_draw);
         rd("vkCmdDrawIndexed", cmd_draw_indexed);
+        rd("vkCmdPushConstants", cmd_push_constants);
+        rd("vkCreateQueryPool", create_query_pool);
+        rd("vkDestroyQueryPool", destroy_query_pool);
+        rd("vkGetQueryPoolResults", get_query_pool_results);
+        rd("vkCmdResetQueryPool", cmd_reset_query_pool);
+        rd("vkCmdWriteTimestamp", cmd_write_timestamp);
 
 #ifdef __ANDROID__
         ri("vkCreateAndroidSurfaceKHR", create_android_surface);
@@ -987,6 +1004,8 @@ struct VulkanD3d9Backend::Impl {
         RingBuf stage{};
         VkDescriptorSet ubo_set = VK_NULL_HANDLE;
         std::vector<RetiredBuf> retired;
+        VkQueryPool query_pool = VK_NULL_HANDLE;
+        bool has_timestamps = false;
 #ifdef __ANDROID__
         // Safe to reuse once this slot's fence has signaled: the submit that waited on it is done.
         VkSemaphore sc_acquire = VK_NULL_HANDLE;
@@ -1159,6 +1178,43 @@ struct VulkanD3d9Backend::Impl {
     std::uint64_t presented_frames = 0;
     std::uint64_t fps_win_frames = 0;
     double last_inst_fps = 0.0;
+
+    // R5b FSR upscaling, sharpening, FXAA, and dynamic resolution.
+    DynamicResolution dyn_res{};
+    ThermalStatus thermal_status = ThermalStatus::None;
+    std::atomic<float> active_scale{1.0F};
+    bool timestamp_queries_supported = false;
+    float timestamp_period_ns = 0.0F;
+    bool frame_has_start_ts = false;
+    double last_gpu_frame_ms = -1.0;
+    bool has_last_present_tp = false;
+    std::chrono::steady_clock::time_point last_present_tp{};
+
+    bool post_shaders_attempted = false;
+    bool post_shaders_ok = false;
+    std::string post_shader_status = "unused";
+    VkShaderModule post_vs = VK_NULL_HANDLE;
+    VkShaderModule post_easu_fs = VK_NULL_HANDLE;
+    VkShaderModule post_rcas_fs = VK_NULL_HANDLE;
+    VkShaderModule post_fxaa_fs = VK_NULL_HANDLE;
+    VkDescriptorSetLayout post_dsl = VK_NULL_HANDLE;
+    VkPipelineLayout post_pipeline_layout = VK_NULL_HANDLE;
+    VkRenderPass post_rp = VK_NULL_HANDLE;
+    VkSampler post_sampler = VK_NULL_HANDLE;
+    VkPipeline post_easu_pip = VK_NULL_HANDLE;
+    VkPipeline post_rcas_pip = VK_NULL_HANDLE;
+    VkPipeline post_fxaa_pip = VK_NULL_HANDLE;
+    VkDescriptorPool post_desc_pool = VK_NULL_HANDLE;
+    struct PostImg {
+        VkImage img = VK_NULL_HANDLE;
+        MemAlloc mem{};
+        VkImageView view = VK_NULL_HANDLE;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+    };
+    std::array<PostImg, 2> post_imgs{};
+    VkDescriptorSet post_bb_ds = VK_NULL_HANDLE;
 
 #ifdef __ANDROID__
     enum class AndroidPresentPath { none, swapchain, ahb_surface_control, native_window_cpu };
@@ -1692,18 +1748,21 @@ struct VulkanD3d9Backend::Impl {
                 vk.cmd_end_render_pass(frame_cmd);
                 render_pass_active = false;
             }
+            VkImage src_img = bb_img;
+            VkImageLayout src_layout = bb_layout;
+            run_postfx_passes_locked(src_img, src_layout);
             const bool do_rb = (out_rgba8 != nullptr) && ensure_readback(rb_bytes, &last_error);
 
             std::array<VkImageMemoryBarrier, 2> pre_bars{};
             pre_bars[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pre_bars[0].oldLayout = bb_layout;
+            pre_bars[0].oldLayout = src_layout;
             pre_bars[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             pre_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             pre_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            pre_bars[0].image = bb_img;
+            pre_bars[0].image = src_img;
             pre_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
             pre_bars[0].srcAccessMask =
-                (bb_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
+                (src_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
             pre_bars[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
             pre_bars[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1726,7 +1785,7 @@ struct VulkanD3d9Backend::Impl {
                 VkBufferImageCopy cpy{};
                 cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 cpy.imageExtent = {bb_width, bb_height, 1U};
-                vk.cmd_copy_image_to_buffer(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vk.cmd_copy_image_to_buffer(frame_cmd, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                             readback_buf, 1U, &cpy);
             }
 
@@ -1767,7 +1826,7 @@ struct VulkanD3d9Backend::Impl {
                 ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 ic.extent = {bb_width, bb_height, 1U};
-                vk.cmd_copy_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vk.cmd_copy_image(frame_cmd, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   sc_images[img_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &ic);
             } else if (vk.cmd_blit_image != nullptr) {
                 VkImageBlit bl{};
@@ -1777,7 +1836,7 @@ struct VulkanD3d9Backend::Impl {
                 bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 bl.dstOffsets[0] = {dst_x, dst_y, 0};
                 bl.dstOffsets[1] = {dst_x + dst_w, dst_y + dst_h, 1};
-                vk.cmd_blit_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vk.cmd_blit_image(frame_cmd, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   sc_images[img_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &bl, VK_FILTER_LINEAR);
             }
 
@@ -1787,7 +1846,7 @@ struct VulkanD3d9Backend::Impl {
             post_bars[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             post_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             post_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            post_bars[0].image = bb_img;
+            post_bars[0].image = src_img;
             post_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
             post_bars[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             post_bars[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1805,7 +1864,7 @@ struct VulkanD3d9Backend::Impl {
             vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr,
                                     2U, post_bars.data());
-            bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            if (src_img == bb_img) bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
             // No wait here: the next frame records while this one draws (readback alone waits).
             if (!submit_frame_locked(acquire_sem, VK_PIPELINE_STAGE_TRANSFER_BIT, done_sem, do_rb)) return false;
@@ -1845,18 +1904,21 @@ struct VulkanD3d9Backend::Impl {
                 vk.cmd_end_render_pass(frame_cmd);
                 render_pass_active = false;
             }
+            VkImage src_img = bb_img;
+            VkImageLayout src_layout = bb_layout;
+            run_postfx_passes_locked(src_img, src_layout);
             const bool do_rb = (out_rgba8 != nullptr) && ensure_readback(rb_bytes, &last_error);
 
             std::array<VkImageMemoryBarrier, 2> pre_bars{};
             pre_bars[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            pre_bars[0].oldLayout = bb_layout;
+            pre_bars[0].oldLayout = src_layout;
             pre_bars[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             pre_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             pre_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            pre_bars[0].image = bb_img;
+            pre_bars[0].image = src_img;
             pre_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
             pre_bars[0].srcAccessMask =
-                (bb_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
+                (src_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
             pre_bars[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
             pre_bars[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1877,7 +1939,7 @@ struct VulkanD3d9Backend::Impl {
                 VkBufferImageCopy cpy{};
                 cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 cpy.imageExtent = {bb_width, bb_height, 1U};
-                vk.cmd_copy_image_to_buffer(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vk.cmd_copy_image_to_buffer(frame_cmd, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                             readback_buf, 1U, &cpy);
             }
 
@@ -1886,7 +1948,7 @@ struct VulkanD3d9Backend::Impl {
                 ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 ic.extent = {bb_width, bb_height, 1U};
-                vk.cmd_copy_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vk.cmd_copy_image(frame_cmd, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   slot.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &ic);
             } else if (vk.cmd_blit_image != nullptr) {
                 VkImageBlit bl{};
@@ -1896,7 +1958,7 @@ struct VulkanD3d9Backend::Impl {
                 bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                 bl.dstOffsets[0] = {0, 0, 0};
                 bl.dstOffsets[1] = {static_cast<std::int32_t>(bb_width), static_cast<std::int32_t>(bb_height), 1};
-                vk.cmd_blit_image(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                vk.cmd_blit_image(frame_cmd, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   slot.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1U, &bl, VK_FILTER_NEAREST);
             }
 
@@ -1906,7 +1968,7 @@ struct VulkanD3d9Backend::Impl {
             post_bars[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             post_bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             post_bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            post_bars[0].image = bb_img;
+            post_bars[0].image = src_img;
             post_bars[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
             post_bars[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             post_bars[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1924,7 +1986,7 @@ struct VulkanD3d9Backend::Impl {
             vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0U, 0U, nullptr, 0U, nullptr,
                                     2U, post_bars.data());
-            bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            if (src_img == bb_img) bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
             // The compositor gets no GPU fence, so a buffer is handed over only once its frame has
             // finished: `advance_frame_slot()` waits for the previous frame, then
@@ -2100,26 +2162,29 @@ struct VulkanD3d9Backend::Impl {
             vk.cmd_end_render_pass(frame_cmd);
             render_pass_active = false;
         }
+        VkImage src_img = bb_img;
+        VkImageLayout src_layout = bb_layout;
+        run_postfx_passes_locked(src_img, src_layout);
         CpuReadback& slot_rb = cpu_rb[cur_slot];
         const bool rb_ok = ensure_cpu_readback(slot_rb, rb_bytes);
         if (rb_ok) {
             VkImageMemoryBarrier bar{};
             bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            bar.oldLayout = bb_layout;
+            bar.oldLayout = src_layout;
             bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bar.image = bb_img;
+            bar.image = src_img;
             bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
             bar.srcAccessMask =
-                (bb_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
+                (src_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0U;
             bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
             VkBufferImageCopy cpy{};
             cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
             cpy.imageExtent = {bb_width, bb_height, 1U};
-            vk.cmd_copy_image_to_buffer(frame_cmd, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vk.cmd_copy_image_to_buffer(frame_cmd, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                         slot_rb.buf, 1U, &cpy);
             bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -2134,7 +2199,7 @@ struct VulkanD3d9Backend::Impl {
             hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
             vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0U, 1U, &hb,
                                     0U, nullptr, 0U, nullptr);
-            bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            if (src_img == bb_img) bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         }
         const bool want_pixels = out_rgba8 != nullptr;
         if (!submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, want_pixels)) return false;
@@ -2228,6 +2293,7 @@ struct VulkanD3d9Backend::Impl {
                 dsl_ubo = VK_NULL_HANDLE;
             }
 
+            destroy_postfx_pipelines();
             destroy_backbuffer();
             for (auto& [k, rp] : render_passes) {
                 (void)k;
@@ -2300,9 +2366,16 @@ struct VulkanD3d9Backend::Impl {
                 upload_fence = VK_NULL_HANDLE;
             }
             for (FrameSlot& s : slots) {
+                if (s.query_pool != VK_NULL_HANDLE && vk.destroy_query_pool != nullptr) {
+                    vk.destroy_query_pool(h.device, s.query_pool, nullptr);
+                    s.query_pool = VK_NULL_HANDLE;
+                }
+                s.has_timestamps = false;
                 if (s.fence != VK_NULL_HANDLE) vk.destroy_fence(h.device, s.fence, nullptr);
                 s.fence = VK_NULL_HANDLE;
             }
+            timestamp_queries_supported = false;
+            frame_has_start_ts = false;
             if (h.command_pool != VK_NULL_HANDLE) {
                 std::vector<VkCommandBuffer> cbs;
                 if (upload_cmd != VK_NULL_HANDLE) cbs.push_back(upload_cmd);
@@ -2398,10 +2471,17 @@ struct VulkanD3d9Backend::Impl {
             up_recording = false;
             if (vk.end_cmd_buffer(up_cmd) == VK_SUCCESS) cbs[n++] = up_cmd;
         }
+        if (render_pass_active) {
+            vk.cmd_end_render_pass(frame_cmd);
+            render_pass_active = false;
+        }
         if (frame_recording) {
-            if (render_pass_active) {
-                vk.cmd_end_render_pass(frame_cmd);
-                render_pass_active = false;
+            if (frame_has_start_ts && slots[cur_slot].query_pool != VK_NULL_HANDLE &&
+                vk.cmd_write_timestamp != nullptr) {
+                vk.cmd_write_timestamp(frame_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                       slots[cur_slot].query_pool, 1U);
+                slots[cur_slot].has_timestamps = true;
+                frame_has_start_ts = false;
             }
             frame_recording = false;
             if (vk.end_cmd_buffer(frame_cmd) != VK_SUCCESS) return false;
@@ -2441,6 +2521,18 @@ struct VulkanD3d9Backend::Impl {
         cur_slot = (cur_slot + 1U) % kFramesInFlight;
         load_slot();
         wait_current_slot();
+        if (slots[cur_slot].query_pool != VK_NULL_HANDLE && slots[cur_slot].has_timestamps &&
+            vk.get_query_pool_results != nullptr && timestamp_period_ns > 0.0F) {
+            std::uint64_t ts[2]{0U, 0U};
+            const VkResult qr = vk.get_query_pool_results(
+                h.device, slots[cur_slot].query_pool, 0U, 2U, sizeof(ts), ts, sizeof(std::uint64_t),
+                VK_QUERY_RESULT_64_BIT);
+            if (qr == VK_SUCCESS && ts[1] >= ts[0]) {
+                last_gpu_frame_ms =
+                    static_cast<double>(ts[1] - ts[0]) * static_cast<double>(timestamp_period_ns) / 1e6;
+            }
+            slots[cur_slot].has_timestamps = false;
+        }
         ubo_ring.cursor = 0U;
         dyn_geom_ring.cursor = 0U;
         stage_ring.cursor = 0U;
@@ -2595,7 +2687,498 @@ struct VulkanD3d9Backend::Impl {
         t.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
 
+    void destroy_postfx_targets() noexcept {
+        for (PostImg& p : post_imgs) {
+            if (p.fb != VK_NULL_HANDLE) {
+                vk.destroy_framebuffer(h.device, p.fb, nullptr);
+                p.fb = VK_NULL_HANDLE;
+            }
+            if (p.view != VK_NULL_HANDLE) {
+                vk.destroy_image_view(h.device, p.view, nullptr);
+                p.view = VK_NULL_HANDLE;
+            }
+            if (p.img != VK_NULL_HANDLE) {
+                vk.destroy_image(h.device, p.img, nullptr);
+                p.img = VK_NULL_HANDLE;
+            }
+            alloc.free(p.mem);
+            p.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            p.ds = VK_NULL_HANDLE;
+        }
+        post_bb_ds = VK_NULL_HANDLE;
+        if (post_desc_pool != VK_NULL_HANDLE) {
+            vk.destroy_desc_pool(h.device, post_desc_pool, nullptr);
+            post_desc_pool = VK_NULL_HANDLE;
+        }
+    }
+
+    void destroy_postfx_pipelines() noexcept {
+        destroy_postfx_targets();
+        for (VkPipeline* p : {&post_easu_pip, &post_rcas_pip, &post_fxaa_pip}) {
+            if (*p != VK_NULL_HANDLE) {
+                vk.destroy_pipeline(h.device, *p, nullptr);
+                *p = VK_NULL_HANDLE;
+            }
+        }
+        for (VkShaderModule* m : {&post_vs, &post_easu_fs, &post_rcas_fs, &post_fxaa_fs}) {
+            if (*m != VK_NULL_HANDLE) {
+                vk.destroy_shader_module(h.device, *m, nullptr);
+                *m = VK_NULL_HANDLE;
+            }
+        }
+        if (post_rp != VK_NULL_HANDLE) {
+            vk.destroy_render_pass(h.device, post_rp, nullptr);
+            post_rp = VK_NULL_HANDLE;
+        }
+        if (post_pipeline_layout != VK_NULL_HANDLE) {
+            vk.destroy_pipeline_layout(h.device, post_pipeline_layout, nullptr);
+            post_pipeline_layout = VK_NULL_HANDLE;
+        }
+        if (post_dsl != VK_NULL_HANDLE) {
+            vk.destroy_desc_set_layout(h.device, post_dsl, nullptr);
+            post_dsl = VK_NULL_HANDLE;
+        }
+        if (post_sampler != VK_NULL_HANDLE) {
+            vk.destroy_sampler(h.device, post_sampler, nullptr);
+            post_sampler = VK_NULL_HANDLE;
+        }
+        post_shaders_attempted = false;
+        post_shaders_ok = false;
+        post_shader_status = "unused";
+    }
+
+    void update_render_report() {
+        const float s = active_scale.load(std::memory_order_relaxed);
+        char sbuf[32];
+        std::snprintf(sbuf, sizeof(sbuf), "%.2f", s);
+        std::string passes;
+        auto add_pass = [&](std::string_view name) {
+            if (!passes.empty()) passes += '+';
+            passes += name;
+        };
+        if (config.fxaa) add_pass("fxaa");
+        if (s < 1.0F) add_pass("easu");
+        if (config.sharpness > 0.0F) add_pass("rcas");
+        if (passes.empty()) passes = "none";
+        report.render_summary = std::string("scale=") + sbuf +
+                                (config.auto_resolution ? " (auto)" : " (fixed)") +
+                                " passes=" + passes +
+                                " post_shaders=" + post_shader_status;
+    }
+
+    bool compile_post_shader(std::string_view glsl, wse::asset::SpirvStage stage, VkShaderModule& out_mod,
+                             std::string& err_out) {
+        if (!compiler) {
+            err_out = "compiler unavailable";
+            return false;
+        }
+        std::vector<std::uint32_t> spv;
+        std::string log;
+        if (!compiler->compile_vulkan_glsl_to_spirv(glsl, stage, "main", spv, nullptr, &log) || spv.empty()) {
+            err_out = log.empty() ? "glslang compile failed" : log;
+            return false;
+        }
+        if (!gpu_ready) return true;
+        VkShaderModuleCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        ci.codeSize = spv.size() * sizeof(std::uint32_t);
+        ci.pCode = spv.data();
+        if (vk.create_shader_module(h.device, &ci, nullptr, &out_mod) != VK_SUCCESS || out_mod == VK_NULL_HANDLE) {
+            err_out = "vkCreateShaderModule failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool init_postfx_locked() {
+        if (post_shaders_attempted) return post_shaders_ok;
+        post_shaders_attempted = true;
+        post_shaders_ok = false;
+
+        std::string err_msg;
+        if (!compile_post_shader(kPostVertex, wse::asset::SpirvStage::Vertex, post_vs, err_msg) ||
+            !compile_post_shader(kFsrEasu, wse::asset::SpirvStage::Fragment, post_easu_fs, err_msg) ||
+            !compile_post_shader(kFsrRcas, wse::asset::SpirvStage::Fragment, post_rcas_fs, err_msg) ||
+            !compile_post_shader(kFxaa, wse::asset::SpirvStage::Fragment, post_fxaa_fs, err_msg)) {
+            post_shader_status = "failed(" + err_msg + ")";
+            report.missing_features.push_back("postfx_shaders: " + err_msg);
+            destroy_postfx_pipelines();
+            post_shaders_attempted = true;
+            post_shaders_ok = false;
+            post_shader_status = "failed(" + err_msg + ")";
+            return false;
+        }
+
+        if (!gpu_ready) {
+            post_shaders_ok = true;
+            post_shader_status = "ok";
+            return true;
+        }
+
+        if (vk.cmd_push_constants == nullptr) {
+            post_shader_status = "failed(missing vkCmdPushConstants)";
+            report.missing_features.push_back("postfx_shaders: missing vkCmdPushConstants");
+            destroy_postfx_pipelines();
+            post_shaders_attempted = true;
+            post_shaders_ok = false;
+            post_shader_status = "failed(missing vkCmdPushConstants)";
+            return false;
+        }
+
+        VkDescriptorSetLayoutBinding b{};
+        b.binding = 0U;
+        b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b.descriptorCount = 1U;
+        b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo dsl_ci{};
+        dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dsl_ci.bindingCount = 1U;
+        dsl_ci.pBindings = &b;
+        if (vk.create_desc_set_layout(h.device, &dsl_ci, nullptr, &post_dsl) != VK_SUCCESS) {
+            post_shader_status = "failed(post_dsl)";
+            destroy_postfx_pipelines();
+            post_shaders_attempted = true;
+            post_shaders_ok = false;
+            post_shader_status = "failed(post_dsl)";
+            return false;
+        }
+
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pcr.offset = 0U;
+        pcr.size = sizeof(EasuConstants);
+        VkPipelineLayoutCreateInfo pl_ci{};
+        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl_ci.setLayoutCount = 1U;
+        pl_ci.pSetLayouts = &post_dsl;
+        pl_ci.pushConstantRangeCount = 1U;
+        pl_ci.pPushConstantRanges = &pcr;
+        if (vk.create_pipeline_layout(h.device, &pl_ci, nullptr, &post_pipeline_layout) != VK_SUCCESS) {
+            post_shader_status = "failed(post_pipeline_layout)";
+            destroy_postfx_pipelines();
+            post_shaders_attempted = true;
+            post_shaders_ok = false;
+            post_shader_status = "failed(post_pipeline_layout)";
+            return false;
+        }
+
+        VkAttachmentDescription att{};
+        att.format = VK_FORMAT_R8G8B8A8_UNORM;
+        att.samples = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference cref{0U, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1U;
+        sub.pColorAttachments = &cref;
+        VkRenderPassCreateInfo rp_ci{};
+        rp_ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rp_ci.attachmentCount = 1U;
+        rp_ci.pAttachments = &att;
+        rp_ci.subpassCount = 1U;
+        rp_ci.pSubpasses = &sub;
+        if (vk.create_render_pass(h.device, &rp_ci, nullptr, &post_rp) != VK_SUCCESS) {
+            post_shader_status = "failed(post_rp)";
+            destroy_postfx_pipelines();
+            post_shaders_attempted = true;
+            post_shaders_ok = false;
+            post_shader_status = "failed(post_rp)";
+            return false;
+        }
+
+        VkSamplerCreateInfo sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter = VK_FILTER_LINEAR;
+        sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxAnisotropy = 1.0F;
+        if (vk.create_sampler(h.device, &sci, nullptr, &post_sampler) != VK_SUCCESS) {
+            post_shader_status = "failed(post_sampler)";
+            destroy_postfx_pipelines();
+            post_shaders_attempted = true;
+            post_shaders_ok = false;
+            post_shader_status = "failed(post_sampler)";
+            return false;
+        }
+
+        auto make_pip = [&](VkShaderModule fs, VkPipeline& out_pip) -> bool {
+            std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+            stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = post_vs;
+            stages[0].pName = "main";
+            stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = fs;
+            stages[1].pName = "main";
+
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1U;
+            vp.scissorCount = 1U;
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_NONE;
+            rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth = 1.0F;
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo ds{};
+            ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            VkPipelineColorBlendAttachmentState cba{};
+            cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cb{};
+            cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cb.attachmentCount = 1U;
+            cb.pAttachments = &cba;
+            std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dy{};
+            dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dy.dynamicStateCount = 2U;
+            dy.pDynamicStates = dyn_states.data();
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.stageCount = 2U;
+            gpci.pStages = stages.data();
+            gpci.pVertexInputState = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState = &ms;
+            gpci.pDepthStencilState = &ds;
+            gpci.pColorBlendState = &cb;
+            gpci.pDynamicState = &dy;
+            gpci.layout = post_pipeline_layout;
+            gpci.renderPass = post_rp;
+            return vk.create_graphics_pipelines(h.device, pipeline_cache, 1U, &gpci, nullptr, &out_pip) == VK_SUCCESS;
+        };
+
+        if (!make_pip(post_easu_fs, post_easu_pip) ||
+            !make_pip(post_rcas_fs, post_rcas_pip) ||
+            !make_pip(post_fxaa_fs, post_fxaa_pip)) {
+            post_shader_status = "failed(post_pipeline)";
+            destroy_postfx_pipelines();
+            post_shaders_attempted = true;
+            post_shaders_ok = false;
+            post_shader_status = "failed(post_pipeline)";
+            return false;
+        }
+
+        post_shaders_ok = true;
+        post_shader_status = "ok";
+        return true;
+    }
+
+    bool ensure_postfx_targets_locked() {
+        if (!gpu_ready || bb_img == VK_NULL_HANDLE || bb_view == VK_NULL_HANDLE) return false;
+        if (!init_postfx_locked()) return false;
+        if (post_imgs[0].img != VK_NULL_HANDLE && post_imgs[1].img != VK_NULL_HANDLE &&
+            post_bb_ds != VK_NULL_HANDLE) {
+            return true;
+        }
+        destroy_postfx_targets();
+
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3U};
+        VkDescriptorPoolCreateInfo dpci{};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = 3U;
+        dpci.poolSizeCount = 1U;
+        dpci.pPoolSizes = &ps;
+        if (vk.create_desc_pool(h.device, &dpci, nullptr, &post_desc_pool) != VK_SUCCESS) {
+            destroy_postfx_targets();
+            return false;
+        }
+
+        std::array<VkDescriptorSetLayout, 3> layouts{post_dsl, post_dsl, post_dsl};
+        std::array<VkDescriptorSet, 3> sets{};
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = post_desc_pool;
+        dsai.descriptorSetCount = 3U;
+        dsai.pSetLayouts = layouts.data();
+        if (vk.allocate_desc_sets(h.device, &dsai, sets.data()) != VK_SUCCESS) {
+            destroy_postfx_targets();
+            return false;
+        }
+        post_bb_ds = sets[0];
+        post_imgs[0].ds = sets[1];
+        post_imgs[1].ds = sets[2];
+
+        for (std::size_t i = 0; i < 2U; ++i) {
+            PostImg& p = post_imgs[i];
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ici.extent = {bb_width, bb_height, 1U};
+            ici.mipLevels = 1U;
+            ici.arrayLayers = 1U;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vk.create_image(h.device, &ici, nullptr, &p.img) != VK_SUCCESS) {
+                destroy_postfx_targets();
+                return false;
+            }
+            VkMemoryRequirements reqs{};
+            vk.get_image_mem_reqs(h.device, p.img, &reqs);
+            if (!alloc.alloc(reqs, true, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0U, p.mem, &last_error) ||
+                vk.bind_image_memory(h.device, p.img, p.mem.memory, p.mem.offset) != VK_SUCCESS) {
+                destroy_postfx_targets();
+                return false;
+            }
+            VkImageViewCreateInfo ivci{};
+            ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            ivci.image = p.img;
+            ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            ivci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            if (vk.create_image_view(h.device, &ivci, nullptr, &p.view) != VK_SUCCESS) {
+                destroy_postfx_targets();
+                return false;
+            }
+            VkFramebufferCreateInfo fbci{};
+            fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            fbci.renderPass = post_rp;
+            fbci.attachmentCount = 1U;
+            fbci.pAttachments = &p.view;
+            fbci.width = bb_width;
+            fbci.height = bb_height;
+            fbci.layers = 1U;
+            if (vk.create_framebuffer(h.device, &fbci, nullptr, &p.fb) != VK_SUCCESS) {
+                destroy_postfx_targets();
+                return false;
+            }
+            p.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        }
+
+        std::array<VkDescriptorImageInfo, 3> dii{
+            VkDescriptorImageInfo{post_sampler, bb_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            VkDescriptorImageInfo{post_sampler, post_imgs[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            VkDescriptorImageInfo{post_sampler, post_imgs[1].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        };
+        std::array<VkWriteDescriptorSet, 3> writes{};
+        for (std::size_t i = 0; i < 3U; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = sets[i];
+            writes[i].dstBinding = 0U;
+            writes[i].descriptorCount = 1U;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &dii[i];
+        }
+        vk.update_desc_sets(h.device, 3U, writes.data(), 0U, nullptr);
+        return true;
+    }
+
+    void run_postfx_passes_locked(VkImage& out_img, VkImageLayout& out_layout) {
+        out_img = bb_img;
+        out_layout = bb_layout;
+        const float rscale = active_scale.load(std::memory_order_relaxed);
+        const bool do_fxaa = config.fxaa;
+        const bool do_easu = (rscale < 1.0F);
+        const bool do_rcas = (config.sharpness > 0.0F);
+        if (!do_fxaa && !do_easu && !do_rcas) return;
+        if (!ensure_postfx_targets_locked()) return;
+        if (!ensure_frame_recording()) return;
+
+        const auto [sw, sh] = do_easu ? scaled_render_extent(bb_width, bb_height, rscale)
+                                      : std::pair<std::uint32_t, std::uint32_t>{bb_width, bb_height};
+
+        VkImage src_img = bb_img;
+        VkImageLayout src_layout = bb_layout;
+        VkDescriptorSet src_ds = post_bb_ds;
+        int dst_idx = 0;
+
+        auto run_pass = [&](VkPipeline pip, VkDescriptorSet ds, std::uint32_t out_w, std::uint32_t out_h,
+                            const void* pc_data, std::uint32_t pc_size) {
+            VkImageMemoryBarrier bar{};
+            bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            bar.oldLayout = src_layout;
+            bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.image = src_img;
+            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            bar.srcAccessMask = (src_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                                    ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                    : 0U;
+            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+            if (src_img == bb_img) bb_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            PostImg& dst = post_imgs[static_cast<std::size_t>(dst_idx)];
+            VkRenderPassBeginInfo rpbi{};
+            rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            rpbi.renderPass = post_rp;
+            rpbi.framebuffer = dst.fb;
+            rpbi.renderArea = {{0, 0}, {out_w, out_h}};
+            vk.cmd_begin_render_pass(frame_cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+            vk.cmd_bind_pipeline(frame_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pip);
+            VkViewport vp{0.0F, 0.0F, static_cast<float>(out_w), static_cast<float>(out_h), 0.0F, 1.0F};
+            VkRect2D sc{{0, 0}, {out_w, out_h}};
+            vk.cmd_set_viewport(frame_cmd, 0U, 1U, &vp);
+            vk.cmd_set_scissor(frame_cmd, 0U, 1U, &sc);
+            vk.cmd_bind_desc_sets(frame_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, post_pipeline_layout,
+                                  0U, 1U, &ds, 0U, nullptr);
+            if (pc_size > 0U && pc_data != nullptr) {
+                vk.cmd_push_constants(frame_cmd, post_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                      0U, pc_size, pc_data);
+            }
+            vk.cmd_draw(frame_cmd, 3U, 1U, 0U, 0U);
+            vk.cmd_end_render_pass(frame_cmd);
+
+            dst.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            src_img = dst.img;
+            src_layout = dst.layout;
+            src_ds = dst.ds;
+            dst_idx = 1 - dst_idx;
+        };
+
+        if (do_fxaa) {
+            const float fxaa_pc[2] = {0.166F, 0.0833F};
+            run_pass(post_fxaa_pip, src_ds, sw, sh, fxaa_pc, sizeof(fxaa_pc));
+        }
+        if (do_easu) {
+            const EasuConstants con = easu_constants(
+                static_cast<float>(bb_width), static_cast<float>(bb_height),
+                static_cast<float>(sw), static_cast<float>(sh),
+                static_cast<float>(bb_width), static_cast<float>(bb_height));
+            run_pass(post_easu_pip, src_ds, bb_width, bb_height, con.con, sizeof(con.con));
+        }
+        if (do_rcas) {
+            const RcasConstants con = rcas_constants(config.sharpness);
+            run_pass(post_rcas_pip, src_ds, bb_width, bb_height, con.con, sizeof(con.con));
+        }
+
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_sampler_set = VK_NULL_HANDLE;
+        out_img = src_img;
+        out_layout = src_layout;
+    }
+
     void destroy_backbuffer() noexcept {
+        destroy_postfx_targets();
         if (bb_fb != VK_NULL_HANDLE) {
             vk.destroy_framebuffer(h.device, bb_fb, nullptr);
             bb_fb = VK_NULL_HANDLE;
@@ -3103,11 +3686,32 @@ struct VulkanD3d9Backend::Impl {
             vk.get_phys_features(h.physical_device, &phys_features);
         }
 
+        // Initialize dynamic resolution controller & active scale.
+        {
+            DynResConfig dcfg{};
+            dcfg.min_scale = std::clamp(config.min_render_scale, 0.5F, 1.0F);
+            dcfg.max_scale = 1.0F;
+            dcfg.target_frame_ms = (config.target_fps > 0.0F)
+                                       ? (1000.0 / static_cast<double>(config.target_fps))
+                                       : (1000.0 / 60.0);
+            dyn_res = DynamicResolution(dcfg);
+            const float init_scale = config.auto_resolution
+                                         ? dyn_res.scale()
+                                         : std::clamp(config.render_scale, 0.5F, 1.0F);
+            active_scale.store(init_scale, std::memory_order_relaxed);
+            has_last_present_tp = false;
+            last_gpu_frame_ms = -1.0;
+        }
+
         // Mock / non-executing device: record capability report and return ok without allocating GPU resources.
         if (h.is_mock || !h.can_execute_gpu || !vk.has_core_gpu()) {
             report.texture_compression_etc2 = (phys_features.textureCompressionETC2 == VK_TRUE);
             if (!report.texture_compression_bc) report.missing_features.push_back("textureCompressionBC -> RGBA8");
             if (!h.is_mock && !vk.has_core_gpu()) report.missing_features.push_back("missing core Vulkan GPU procs");
+            if (config.auto_resolution || config.render_scale < 1.0F || config.sharpness > 0.0F || config.fxaa) {
+                (void)init_postfx_locked();
+            }
+            update_render_report();
             report.ok = true;
             initialized = true;
             gpu_ready = false;
@@ -3359,6 +3963,49 @@ struct VulkanD3d9Backend::Impl {
             return false;
         }
 
+        // Probe GPU timestamp query support.
+        timestamp_queries_supported = false;
+        timestamp_period_ns = phys_props.limits.timestampPeriod;
+        if (timestamp_period_ns > 0.0F && vk.get_phys_queue_family_props != nullptr &&
+            vk.create_query_pool != nullptr && vk.destroy_query_pool != nullptr &&
+            vk.get_query_pool_results != nullptr && vk.cmd_reset_query_pool != nullptr &&
+            vk.cmd_write_timestamp != nullptr && h.physical_device != VK_NULL_HANDLE) {
+            std::uint32_t qcnt = 0U;
+            vk.get_phys_queue_family_props(h.physical_device, &qcnt, nullptr);
+            if (qcnt > h.graphics_queue_family) {
+                std::vector<VkQueueFamilyProperties> qprops(qcnt);
+                vk.get_phys_queue_family_props(h.physical_device, &qcnt, qprops.data());
+                if (qprops[h.graphics_queue_family].timestampValidBits > 0U) {
+                    timestamp_queries_supported = true;
+                    for (FrameSlot& s : slots) {
+                        VkQueryPoolCreateInfo qpci{};
+                        qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+                        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                        qpci.queryCount = 2U;
+                        if (vk.create_query_pool(h.device, &qpci, nullptr, &s.query_pool) != VK_SUCCESS) {
+                            s.query_pool = VK_NULL_HANDLE;
+                            timestamp_queries_supported = false;
+                            break;
+                        }
+                        s.has_timestamps = false;
+                    }
+                    if (!timestamp_queries_supported) {
+                        for (FrameSlot& s : slots) {
+                            if (s.query_pool != VK_NULL_HANDLE) {
+                                vk.destroy_query_pool(h.device, s.query_pool, nullptr);
+                                s.query_pool = VK_NULL_HANDLE;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (config.auto_resolution || config.render_scale < 1.0F || config.sharpness > 0.0F || config.fxaa) {
+            (void)init_postfx_locked();
+        }
+        update_render_report();
+
 #ifdef __ANDROID__
         if (active_window != nullptr) {
             setup_android_presentation_locked();
@@ -3494,6 +4141,13 @@ struct VulkanD3d9Backend::Impl {
         frame_recording = true;
         bound_pipeline = VK_NULL_HANDLE;
         bound_sampler_set = VK_NULL_HANDLE;
+        if (slots[cur_slot].query_pool != VK_NULL_HANDLE && !frame_has_start_ts &&
+            vk.cmd_reset_query_pool != nullptr && vk.cmd_write_timestamp != nullptr) {
+            vk.cmd_reset_query_pool(frame_cmd, slots[cur_slot].query_pool, 0U, 2U);
+            vk.cmd_write_timestamp(frame_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   slots[cur_slot].query_pool, 0U);
+            frame_has_start_ts = true;
+        }
         return true;
     }
 
@@ -4289,11 +4943,27 @@ struct VulkanD3d9Backend::Impl {
         }
 
         // Dynamic viewport, scissor, depth bias, blend constants.
-        const std::uint32_t vpw = st.viewport.width != 0U ? st.viewport.width : rp_width;
-        const std::uint32_t vph = st.viewport.height != 0U ? st.viewport.height : rp_height;
+        const float rscale = (active_rt == 0U) ? active_scale.load(std::memory_order_relaxed) : 1.0F;
+        const auto [lim_w, lim_h] = (rscale < 1.0F)
+            ? scaled_render_extent(rp_width, rp_height, rscale)
+            : std::pair<std::uint32_t, std::uint32_t>{rp_width, rp_height};
+        const std::uint32_t raw_vpw = st.viewport.width != 0U ? st.viewport.width : rp_width;
+        const std::uint32_t raw_vph = st.viewport.height != 0U ? st.viewport.height : rp_height;
+        const ScaledRect svp = (rscale < 1.0F)
+            ? scale_rect(static_cast<std::int32_t>(st.viewport.x),
+                         static_cast<std::int32_t>(st.viewport.y),
+                         static_cast<std::int32_t>(st.viewport.x + raw_vpw),
+                         static_cast<std::int32_t>(st.viewport.y + raw_vph),
+                         rscale, lim_w, lim_h)
+            : ScaledRect{static_cast<std::int32_t>(st.viewport.x),
+                         static_cast<std::int32_t>(st.viewport.y),
+                         static_cast<std::int32_t>(st.viewport.x + raw_vpw),
+                         static_cast<std::int32_t>(st.viewport.y + raw_vph)};
+        const std::uint32_t vpw = static_cast<std::uint32_t>(std::max(0, svp.right - svp.left));
+        const std::uint32_t vph = static_cast<std::uint32_t>(std::max(0, svp.bottom - svp.top));
         VkViewport vvp{};
-        vvp.x = static_cast<float>(st.viewport.x);
-        vvp.y = static_cast<float>(st.viewport.y);
+        vvp.x = static_cast<float>(svp.left);
+        vvp.y = static_cast<float>(svp.top);
         vvp.width = static_cast<float>(vpw);
         vvp.height = static_cast<float>(vph);
         vvp.minDepth = st.viewport.min_z;
@@ -4302,13 +4972,22 @@ struct VulkanD3d9Backend::Impl {
 
         VkRect2D sci{};
         if (st.rs[174] != 0U) {  // D3DRS_SCISSORTESTENABLE
-            const std::int32_t l = std::clamp<std::int32_t>(st.scissor.left, 0, static_cast<std::int32_t>(rp_width));
-            const std::int32_t t = std::clamp<std::int32_t>(st.scissor.top, 0, static_cast<std::int32_t>(rp_height));
-            const std::int32_t r = std::clamp<std::int32_t>(st.scissor.right, l, static_cast<std::int32_t>(rp_width));
-            const std::int32_t b = std::clamp<std::int32_t>(st.scissor.bottom, t, static_cast<std::int32_t>(rp_height));
-            sci = {{l, t}, {static_cast<std::uint32_t>(r - l), static_cast<std::uint32_t>(b - t)}};
+            if (rscale < 1.0F) {
+                const ScaledRect ssc = scale_rect(st.scissor.left, st.scissor.top,
+                                                  st.scissor.right, st.scissor.bottom,
+                                                  rscale, lim_w, lim_h);
+                sci = {{ssc.left, ssc.top},
+                       {static_cast<std::uint32_t>(ssc.right - ssc.left),
+                        static_cast<std::uint32_t>(ssc.bottom - ssc.top)}};
+            } else {
+                const std::int32_t l = std::clamp<std::int32_t>(st.scissor.left, 0, static_cast<std::int32_t>(rp_width));
+                const std::int32_t t = std::clamp<std::int32_t>(st.scissor.top, 0, static_cast<std::int32_t>(rp_height));
+                const std::int32_t r = std::clamp<std::int32_t>(st.scissor.right, l, static_cast<std::int32_t>(rp_width));
+                const std::int32_t b = std::clamp<std::int32_t>(st.scissor.bottom, t, static_cast<std::int32_t>(rp_height));
+                sci = {{l, t}, {static_cast<std::uint32_t>(r - l), static_cast<std::uint32_t>(b - t)}};
+            }
         } else {
-            sci = {{static_cast<std::int32_t>(st.viewport.x), static_cast<std::int32_t>(st.viewport.y)}, {vpw, vph}};
+            sci = {{svp.left, svp.top}, {vpw, vph}};
         }
         vk.cmd_set_scissor(frame_cmd, 0U, 1U, &sci);
 
@@ -5006,23 +5685,52 @@ void VulkanD3d9Backend::clear(const D3d9DrawState& state, std::uint32_t flags, s
     }
     if (att_cnt == 0U) return;
 
+    const float rscale = (impl_->active_rt == 0U) ? impl_->active_scale.load(std::memory_order_relaxed) : 1.0F;
+    const auto [lim_w, lim_h] = (rscale < 1.0F)
+        ? scaled_render_extent(tw, th, rscale)
+        : std::pair<std::uint32_t, std::uint32_t>{tw, th};
+
     std::vector<VkClearRect> vk_rects;
     if (rects.empty()) {
-        VkClearRect cr{};
-        cr.rect = {{static_cast<std::int32_t>(state.viewport.x), static_cast<std::int32_t>(state.viewport.y)},
-                   {std::min(vpw, tw - std::min(state.viewport.x, tw)),
-                    std::min(vph, th - std::min(state.viewport.y, th))}};
-        cr.baseArrayLayer = 0U;
-        cr.layerCount = 1U;
-        if (cr.rect.extent.width > 0U && cr.rect.extent.height > 0U) vk_rects.push_back(cr);
+        if (rscale < 1.0F) {
+            const ScaledRect sr = scale_rect(static_cast<std::int32_t>(state.viewport.x),
+                                             static_cast<std::int32_t>(state.viewport.y),
+                                             static_cast<std::int32_t>(state.viewport.x + vpw),
+                                             static_cast<std::int32_t>(state.viewport.y + vph),
+                                             rscale, lim_w, lim_h);
+            if (sr.right > sr.left && sr.bottom > sr.top) {
+                vk_rects.push_back({{{sr.left, sr.top},
+                                     {static_cast<std::uint32_t>(sr.right - sr.left),
+                                      static_cast<std::uint32_t>(sr.bottom - sr.top)}},
+                                    0U, 1U});
+            }
+        } else {
+            VkClearRect cr{};
+            cr.rect = {{static_cast<std::int32_t>(state.viewport.x), static_cast<std::int32_t>(state.viewport.y)},
+                       {std::min(vpw, tw - std::min(state.viewport.x, tw)),
+                        std::min(vph, th - std::min(state.viewport.y, th))}};
+            cr.baseArrayLayer = 0U;
+            cr.layerCount = 1U;
+            if (cr.rect.extent.width > 0U && cr.rect.extent.height > 0U) vk_rects.push_back(cr);
+        }
     } else {
         for (const D3d9Rect& rc : rects) {
-            const std::int32_t l = std::clamp<std::int32_t>(rc.left, 0, static_cast<std::int32_t>(tw));
-            const std::int32_t t = std::clamp<std::int32_t>(rc.top, 0, static_cast<std::int32_t>(th));
-            const std::int32_t ri = std::clamp<std::int32_t>(rc.right, l, static_cast<std::int32_t>(tw));
-            const std::int32_t bt = std::clamp<std::int32_t>(rc.bottom, t, static_cast<std::int32_t>(th));
-            if (ri > l && bt > t) {
-                vk_rects.push_back({{{l, t}, {static_cast<std::uint32_t>(ri - l), static_cast<std::uint32_t>(bt - t)}}, 0U, 1U});
+            if (rscale < 1.0F) {
+                const ScaledRect sr = scale_rect(rc.left, rc.top, rc.right, rc.bottom, rscale, lim_w, lim_h);
+                if (sr.right > sr.left && sr.bottom > sr.top) {
+                    vk_rects.push_back({{{sr.left, sr.top},
+                                         {static_cast<std::uint32_t>(sr.right - sr.left),
+                                          static_cast<std::uint32_t>(sr.bottom - sr.top)}},
+                                        0U, 1U});
+                }
+            } else {
+                const std::int32_t l = std::clamp<std::int32_t>(rc.left, 0, static_cast<std::int32_t>(tw));
+                const std::int32_t t = std::clamp<std::int32_t>(rc.top, 0, static_cast<std::int32_t>(th));
+                const std::int32_t ri = std::clamp<std::int32_t>(rc.right, l, static_cast<std::int32_t>(tw));
+                const std::int32_t bt = std::clamp<std::int32_t>(rc.bottom, t, static_cast<std::int32_t>(th));
+                if (ri > l && bt > t) {
+                    vk_rects.push_back({{{l, t}, {static_cast<std::uint32_t>(ri - l), static_cast<std::uint32_t>(bt - t)}}, 0U, 1U});
+                }
             }
         }
     }
@@ -5108,25 +5816,30 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
                     impl_->vk.cmd_end_render_pass(impl_->frame_cmd);
                     impl_->render_pass_active = false;
                 }
+                VkImage src_img = impl_->bb_img;
+                VkImageLayout src_layout = impl_->bb_layout;
+                impl_->run_postfx_passes_locked(src_img, src_layout);
                 const VkDeviceSize rb_bytes = static_cast<VkDeviceSize>(impl_->bb_width) * impl_->bb_height * 4U;
                 const bool do_rb = (out_rgba8 != nullptr) && impl_->ensure_readback(rb_bytes, &impl_->last_error);
                 if (do_rb) {
                     VkImageMemoryBarrier bar{};
                     bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                    bar.oldLayout = impl_->bb_layout;
+                    bar.oldLayout = src_layout;
                     bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                     bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                     bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    bar.image = impl_->bb_img;
+                    bar.image = src_img;
                     bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
-                    bar.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    bar.srcAccessMask = (src_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                                            ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                            : 0U;
                     bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                     impl_->vk.cmd_pipeline_barrier(impl_->frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
                     VkBufferImageCopy cpy{};
                     cpy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 0U, 1U};
                     cpy.imageExtent = {impl_->bb_width, impl_->bb_height, 1U};
-                    impl_->vk.cmd_copy_image_to_buffer(impl_->frame_cmd, impl_->bb_img,
+                    impl_->vk.cmd_copy_image_to_buffer(impl_->frame_cmd, src_img,
                                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, impl_->readback_buf, 1U, &cpy);
                     bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                     bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -5135,7 +5848,7 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
                     impl_->vk.cmd_pipeline_barrier(impl_->frame_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr,
                                                    1U, &bar);
-                    impl_->bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    if (src_img == impl_->bb_img) impl_->bb_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 }
                 // No wait unless the caller wants the pixels: the next frame records meanwhile.
                 if (!impl_->submit_frame_locked(VK_NULL_HANDLE, 0U, VK_NULL_HANDLE, do_rb)) {
@@ -5166,6 +5879,23 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
 
         if (ok) {
             const auto now = std::chrono::steady_clock::now();
+            double frame_ms = 0.0;
+            bool have_frame_ms = false;
+            if (impl_->last_gpu_frame_ms >= 0.0) {
+                frame_ms = impl_->last_gpu_frame_ms;
+                impl_->last_gpu_frame_ms = -1.0;
+                have_frame_ms = true;
+            } else if (impl_->has_last_present_tp) {
+                frame_ms = std::chrono::duration<double, std::milli>(now - impl_->last_present_tp).count();
+                have_frame_ms = true;
+            }
+            impl_->last_present_tp = now;
+            impl_->has_last_present_tp = true;
+            if (impl_->config.auto_resolution && have_frame_ms) {
+                const float next_scale = impl_->dyn_res.update(frame_ms, impl_->thermal_status);
+                impl_->active_scale.store(next_scale, std::memory_order_relaxed);
+                impl_->update_render_report();
+            }
             ++impl_->presented_frames;
             ++impl_->fps_win_frames;
             if (!impl_->fps_started) {
@@ -5215,6 +5945,15 @@ void VulkanD3d9Backend::set_native_window(void* native_window) noexcept {
 #else
     (void)native_window;
 #endif
+}
+
+void VulkanD3d9Backend::set_thermal_status(ThermalStatus status) noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    impl_->thermal_status = status;
+}
+
+float VulkanD3d9Backend::current_render_scale() const noexcept {
+    return impl_->active_scale.load(std::memory_order_relaxed);
 }
 
 void VulkanD3d9Backend::flush_pipeline_cache() noexcept {

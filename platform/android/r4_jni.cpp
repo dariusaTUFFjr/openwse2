@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -38,6 +39,7 @@
 #include "driver_loader.h"
 #include "saf_jni_util.h"
 #include "wse/platform/caching_vfs.h"
+#include "wse/platform/performance.h"
 #include "wse/platform/rhi.h"
 #include "wse/platform/saf_vfs.h"
 #include "wse/platform/vfs.h"
@@ -297,6 +299,41 @@ std::string format_fixed1(double v) {
     return std::string(buf);
 }
 
+std::string format_fixed2(double v) {
+    char buf[32]{};
+    std::snprintf(buf, sizeof(buf), "%.2f", v);
+    return std::string(buf);
+}
+
+struct ThermalProbe {
+    void* lib = nullptr;
+    void* mgr = nullptr;
+    using AcquireFn = void* (*)();
+    using GetStatusFn = std::int32_t (*)(void*);
+    using ReleaseFn = void (*)(void*);
+    AcquireFn acquire = nullptr;
+    GetStatusFn get_status = nullptr;
+    ReleaseFn release = nullptr;
+    bool initialized = false;
+
+    wse::platform::ThermalStatus poll() noexcept {
+        if (!initialized) {
+            initialized = true;
+            lib = dlopen("libandroid.so", RTLD_LAZY | RTLD_LOCAL);
+            if (lib != nullptr) {
+                acquire = reinterpret_cast<AcquireFn>(dlsym(lib, "AThermal_acquireManager"));
+                get_status = reinterpret_cast<GetStatusFn>(dlsym(lib, "AThermal_getCurrentThermalStatus"));
+                release = reinterpret_cast<ReleaseFn>(dlsym(lib, "AThermal_releaseManager"));
+                if (acquire != nullptr && get_status != nullptr) {
+                    mgr = acquire();
+                }
+            }
+        }
+        if (mgr == nullptr || get_status == nullptr) return wse::platform::ThermalStatus::None;
+        return wse::platform::sanitize_thermal_status(get_status(mgr));
+    }
+};
+
 std::string_view driver_label(wse::platform::DriverMode mode) noexcept {
     switch (mode) {
     case wse::platform::DriverMode::panvk: return "PanVK";
@@ -453,7 +490,8 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
 extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_nativeRunVulkan(
     JNIEnv* env, jclass, jobject bridge, jstring jcopy_dir, jstring jwork_dir, jstring jmodule, jint jobs,
     jlong frames, jobject jsurface, jstring jdriver_mode, jstring jcustom_icd_path, jstring jnative_lib_dir,
-    jstring jshader_cache_dir, jint max_texture_size, jobject jhud_listener) {
+    jstring jshader_cache_dir, jint max_texture_size, jfloat render_scale, jboolean auto_resolution,
+    jfloat sharpness, jboolean fxaa, jobject jhud_listener) {
     namespace fs = std::filesystem;
     const fs::path work = fs::path(jstring_to_utf8(env, jwork_dir)) / "r4";
     std::error_code ec;
@@ -567,6 +605,12 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     }
     cfg.max_texture_size = static_cast<std::uint32_t>(std::max<jint>(0, max_texture_size));
     cfg.native_window = init_win;
+    cfg.render_scale = std::clamp(static_cast<float>(render_scale), 0.5F, 1.0F);
+    cfg.auto_resolution = (auto_resolution == JNI_TRUE);
+    cfg.min_render_scale = 0.5F;
+    cfg.target_fps = 60.0F;
+    cfg.sharpness = std::max(0.0F, static_cast<float>(sharpness));
+    cfg.fxaa = (fxaa == JNI_TRUE);
     cfg.on_frame_presented = [hud, drv_label](std::uint64_t frame, double inst_fps, double avg_fps,
                                               std::string_view present_path) {
         std::shared_ptr<wse::platform::VulkanD3d9Backend> bk;
@@ -582,6 +626,15 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
         }
 
         const auto now = std::chrono::steady_clock::now();
+        {
+            static ThermalProbe thermal_probe{};
+            static auto last_thermal_tp = std::chrono::steady_clock::time_point::min();
+            if (bk && (last_thermal_tp == std::chrono::steady_clock::time_point::min() ||
+                       std::chrono::duration<double>(now - last_thermal_tp).count() >= 2.0)) {
+                last_thermal_tp = now;
+                bk->set_thermal_status(thermal_probe.poll());
+            }
+        }
         double menu_avg = 0.0;
         bool should_log = false;
         bool should_hud = false;
@@ -624,7 +677,8 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
             if (bk) {
                 line += " shaders=" + std::to_string(bk->compiled_shader_count()) + "/" +
                         std::to_string(bk->failed_shader_count()) +
-                        " pipelines=" + std::to_string(bk->cached_pipeline_count());
+                        " pipelines=" + std::to_string(bk->cached_pipeline_count()) +
+                        " scale=" + format_fixed2(bk->current_render_scale());
             }
             line += " path=" + std::string(present_path) + "\n";
             // Where the time goes: install reads, texture preparation, the game thread's own CPU
@@ -673,6 +727,9 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
         if (should_hud && hud) {
             std::string pill = drv_label + " · " + format_fixed1(inst_fps) + " fps · f" +
                                std::to_string(frame) + " · " + std::string(short_present_path(present_path));
+            if (bk && bk->current_render_scale() < 0.995F) {
+                pill += " · " + std::to_string(static_cast<int>(std::lround(bk->current_render_scale() * 100.0F))) + "%";
+            }
             hud->update(pill);
         }
         {

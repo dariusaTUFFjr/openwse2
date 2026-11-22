@@ -63,7 +63,10 @@ fun AdvancedScreen(
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onClearInstallCache: () -> Unit = {},
     onClearTextureCache: () -> Unit = {},
-    onDismissR4Report: () -> Unit = {}
+    onDismissR4Report: () -> Unit = {},
+    onPictureResolutionChange: (Int) -> Unit = {},
+    onPictureSharpenChange: (Boolean) -> Unit = {},
+    onPictureFxaaChange: (Boolean) -> Unit = {}
 ) {
     val colors = LocalWseColors.current
     val treeUri = state.installFolder.treeUri
@@ -179,6 +182,47 @@ fun AdvancedScreen(
                     enabled = !state.driverState.isProbeInProgress,
                     showDivider = false,
                     onClick = onProbeVulkan
+                )
+            }
+
+            LauncherSectionHeader(title = "Picture")
+            LauncherGroupedCard {
+                val pictureOptions = listOf(
+                    "Automatic (recommended)",
+                    "100 %",
+                    "85 %",
+                    "75 %",
+                    "67 %",
+                    "50 %"
+                )
+                val resIdx = state.pictureResolutionIndex.coerceIn(0, pictureOptions.lastIndex)
+                ExposedDropdownListItem(
+                    headline = "Resolution",
+                    options = pictureOptions,
+                    selectedIndex = resIdx,
+                    enabled = true,
+                    onSelected = onPictureResolutionChange,
+                    supporting = if (resIdx == 0) {
+                        "Draws fewer pixels when the phone can't keep up or gets warm, then sharpens the picture back up."
+                    } else {
+                        null
+                    }
+                )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Sharpen the picture",
+                    checked = state.pictureSharpen,
+                    enabled = true,
+                    onCheckedChange = onPictureSharpenChange
+                )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Smooth jagged edges",
+                    checked = state.pictureFxaa,
+                    enabled = true,
+                    onCheckedChange = onPictureFxaaChange
                 )
             }
 

@@ -4,18 +4,61 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "driver_loader.h"
+#include "wse/platform/performance.h"
 #include "wse/recomp/d3d9_backend.h"
 
 namespace wse::platform {
+
+struct ScaledRect {
+    std::int32_t left = 0;
+    std::int32_t top = 0;
+    std::int32_t right = 0;
+    std::int32_t bottom = 0;
+};
+
+// Rounded like `scale_rect`, so a full-size viewport fills exactly the region the upscaler reads.
+[[nodiscard]] inline std::pair<std::uint32_t, std::uint32_t> scaled_render_extent(
+    std::uint32_t width, std::uint32_t height, float scale) noexcept {
+    if (width == 0U || height == 0U) return {width, height};
+    const float s = std::isfinite(scale) ? std::clamp(scale, 0.5F, 1.0F) : 1.0F;
+    if (s >= 1.0F) return {width, height};
+    const auto sw = static_cast<std::uint32_t>(
+        std::clamp<std::int64_t>(std::llround(static_cast<double>(width) * s),
+                                 1LL, static_cast<std::int64_t>(width)));
+    const auto sh = static_cast<std::uint32_t>(
+        std::clamp<std::int64_t>(std::llround(static_cast<double>(height) * s),
+                                 1LL, static_cast<std::int64_t>(height)));
+    return {sw, sh};
+}
+
+[[nodiscard]] inline ScaledRect scale_rect(std::int32_t left, std::int32_t top,
+                                           std::int32_t right, std::int32_t bottom,
+                                           float scale,
+                                           std::uint32_t max_w, std::uint32_t max_h) noexcept {
+    const float s = std::isfinite(scale) ? std::clamp(scale, 0.5F, 1.0F) : 1.0F;
+    const auto mw = static_cast<std::int32_t>(max_w);
+    const auto mh = static_cast<std::int32_t>(max_h);
+    auto sc = [s](std::int32_t v) noexcept -> std::int32_t {
+        return static_cast<std::int32_t>(std::llround(static_cast<double>(v) * s));
+    };
+    const std::int32_t l = std::clamp(sc(left), 0, mw);
+    const std::int32_t t = std::clamp(sc(top), 0, mh);
+    const std::int32_t r = std::clamp(sc(right), l, mw);
+    const std::int32_t b = std::clamp(sc(bottom), t, mh);
+    return {l, t, r, b};
+}
 
 struct VulkanD3d9Config {
     std::string pipeline_cache_path{};     // optional on-disk VkPipelineCache file
@@ -36,6 +79,13 @@ struct VulkanD3d9Config {
     bool prefer_etc2 = true;               // transcode DDS to ETC2 when BC is not used and ETC2 is supported
     bool simulate_etc2 = false;            // PC check: transcode to ETC2, decode back to RGBA8 and upload RGBA8
     unsigned etc2_threads = 0U;            // 0 = min(4, hardware_concurrency)
+    // R5b FSR upscaling, sharpening, FXAA, and dynamic resolution.
+    float render_scale = 1.0F;       // fixed scale in [0.5, 1.0] when auto_resolution is false
+    bool auto_resolution = false;
+    float min_render_scale = 0.5F;
+    float target_fps = 60.0F;
+    float sharpness = 0.0F;          // 0 = off; RCAS strength in FSR stops (e.g. 0.2)
+    bool fxaa = false;
 };
 
 class VulkanD3d9Backend final : public wse::recomp::D3d9Backend {
@@ -95,6 +145,10 @@ public:
     // Thread-safe Android ANativeWindow* attachment (pass nullptr on surfaceDestroyed).
     // Safe no-op on non-Android platforms.
     void set_native_window(void* native_window) noexcept;
+    // Updates the thermal status used by DynamicResolution (default ThermalStatus::None).
+    void set_thermal_status(ThermalStatus status) noexcept;
+    // Active render scale in [0.5, 1.0] for the current/next frame.
+    [[nodiscard]] float current_render_scale() const noexcept;
     // Persists VkPipelineCache to `config.pipeline_cache_path` (safe to call before process exit).
     void flush_pipeline_cache() noexcept;
     [[nodiscard]] std::string active_presentation_path() const;
