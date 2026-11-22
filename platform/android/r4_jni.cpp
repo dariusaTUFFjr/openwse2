@@ -278,28 +278,6 @@ std::mutex g_report_m;
 std::FILE* g_report = nullptr;
 std::string g_progress_path;
 
-// Renames an existing non-empty `report.txt` to `report.prev.txt` (replacing an older one)
-// so a crash report from the previous run survives the next launch.
-void rotate_report_file(const std::filesystem::path& work) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    const fs::path cur = work / "report.txt";
-    const fs::path prev = work / "report.prev.txt";
-    if (fs::is_regular_file(cur, ec) && !ec) {
-        if (fs::file_size(cur, ec) > 0U && !ec) {
-            fs::rename(cur, prev, ec);
-            if (ec) {
-                ec.clear();
-                fs::remove(prev, ec);
-                ec.clear();
-                fs::rename(cur, prev, ec);
-            }
-        } else {
-            fs::remove(cur, ec);
-        }
-    }
-}
-
 void report(const std::string& text) {
     const std::lock_guard<std::mutex> lock(g_report_m);
     if (g_report != nullptr) {
@@ -449,7 +427,6 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     fs::create_directories(work / "user", ec);
     {
         const std::lock_guard<std::mutex> lock(g_report_m);
-        rotate_report_file(work);
         g_report = std::fopen((work / "report.txt").c_str(), "w");
     }
     g_progress_path = (work / "progress.txt").string();
@@ -468,7 +445,6 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     fs::create_directories(work / "user", ec);
     {
         const std::lock_guard<std::mutex> lock(g_report_m);
-        rotate_report_file(work);
         g_report = std::fopen((work / "report.txt").c_str(), "w");
     }
     g_progress_path = (work / "progress.txt").string();

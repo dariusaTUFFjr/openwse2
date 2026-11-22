@@ -191,13 +191,14 @@ class R4StartupRunner private constructor(private val app: Application) {
         false
     }
 
+    // The report of the run before this one (rotated to PREVIOUS_REPORT when a run starts).
     fun hasPreviousCrashReport(): Boolean {
-        val f = File(r4Dir, "report.prev.txt")
+        val f = File(r4Dir, PREVIOUS_REPORT)
         return f.isFile && f.length() > 0
     }
 
     fun previousCrashReportToSave(): String? {
-        val f = File(r4Dir, "report.prev.txt")
+        val f = File(r4Dir, PREVIOUS_REPORT)
         return try {
             f.takeIf { it.isFile && it.length() > 0 }?.readText()
         } catch (_: Throwable) {
