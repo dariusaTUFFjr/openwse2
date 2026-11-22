@@ -108,6 +108,15 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     private val _showFpsOverlay = MutableStateFlow(false)
     val showFpsOverlay: StateFlow<Boolean> = _showFpsOverlay.asStateFlow()
 
+    private val _pictureResolutionIndex = MutableStateFlow(0)
+    val pictureResolutionIndex: StateFlow<Int> = _pictureResolutionIndex.asStateFlow()
+
+    private val _pictureSharpen = MutableStateFlow(true)
+    val pictureSharpen: StateFlow<Boolean> = _pictureSharpen.asStateFlow()
+
+    private val _pictureFxaa = MutableStateFlow(false)
+    val pictureFxaa: StateFlow<Boolean> = _pictureFxaa.asStateFlow()
+
     private val _statusLog = MutableStateFlow("Ready.")
     val statusLog: StateFlow<String> = _statusLog.asStateFlow()
 
@@ -399,6 +408,18 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         val maxTex = _settingsState.value.performance?.maxTextureSize ?: 0
         val shaderCache = File(app.cacheDir, "mesa_shader_cache").apply { mkdirs() }
         val nativeLibDir = app.applicationInfo.nativeLibraryDir ?: ""
+        val resIdx = _pictureResolutionIndex.value.coerceIn(0, 5)
+        val autoRes = (resIdx == 0)
+        val fixedScale = when (resIdx) {
+            1 -> 1.0f
+            2 -> 0.85f
+            3 -> 0.75f
+            4 -> 0.67f
+            5 -> 0.50f
+            else -> 1.0f
+        }
+        val sharpness = if (_pictureSharpen.value) 0.2f else 0.0f
+        val fxaa = _pictureFxaa.value
         _statusLog.value = "Getting $moduleName ready to play…"
         r4Runner.prepareForLiveVulkan(treeUri) { copyDir, workDir, jobs ->
             if (!isCleared.get()) {
@@ -413,7 +434,11 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                         customIcdPath = icdPath,
                         nativeLibDir = nativeLibDir,
                         shaderCacheDir = shaderCache.absolutePath,
-                        maxTextureSize = maxTex
+                        maxTextureSize = maxTex,
+                        renderScale = fixedScale,
+                        autoResolution = autoRes,
+                        sharpness = sharpness,
+                        fxaa = fxaa
                     )
                 )
             }
@@ -823,6 +848,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     private fun restorePreferences() {
         val prefs = prefs()
         _showFpsOverlay.value = prefs.getBoolean(KEY_SHOW_FPS_OVERLAY, false)
+        _pictureResolutionIndex.value = prefs.getInt(KEY_PICTURE_RESOLUTION_INDEX, 0).coerceIn(0, 5)
+        _pictureSharpen.value = prefs.getBoolean(KEY_PICTURE_SHARPEN, true)
+        _pictureFxaa.value = prefs.getBoolean(KEY_PICTURE_FXAA, false)
 
         // Stored as the stable mode id; older builds stored the display label.
         val savedDriver = prefs.getString(KEY_GPU_DRIVER, DRIVER_MODE_KEYS.first()) ?: ""
@@ -1625,6 +1653,25 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         return Math.round(max)
     }
 
+    fun setPictureResolution(index: Int) {
+        val clamped = index.coerceIn(0, 5)
+        if (_pictureResolutionIndex.value == clamped) return
+        _pictureResolutionIndex.value = clamped
+        prefs().edit().putInt(KEY_PICTURE_RESOLUTION_INDEX, clamped).apply()
+    }
+
+    fun setPictureSharpen(enabled: Boolean) {
+        if (_pictureSharpen.value == enabled) return
+        _pictureSharpen.value = enabled
+        prefs().edit().putBoolean(KEY_PICTURE_SHARPEN, enabled).apply()
+    }
+
+    fun setPictureFxaa(enabled: Boolean) {
+        if (_pictureFxaa.value == enabled) return
+        _pictureFxaa.value = enabled
+        prefs().edit().putBoolean(KEY_PICTURE_FXAA, enabled).apply()
+    }
+
     private fun prefs() = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val configRoot: String
@@ -1664,6 +1711,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         private const val KEY_DRIVER_PATH_PREFIX = "driver_path_"
         private const val KEY_DRIVER_NAME_PREFIX = "driver_name_"
         private const val KEY_SHOW_FPS_OVERLAY = "show_fps_overlay"
+        private const val KEY_PICTURE_RESOLUTION_INDEX = "picture_resolution_index"
+        private const val KEY_PICTURE_SHARPEN = "picture_sharpen"
+        private const val KEY_PICTURE_FXAA = "picture_fxaa"
         private const val KEY_FRAME_RATE_CAP = "frame_rate_cap_hz"
         private const val KEY_GYRO_AIM = "gyro_aim_enabled"
         private const val KEY_PINCH_ZOOM = "pinch_zoom_enabled"

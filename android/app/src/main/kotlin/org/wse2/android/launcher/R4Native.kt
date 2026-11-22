@@ -50,6 +50,10 @@ object R4Native {
         nativeLibDir: String,
         shaderCacheDir: String,
         maxTextureSize: Int,
+        renderScale: Float,
+        autoResolution: Boolean,
+        sharpness: Float,
+        fxaa: Boolean,
         hudListener: HudListener?
     ): Int
 

@@ -85,6 +85,9 @@ fun LauncherApp(
     val settingsState by viewModel.settingsState.collectAsStateWithLifecycle()
     val driverState by viewModel.driverState.collectAsStateWithLifecycle()
     val showFpsOverlay by viewModel.showFpsOverlay.collectAsStateWithLifecycle()
+    val pictureResolutionIndex by viewModel.pictureResolutionIndex.collectAsStateWithLifecycle()
+    val pictureSharpen by viewModel.pictureSharpen.collectAsStateWithLifecycle()
+    val pictureFxaa by viewModel.pictureFxaa.collectAsStateWithLifecycle()
     val statusLog by viewModel.statusLog.collectAsStateWithLifecycle()
     val moduleArt by viewModel.moduleArt.collectAsStateWithLifecycle()
     val heroArt by viewModel.heroArt.collectAsStateWithLifecycle()
@@ -178,7 +181,13 @@ fun LauncherApp(
         onLaunchRecompVulkan = viewModel::launchRecompVulkan,
         onR4UseCopyChange = viewModel::setR4UseCopy,
         onClearInstallCache = viewModel::clearInstallCache,
-        onDismissR4Report = viewModel::dismissR4Report
+        onDismissR4Report = viewModel::dismissR4Report,
+        pictureResolutionIndex = pictureResolutionIndex,
+        pictureSharpen = pictureSharpen,
+        pictureFxaa = pictureFxaa,
+        onPictureResolutionChange = viewModel::setPictureResolution,
+        onPictureSharpenChange = viewModel::setPictureSharpen,
+        onPictureFxaaChange = viewModel::setPictureFxaa
     )
 
     when (val dialog = activeDialog) {
@@ -283,7 +292,13 @@ fun LauncherAppContent(
     onLaunchRecompVulkan: () -> Unit = {},
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onClearInstallCache: () -> Unit = {},
-    onDismissR4Report: () -> Unit = {}
+    onDismissR4Report: () -> Unit = {},
+    pictureResolutionIndex: Int = 0,
+    pictureSharpen: Boolean = true,
+    pictureFxaa: Boolean = false,
+    onPictureResolutionChange: (Int) -> Unit = {},
+    onPictureSharpenChange: (Boolean) -> Unit = {},
+    onPictureFxaaChange: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val layoutDirection = LocalLayoutDirection.current
@@ -315,6 +330,9 @@ fun LauncherAppContent(
         selectedModule = selectedModule,
         driverState = driverState,
         showFpsOverlay = showFpsOverlay,
+        pictureResolutionIndex = pictureResolutionIndex,
+        pictureSharpen = pictureSharpen,
+        pictureFxaa = pictureFxaa,
         statusLog = statusLog
     )
 
@@ -401,7 +419,10 @@ fun LauncherAppContent(
                 onLaunchRecompVulkan = onLaunchRecompVulkan,
                 onR4UseCopyChange = onR4UseCopyChange,
                 onClearInstallCache = onClearInstallCache,
-                onDismissR4Report = onDismissR4Report
+                onDismissR4Report = onDismissR4Report,
+                onPictureResolutionChange = onPictureResolutionChange,
+                onPictureSharpenChange = onPictureSharpenChange,
+                onPictureFxaaChange = onPictureFxaaChange
             )
         }
     }

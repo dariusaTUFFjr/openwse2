@@ -174,6 +174,7 @@ struct D3d9DriverReport {
     bool texture_compression_bc = false;
     bool bgra_vertex_format = false;
     bool pipeline_cache_active = false;
+    std::string render_summary;
     std::vector<std::string> missing_features;
     std::string error;
 
@@ -187,6 +188,9 @@ struct D3d9DriverReport {
         s += std::string("\n  features: BC=") + (texture_compression_bc ? "yes" : "no(RGBA8)") +
              " bgra_vtx=" + (bgra_vertex_format ? "yes" : "no(swizzle)") +
              " pipeline_cache=" + (pipeline_cache_active ? "yes" : "no");
+        if (!render_summary.empty()) {
+            s += "\n  render: " + render_summary;
+        }
         if (!missing_features.empty()) {
             s += "\n  missing/fallbacks:";
             for (const std::string& m : missing_features) s += " [" + m + "]";
