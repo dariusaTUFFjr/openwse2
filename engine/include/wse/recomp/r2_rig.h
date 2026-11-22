@@ -88,9 +88,11 @@ inline Arg pick_arg(std::uint64_t& s) noexcept {
     Arg a;
     switch (r % 4) {
     case 0:
-    case 1:  // a pointer 4 KiB into a buffer (+-256 bytes, 8-aligned): structs reach far forward
+    case 1:  // a pointer 4 KiB into a buffer (+-512 bytes): structs reach far forward
+        // 16-aligned like the game's own objects: `movaps`/`movdqa` on a pointer that is only
+        // 8-aligned faults on x86 but not in the translation, which says nothing about the code.
         a.buffer = static_cast<int>((r >> 8) % kBuffers);
-        a.offset = kPointerOffset + (static_cast<std::int64_t>((r >> 16) % 64) - 32) * 8;
+        a.offset = kPointerOffset + (static_cast<std::int64_t>((r >> 16) % 64) - 32) * 16;
         break;
     case 2:
         a.literal = (r >> 8) % 256;
@@ -145,7 +147,7 @@ inline void fill_buffers(std::uint64_t va, std::uint8_t* const buffers[kBuffers]
             std::uint64_t v = splitmix(s);
             if (w % 2 == 0) {
                 const int target = static_cast<int>(v % kBuffers);
-                const std::uint64_t off = kPointerOffset + ((v >> 8) % (kBufferBytes / 2 / 8)) * 8;
+                const std::uint64_t off = kPointerOffset + ((v >> 8) % (kBufferBytes / 2 / 16)) * 16;  // 16-aligned
                 v = r.buffer[target] + off;
             }
             std::memcpy(buffers[b] + 8 * w, &v, 8);
