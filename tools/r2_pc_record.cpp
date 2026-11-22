@@ -59,7 +59,8 @@ void r2_after_call();
 }
 
 // Saves the Win64 callee-saved state (GPRs, xmm6-15, MXCSR), switches to the guest stack, loads
-// the arguments and calls; `r2_fault_resume` is where the exception handler sends a fault.
+// the arguments, zeroes every other register as the phone's `CpuState{}` does (a `bool` getter
+// sets only `al`, so `rax`'s other bits must start the same on both sides) and calls; `r2_fault_resume` is where the exception handler sends a fault.
 __asm__(R"(
     .intel_syntax noprefix
     .text
@@ -89,20 +90,44 @@ r2_call_native:
     mov [rip + g_r2_saved_rsp], rsp
     mov dword ptr [rsp + 0xA4], 0x1F80
     ldmxcsr [rsp + 0xA4]
-    mov rax, [rcx + 0]
+    mov r11, [rcx + 0]
     mov rsp, [rcx + 8]
     movdqu xmm0, [rcx + 48]
     movdqu xmm1, [rcx + 64]
     movdqu xmm2, [rcx + 80]
     movdqu xmm3, [rcx + 96]
+    pxor xmm4, xmm4
+    pxor xmm5, xmm5
+    pxor xmm6, xmm6
+    pxor xmm7, xmm7
+    pxor xmm8, xmm8
+    pxor xmm9, xmm9
+    pxor xmm10, xmm10
+    pxor xmm11, xmm11
+    pxor xmm12, xmm12
+    pxor xmm13, xmm13
+    pxor xmm14, xmm14
+    pxor xmm15, xmm15
     mov rdx, [rcx + 24]
     mov r8, [rcx + 32]
     mov r9, [rcx + 40]
     mov rcx, [rcx + 16]
     cld
-    mov r11, 0x230000000
+    mov rax, 0x230000000
+    push rax
     push r11
-    jmp rax
+    xor eax, eax
+    xor ebx, ebx
+    xor ebp, ebp
+    xor esi, esi
+    xor edi, edi
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+    ret
     .globl r2_after_call
 r2_after_call:
     mov rcx, [rip + g_r2_out]
