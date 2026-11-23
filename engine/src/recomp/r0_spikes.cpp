@@ -419,6 +419,19 @@ void run_r2_differential(Report& rep, Workspace& ws, LoadMethod method, const Pe
     std::size_t batch_errors = 0;
     std::vector<std::uint64_t> mismatched;
     const auto t1 = std::chrono::steady_clock::now();
+    // Wild addresses fault on both sides (`r2_rig.h` kGuardLo..kGuardHi): reserve every free block.
+    std::vector<void*> guards;
+    for (std::uint64_t a = r2::kGuardLo; a < r2::kGuardHi; a += r2::kGuardStep) {
+        void* g = mmap(reinterpret_cast<void*>(a), r2::kGuardStep, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (g == reinterpret_cast<void*>(a)) {
+            guards.push_back(g);
+        } else if (g != MAP_FAILED) {
+            munmap(g, r2::kGuardStep);  // an old kernel that ignores MAP_FIXED_NOREPLACE
+        }
+    }
+    rep.line("  guard blocks reserved: %zu of %llu", guards.size(),
+             static_cast<unsigned long long>((r2::kGuardHi - r2::kGuardLo) / r2::kGuardStep));
     R2Guard guard;
     g_r2_tid = static_cast<pid_t>(syscall(SYS_gettid));
     for (R2Batch& batch : batches) {
@@ -507,6 +520,9 @@ void run_r2_differential(Report& rep, Workspace& ws, LoadMethod method, const Pe
         }
     }
     const double run_ms = ms_since(t1);
+    for (void* g : guards) {
+        munmap(g, r2::kGuardStep);
+    }
     munmap(region, r2::kRegionBytes);
     munmap(stack, r2::kStackBytes);
 

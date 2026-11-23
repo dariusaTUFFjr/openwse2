@@ -35,6 +35,12 @@ inline constexpr std::uint64_t kGuestRsp = kStackBase + kStackBytes - 0x2000 - 8
 // The return address every call returns to (some functions read `[rsp]`). On the PC a stub there
 // jumps back into the recorder; the phone only compares the popped `rip` with it.
 inline constexpr std::uint64_t kReturnVa = 0x230000000ULL;
+// Every free 1 MiB block in [kGuardLo, kGuardHi) is reserved without access on both sides while
+// the cases run, so an address built from a random argument (`table[index]`) faults on both
+// instead of depending on what else each process happens to have mapped there.
+inline constexpr std::uint64_t kGuardLo = 0x100000ULL;       // 1 MiB
+inline constexpr std::uint64_t kGuardHi = 0x1000000000ULL;   // 64 GiB
+inline constexpr std::uint64_t kGuardStep = 0x100000ULL;     // 1 MiB
 // Zeroed before every case, so reads of uninitialized stack agree.
 inline constexpr std::uint64_t kStackClearLo = kGuestRsp - 0x8000;
 inline constexpr std::uint64_t kStackClearHi = kGuestRsp + 0x1000;
@@ -186,6 +192,26 @@ struct Hasher {
     }
 };
 
+// Any NaN becomes one canonical NaN, sign included: x86 and AArch64 choose different NaNs when
+// both operands are NaN (x86 the first operand's, AArch64 a signalling one first) and produce
+// different default NaNs (x86 negative, AArch64 positive), which says nothing about the
+// translation. A word whose upper 52..62 bits form a double NaN becomes the canonical double NaN;
+// otherwise each 32-bit half that is a float NaN becomes the canonical float NaN. Data that only
+// looks like a NaN is changed the same way on both sides, so hashes still agree.
+inline std::uint64_t canonical_nans(std::uint64_t v) noexcept {
+    if (((v >> 52) & 0x7FFULL) == 0x7FFULL && (v & 0x000FFFFFFFFFFFFFULL) != 0) {
+        return 0x7FF8000000000000ULL;
+    }
+    for (int half = 0; half < 2; ++half) {
+        const int shift = 32 * half;
+        const std::uint32_t f = static_cast<std::uint32_t>(v >> shift);
+        if ((f & 0x7F800000U) == 0x7F800000U && (f & 0x007FFFFFU) != 0) {
+            v = (v & ~(0xFFFFFFFFULL << shift)) | (0x7FC00000ULL << shift);
+        }
+    }
+    return v;
+}
+
 // Adds one case's outcome: `rax`, the low half of `xmm0`, and every buffer word the call changed
 // (its position and new value). A faulting case contributes only the fault: how far a side got
 // before faulting depends on store ordering the translator may change.
@@ -197,7 +223,7 @@ inline void hash_case(Hasher& out, bool faulted, std::uint64_t rax, std::uint64_
         return;
     }
     out.add(normalize(rax, r));
-    out.add(xmm0_lo);
+    out.add(canonical_nans(xmm0_lo));
     constexpr std::size_t kChunk = 4096;
     for (int b = 0; b < kBuffers; ++b) {
         for (std::size_t c = 0; c < kBufferBytes; c += kChunk) {
@@ -211,7 +237,7 @@ inline void hash_case(Hasher& out, bool faulted, std::uint64_t rax, std::uint64_
                 std::memcpy(&was, pristine[b] + 8 * w, 8);
                 if (now != was) {
                     out.add((static_cast<std::uint64_t>(b) << 32) | w);
-                    out.add(normalize(now, r));
+                    out.add(canonical_nans(normalize(now, r)));
                 }
             }
         }

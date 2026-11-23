@@ -306,6 +306,10 @@ int run_worker(const std::string& exe_path, const std::string& pdb_path, const s
         std::fprintf(stderr, "could not map the return stub\n");
         return 2;
     }
+    // Wild addresses fault on both sides (`r2_rig.h` kGuardLo..kGuardHi): reserve every free block.
+    for (std::uint64_t a = r2::kGuardLo; a < r2::kGuardHi; a += r2::kGuardStep) {
+        (void)VirtualAlloc(reinterpret_cast<void*>(a), r2::kGuardStep, MEM_RESERVE, PAGE_NOACCESS);
+    }
     const std::uint8_t jmp_rip0[6] = {0xFF, 0x25, 0, 0, 0, 0};
     const auto after = reinterpret_cast<std::uint64_t>(&r2_after_call);
     std::memcpy(ret_stub, jmp_rip0, 6);
