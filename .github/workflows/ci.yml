@@ -345,7 +345,10 @@ jobs:
             "-Pwse.llvmPrefix=${HOME}/llvm-android"
           )
 
-          gradle -p android recordRoborazziDebug --no-daemon "${extra_props[@]}"
+          # Maven Central rate-limits busy runners (HTTP 429): retry downloads longer before failing.
+          gradle -p android recordRoborazziDebug --no-daemon "${extra_props[@]}" \
+            -Dorg.gradle.internal.repository.max.retries=6 \
+            -Dorg.gradle.internal.repository.initial.backoff=2000
 
       - name: Upload launcher screenshots
         uses: actions/upload-artifact@v4
