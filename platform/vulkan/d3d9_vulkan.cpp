@@ -5280,13 +5280,9 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
                         bc_fmt != VK_FORMAT_UNDEFINED;
 
     // Optional P10.7 mip cap when decoding to RGBA8 or transcoding to ETC2.
-    std::uint32_t first_mip = 0U;
-    if (!use_bc && impl_->config.max_texture_size > 0U) {
-        while (first_mip + 1U < view.mip_count &&
-               std::max(view.width >> first_mip, view.height >> first_mip) > impl_->config.max_texture_size) {
-            ++first_mip;
-        }
-    }
+    std::uint32_t first_mip = use_bc ? 0U
+                                     : wse::asset::first_mip_for_cap(view.width, view.height, view.mip_count,
+                                                                     impl_->config.max_texture_size);
 
     Impl::TextureObj& t = it->second;
     if (impl_->gpu_ready) impl_->retire_texture_image_locked(t);  // a new image replaces one queued frames may sample

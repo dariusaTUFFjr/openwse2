@@ -57,6 +57,11 @@ public:
     // `unsupported` hook at the first instruction that could not be lifted, and `why` names it.
     bool lift(const DFunction& fn, std::string* why);
 
+    // Functions translated without optimisation (LLVM `optnone`: unoptimised IR and fast code
+    // generation) while the rest of the module gets `opt_level`: for functions that run rarely and
+    // cost the most to optimise (`r4_startup.cpp` picks them).
+    void set_light(const std::set<std::uint64_t>& vas);
+
     // Emits the dispatch table, optimizes and emits an object (then resets the module).
     bool emit_object(int opt_level, std::vector<char>& object, TranslateTimings* timings,
                      std::string* error);

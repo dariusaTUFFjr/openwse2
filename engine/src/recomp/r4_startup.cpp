@@ -288,6 +288,19 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
         if ((f & 0x3) != 0 && (f & 0x4) == 0) info.resumable.insert(m.img.image_base + r.begin);
     }
     const std::vector<std::uint64_t> all(entries.begin(), entries.end());
+    // Translated without optimisation: the game's settings file reader and writer. Each is one
+    // giant resumable function (rglConfig::load 15,236 instructions with 3,755 calls, ::save 15,255
+    // with 3,470 in v1.1.5.6) and together they took 25 minutes of one PC core at -O2 (2026-11-23),
+    // most of a first translation; they run when the game starts and when settings are saved, never
+    // per frame. Found by their PDB names, so any WSE2 build with a matching PDB gets the same.
+    std::set<std::uint64_t> light;
+    for (const PdbPublic& p : publics) {
+        if (p.section == 0 || p.section > m.img.sections.size()) continue;
+        if (p.name.rfind("?load@rglConfig@@", 0) == 0 || p.name.rfind("?save@rglConfig@@", 0) == 0) {
+            light.insert(m.img.image_base + m.img.sections[p.section - 1].virtual_address + p.offset);
+        }
+    }
+    if (!light.empty()) out("%s: %zu functions translated without optimisation (rglConfig load/save)\n", m.tag.c_str(), light.size());
     // Batches are address windows of `batch` KiB of .text (named by window), so a new entry only
     // changes its own window's batch; empty windows have no batch.
     const std::uint64_t window = static_cast<std::uint64_t>(batch) * 1024;
@@ -458,6 +471,7 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
             const std::vector<std::uint64_t> vas(all.begin() + static_cast<std::ptrdiff_t>(batch_range[b].first),
                                                  all.begin() + static_cast<std::ptrdiff_t>(batch_range[b].second));
             R1Translator tr(info);
+            tr.set_light(light);
             std::string why;
             std::string e = tr.init_error();
             tr.declare(vas);

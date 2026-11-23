@@ -691,7 +691,7 @@ if(WSE_ENABLE_LLVM)
         # R4 bring-up run (`docs/RECOMP_PLAN.md` "R4 design"): local only, on the user's install;
         # CI builds it so it keeps compiling, and never runs it.
         add_executable(r4_run tools/r4_run.cpp)
-        target_link_libraries(r4_run PRIVATE wse_recomp wse_zydis ${CMAKE_DL_LIBS})
+        target_link_libraries(r4_run PRIVATE wse_recomp wse_zydis wse_texture ${CMAKE_DL_LIBS})
         wse_apply_strict_warnings(r4_run)
     endif()
 

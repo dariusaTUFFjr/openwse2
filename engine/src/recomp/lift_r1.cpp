@@ -421,6 +421,7 @@ struct R1Translator::Impl {
     std::unique_ptr<llvm::LLVMContext> context = std::make_unique<llvm::LLVMContext>();
     std::unique_ptr<llvm::Module> module;
     std::map<std::uint64_t, llvm::Function*> functions;  // declared (some defined)
+    std::set<std::uint64_t> light;                       // translated without optimisation
     std::string init_error;
     LiftReport report;
     double lift_ms = 0.0;
@@ -466,6 +467,10 @@ void R1Translator::discard() {
     impl_->reset();
 }
 double R1Translator::total_lift_ms() const noexcept { return impl_->total_ms + impl_->lift_ms; }
+
+void R1Translator::set_light(const std::set<std::uint64_t>& vas) {
+    impl_->light = vas;
+}
 
 void R1Translator::declare(const std::vector<std::uint64_t>& entries) {
     for (const std::uint64_t va : entries) {
@@ -844,6 +849,13 @@ bool R1Translator::emit_object(int opt_level, std::vector<char>& object, Transla
             *error = t.error;
         }
         return false;
+    }
+    for (const std::uint64_t va : impl_->light) {
+        const auto it = impl_->functions.find(va);
+        if (it != impl_->functions.end() && !it->second->empty()) {
+            it->second->addFnAttr(llvm::Attribute::NoInline);
+            it->second->addFnAttr(llvm::Attribute::OptimizeNone);
+        }
     }
     const double lift_ms = impl_->lift_ms;
     impl_->total_ms += lift_ms;

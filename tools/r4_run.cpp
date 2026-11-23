@@ -29,6 +29,9 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <span>
+#include <set>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +48,9 @@
 #include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/screen.h"
 #include "wse/recomp/shim_d3d9.h"
+#include "wse/asset/dds.h"
+#include "wse/asset/etc2.h"
+#include "wse/asset/texture_cache.h"
 #include "wse/platform/vfs.h"
 
 namespace fs = std::filesystem;
@@ -67,6 +73,86 @@ fs::path find_ci(const fs::path& dir, const std::string& name) {
         if (a == b) return e.path();
     }
     return dir / name;
+}
+
+// The textures the phone converts to ETC2 the first time it loads them (its GPU has no BC),
+// converted here instead: the .dds files the game loads, which are those in TexturesHD and, for a
+// name with no HD version, in Textures (the install's and the module's; the phone's own cache
+// showed 525 of its first 798 textures from TexturesHD, 2026-11-23),
+// written as the phone's cache files (`texture_cache.h` name and format) under `out`. A texture is
+// written for each size cap a phone may use (none, 2048, 1024) where the cap changes its first mip,
+// since that is part of the name. Returns the number of files written.
+std::size_t convert_textures_for_phone(const fs::path& install, const std::string& module, const fs::path& out,
+                                       unsigned threads) {
+    std::vector<fs::path> files;
+    auto lower = [](std::string t) {
+        for (char& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return t;
+    };
+    // `skip`: names (lower case, relative to the folder) that a higher-priority folder supplies.
+    auto add_dir = [&](const fs::path& dir, const std::set<std::string>& skip, std::set<std::string>* names) {
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) return;
+        for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            if (lower(it->path().extension().string()) != ".dds" || !it->is_regular_file(ec)) continue;
+            const std::string rel = lower(fs::relative(it->path(), dir, ec).generic_string());
+            if (skip.count(rel) != 0) continue;
+            if (names != nullptr) names->insert(rel);
+            files.push_back(it->path());
+        }
+    };
+    for (const fs::path& base : {install, find_ci(find_ci(install, "Modules"), module)}) {
+        std::set<std::string> hd;
+        add_dir(find_ci(base, "TexturesHD"), {}, &hd);
+        add_dir(find_ci(base, "Textures"), hd, nullptr);
+    }
+    std::error_code ec;
+    fs::create_directories(out, ec);
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> written{0};
+    std::atomic<std::size_t> failed{0};
+    auto work = [&]() {
+        for (std::size_t i = next++; i < files.size(); i = next++) {
+            const std::vector<std::uint8_t> bytes = read_file(files[i]);
+            wse::asset::DdsImageView view;
+            const auto span = std::span<const std::byte>(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+            if (!wse::asset::parse_dds(span, view, nullptr) || view.mip_count == 0U) {
+                ++failed;
+                continue;
+            }
+            std::set<std::uint32_t> mips;
+            for (const std::uint32_t cap : {0U, 2048U, 1024U}) {
+                mips.insert(wse::asset::first_mip_for_cap(view.width, view.height, view.mip_count, cap));
+            }
+            for (const std::uint32_t first_mip : mips) {
+                const fs::path dest = out / wse::asset::cache_key(bytes, first_mip);
+                std::error_code fec;
+                if (fs::exists(dest, fec)) continue;  // a run that is resumed keeps what it wrote
+                wse::asset::etc2::Image img;
+                if (!wse::asset::etc2::transcode_dds(view, first_mip, img, nullptr, 1)) {
+                    ++failed;
+                    continue;
+                }
+                const std::vector<std::uint8_t> enc = wse::asset::encode(img);
+                const fs::path tmp = fs::path(dest.string() + ".tmp");
+                std::ofstream(tmp, std::ios::binary).write(reinterpret_cast<const char*>(enc.data()),
+                                                           static_cast<std::streamsize>(enc.size()));
+                fs::rename(tmp, dest, fec);
+                if (fec) {
+                    fs::remove(tmp, fec);
+                    ++failed;
+                } else {
+                    ++written;
+                }
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < std::max(1U, threads); ++t) pool.emplace_back(work);
+    for (std::thread& t : pool) t.join();
+    std::printf("textures: %zu .dds files, %zu converted files written, %zu failed\n", files.size(), written.load(),
+                failed.load());
+    return written.load();
 }
 
 }  // namespace
@@ -136,5 +222,10 @@ int main(int argc, char** argv) {
     static wse::platform::HostVfs user_vfs(work / "user");
     o.install = &install_vfs;
     o.user = &user_vfs;
-    return wse::recomp::run_startup(o);
+    const int rc = wse::recomp::run_startup(o);
+    if (!for_phone.empty() && rc == 0) {
+        // Converted textures go in a subfolder; the phone puts them in its texture cache.
+        (void)convert_textures_for_phone(install, o.module, for_phone / "texcache", std::max(1U, o.jobs));
+    }
+    return rc;
 }

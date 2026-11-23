@@ -929,8 +929,8 @@ own, and none blocks another.
       same bits per pixel, so the cache is about as large as the sources. ETC2 is required of every
       Android Vulkan driver (ASTC is optional), and etcpak (BSD-3, pinned like glslang) encodes fast
       enough to convert inline the first time a texture loads; results are cached in app storage by
-      a hash of the source bytes. The PC's "prepare for phone" zip may carry the same cache files
-      (`tools/wse_texcache`), which the import installs.
+      a hash of the source bytes. The PC's "prepare for phone" zip carries the same cache files
+      (`r4_run --for-phone` writes them to `texcache/`, built 2026-11-23), which the import installs.
     - **Game files: copied to app storage as they are read.** The phone measured 32 ms and 23 MB/s
       per file through Android's folder access (APK `ca5e3ed`). A read-through cache keeps a copy of
       each file the game reads in app storage, keyed by path, size and last-modified time from the

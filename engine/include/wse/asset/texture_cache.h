@@ -218,4 +218,16 @@ inline std::uint64_t fnv1a_step_u32_le(std::uint64_t h, std::uint32_t v) noexcep
     return true;
 }
 
+// The first mip level a texture starts from under `max_size` (0 = no cap): the largest level
+// whose width and height both fit, never past the last level. The Vulkan device uses it when it
+// does not upload BC, and `r4_run --for-phone` uses it to name the converted textures it prepares,
+// so the cache keys of both sides agree.
+[[nodiscard]] inline std::uint32_t first_mip_for_cap(std::uint32_t width, std::uint32_t height,
+                                                     std::uint32_t mip_count, std::uint32_t max_size) noexcept {
+    std::uint32_t first = 0U;
+    if (max_size == 0U) return first;
+    while (first + 1U < mip_count && std::max(width >> first, height >> first) > max_size) ++first;
+    return first;
+}
+
 }  // namespace wse::asset

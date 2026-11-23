@@ -469,6 +469,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         val soDir = File(r4Dir, "so").apply { mkdirs() }
         update(state.copy(status = "Importing the game files prepared on your PC…"))
         var parts = 0
+        var textures = 0
         val doc = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
         app.contentResolver.openInputStream(doc)?.use { input ->
             // A part is its .so and its .key. They are installed together, the .key last and only
@@ -507,6 +508,18 @@ class R4StartupRunner private constructor(private val app: Application) {
                         if (stopRequested) return parts
                         val entry = zip.nextEntry ?: break
                         val name = entry.name.substringAfterLast('/').substringAfterLast('\\')
+                        if (!entry.isDirectory && PREPARED_TEXTURE.matches(name)) {
+                            // A texture converted on the PC: into the texture cache as the phone
+                            // would have written it (a whole file or nothing).
+                            val texDir = File(r4Dir, "texcache").apply { mkdirs() }
+                            val dest = File(texDir, name)
+                            if (!dest.isFile) {
+                                val tmp = File(texDir, "$name.import")
+                                tmp.outputStream().use { zip.copyTo(it, 1 shl 16) }
+                                if (tmp.renameTo(dest)) ++textures else tmp.delete()
+                            }
+                            continue
+                        }
                         if (entry.isDirectory || !PREPARED_PART.matches(name)) continue
                         val part = name.substringBeforeLast('.')
                         if (name.endsWith(".key")) {
@@ -527,7 +540,7 @@ class R4StartupRunner private constructor(private val app: Application) {
             return 0
         }
         prefs.edit().putString(PREF_IMPORTED, stamp).apply()
-        importNote("Imported $parts parts from ${stamp.substringBefore('/')}.")
+        importNote("Imported $parts parts and $textures converted textures from ${stamp.substringBefore('/')}.")
         return parts
     }
 
@@ -790,6 +803,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         private const val PREF_IMPORTED ="imported_zip"  // the last PC zip imported (name/size/time)
         private val PREPARED_ZIP = Regex("""(?i)wse2-prepared.*\.zip""")
         private val PREPARED_PART = Regex("""(exe|lua5164)_w\d+\.(so|key)""")
+        private val PREPARED_TEXTURE = Regex("""[0-9a-f]{16}\.etc2""")
         // Kept across launcher restarts, so a run Android keeps killing whole still slows down and
         // gives up: the cached batch count when the worker was last bound, the deaths in a row
         // without a new batch, and the resumes so far.

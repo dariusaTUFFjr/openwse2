@@ -134,6 +134,9 @@ import sys, zipfile, glob
 with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
     for f in sorted(glob.glob("exe_w*.so") + glob.glob("exe_w*.key") + glob.glob("lua5164_w*.so") + glob.glob("lua5164_w*.key")):
         z.write(f)
+    # Textures converted for the phone's graphics chip (r4_run --for-phone writes them).
+    for f in sorted(glob.glob("texcache/*.etc2")):
+        z.write(f)
 PY
 "@
 if ($code -ne 0) { Fail "Could not write the zip (details above)." }
