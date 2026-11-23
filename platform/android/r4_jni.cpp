@@ -456,10 +456,9 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
            (o.frame_limit == 0 ? std::string(", live run (no frame limit)\n")
                                : (", stop after " + std::to_string(o.frame_limit) + " frames\n")));
     // The shared phone target (the one a PC prepares batches for) whenever this CPU has LSE and
-    // RCpc. Asked of the kernel here, because LLVM 18's host feature list never reports "rcpc"
-    // (it does not map /proc/cpuinfo's "lrcpc"), so `lifter_llvm.cpp`'s own check always fell back
-    // to the host CPU, and no PC-prepared batch matched (seen on the user's Cortex-A78 phone,
-    // 2026-11-22). Kept out of the lifter sources on purpose: they make the translator fingerprint.
+    // RCpc. `lifter_llvm.cpp` now asks the kernel itself (LLVM 18's host feature list never
+    // reports "rcpc", seen on the user's Cortex-A78 phone, 2026-11-22); this stays as the same
+    // check made explicitly, so the target never depends on which side runs first.
     const unsigned long hwcap = getauxval(AT_HWCAP);
     if ((hwcap & kHwcapAtomics) != 0 && (hwcap & kHwcapLrcpc) != 0) {
         wse::recomp::set_code_target(wse::recomp::portable_android_target());

@@ -1059,7 +1059,11 @@ own, and none blocks another.
     stalled at `77/80` on the 3 largest batches (each 3–3.5× average size), most likely out of memory:
     a PC run in WSL (3.8 GB) hung on the same batches the same night. **Pulled forward (2026-11-21):**
     the memory fix (largest batches first, split oversized batches, a per-thread memory budget) lands
-    in the next native update, before R5, because every native update until R8 retranslates on the
+    in the next native update, before R5 (**as built, 2026-11-23:** measured first, and splitting was
+    dropped: each of the three costly batches is dominated by one giant resumable function, windows 39
+    and 30 hold a single function each, and cost follows call count, not size; so batches are weighed
+    by their call instructions, translated largest first, kept under half the available memory
+    together, and memory is given back after each batch; `STATUS.md` has the numbers), because every native update until R8 retranslates on the
     phone and on the PC. Benchmark `-O1` on cold batches (functions outside hot startup/battle paths)
     to cut first-time phone translation time without hurting battle FPS. Keep PC preparation
     (`--for-phone` zip import) working as an optional fast path sharing the same

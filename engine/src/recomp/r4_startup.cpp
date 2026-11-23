@@ -3,6 +3,7 @@
 #include "r4_startup.h"
 
 #include <dlfcn.h>
+#include <malloc.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -12,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <unordered_map>
+#include <condition_variable>
 #include <cctype>
 #include <chrono>
 #include <cstdarg>
@@ -226,6 +229,40 @@ bool load_batch(const fs::path& so, LoadedCode& code, std::string* err) {
 #endif
 }
 
+// Translation memory per call instruction in a batch, at -O2. Measured in WSL on the user's
+// v1.1.5.6 exe (2026-11-23, one batch at a time): window 38 (4,001 calls, most in one resumable
+// function with 3,755) took 2.53 GB above the baseline and 874 s; window 8 (1,860 calls) 0.77 GB
+// and 155 s. Calls predict a batch's cost (correlation 0.97 with the translated size over all
+// 80 batches; instructions only 0.43): in a resumable function every call's return address is a
+// resume point. The larger figure, about 0.65 MB per call, is used.
+constexpr std::size_t kBytesPerCall = 680 * 1024;
+
+// Gives memory a finished batch freed back to the system. The allocator otherwise keeps it per
+// thread: in WSL, two large batches translated one after the other on different threads held
+// 3.5 GB at the end instead of the 2.6 GB of the larger one (2026-11-23), and the next module's
+// memory budget was computed from what was left.
+void release_free_memory() {
+#if defined(__ANDROID__)
+#ifdef M_PURGE
+    (void)mallopt(M_PURGE, 0);
+#endif
+#elif defined(__GLIBC__)
+    (void)malloc_trim(0);
+#endif
+}
+
+// What the system reports as available memory (Linux and Android: MemAvailable), or 1 GiB.
+std::size_t available_memory_bytes() {
+    std::ifstream in("/proc/meminfo");
+    std::string key;
+    std::size_t kib = 0;
+    std::string unit;
+    while (in >> key >> kib >> unit) {
+        if (key == "MemAvailable:") return kib * 1024;
+    }
+    return std::size_t{1} << 30;
+}
+
 // Translates `m` in batches on `jobs` worker threads (a batch whose `.so` and key file match is
 // reused, so an interrupted run resumes) and loads every batch.
 bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOptions& o, Loaded& out_loaded) {
@@ -266,12 +303,12 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
         batch_window.push_back(w);
         batch_range.push_back(r);
     }
-    const std::size_t n_batches = batch_window.size();
-    std::vector<fs::path> sos(n_batches);
+    std::vector<std::string> batch_name;  // file stem: `<tag>_w<window>`
     std::vector<std::size_t> todo;
     // How each function was discovered (jump tables, their targets, unresolved jumps): a batch's
     // translation depends on it as much as on which functions the batch holds.
     std::map<std::uint64_t, std::array<std::size_t, 4>> sig;  // tables, targets, unresolved, function-bounded tables
+    std::map<std::uint64_t, std::size_t> cost_of;               // call instructions per function (batch cost)
     {
         Discoverer d0(view);
         d0.set_function_ranges(&m.img.functions);
@@ -284,8 +321,15 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
                 v[3] += jt.by_function_range ? 1 : 0;
             }
             sig[e] = v;
+            std::size_t calls = 0;
+            for (const auto& [va, ins] : f.insns) {
+                (void)va;
+                if (ins.ins.mnemonic == ZYDIS_MNEMONIC_CALL) ++calls;
+            }
+            cost_of[e] = calls + 1;
         }
     }
+    for (const std::uint64_t w : batch_window) batch_name.push_back(m.tag + "_w" + std::to_string(w));
     // Each batch's key file holds the key, then a hash of the batch's functions and how they were
     // discovered: a batch is reused only when both match (`reuse` waives the key, never the
     // functions). A key file without the second line (written before it existed) is kept unless the
@@ -311,9 +355,37 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
         }
         return true;
     };
+    const std::size_t n_batches = batch_name.size();
+    std::vector<fs::path> sos(n_batches);
+    std::vector<std::size_t> weight(n_batches, 0);
     for (std::size_t b = 0; b < n_batches; ++b) {
-        sos[b] = so_dir / (m.tag + "_w" + std::to_string(batch_window[b]) + ".so");
-        const fs::path key_file = so_dir / (m.tag + "_w" + std::to_string(batch_window[b]) + ".key");
+        for (std::size_t i = batch_range[b].first; i < batch_range[b].second; ++i) weight[b] += cost_of[all[i]];
+    }
+    // Files of batches that no longer exist (a different batch size, an older translator that
+    // batched differently, an interrupted link's object file) are removed, so old translations do
+    // not pile up in app storage.
+    {
+        std::set<std::string> keep;
+        for (const std::string& n : batch_name) {
+            keep.insert(n + ".so");
+            keep.insert(n + ".key");
+        }
+        const std::string prefix = m.tag + "_w";
+        std::error_code ec;
+        std::size_t pruned = 0;
+        for (const fs::directory_entry& de : fs::directory_iterator(so_dir, ec)) {
+            const std::string f = de.path().filename().string();
+            if (f.rfind(prefix, 0) != 0 || keep.count(f) != 0) continue;
+            const std::string ext = de.path().extension().string();
+            if (ext != ".so" && ext != ".key" && ext != ".o") continue;
+            std::error_code rec;
+            if (fs::remove(de.path(), rec)) ++pruned;
+        }
+        if (pruned != 0) out("%s: removed %zu files of batches that no longer exist\n", m.tag.c_str(), pruned);
+    }
+    for (std::size_t b = 0; b < n_batches; ++b) {
+        sos[b] = so_dir / (batch_name[b] + ".so");
+        const fs::path key_file = so_dir / (batch_name[b] + ".key");
         std::ifstream in(key_file);
         std::string line;
         std::string fns;
@@ -328,18 +400,61 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
             std::ofstream(key_file) << line << "\n" << batch_hash(b) << "\n";
         }
     }
-    out("%s: %zu functions, %zu resumable, catch continuations in %zu functions; %zu batches (%zu KiB windows), %zu to translate on %u threads\n",
-        m.tag.c_str(), entries.size(), info.resumable.size(), eh.by_function.size(), n_batches, batch, todo.size(), o.jobs);
+    // Largest first: the costly batches start early instead of holding up the end (on the phone
+    // the three largest stalled the run at 77/80, 2026-11-21), and the memory budget sees them
+    // while it can still run them apart.
+    std::stable_sort(todo.begin(), todo.end(), [&](std::size_t a, std::size_t b) { return weight[a] > weight[b]; });
+    // Memory budget: the call instructions of the batches being translated at once stay under half
+    // of what the system reports as available (kBytesPerCall each). A batch larger than the whole
+    // budget still runs, alone.
+    const std::size_t budget = std::max<std::size_t>(1, available_memory_bytes() / 2 / kBytesPerCall);
+    std::size_t largest = 0;
+    for (const std::size_t b : todo) largest = std::max(largest, weight[b]);
+    {
+        std::vector<std::size_t> order(n_batches);
+        for (std::size_t b = 0; b < n_batches; ++b) order[b] = b;
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t c) { return weight[a] > weight[c]; });
+        std::string heaviest;
+        for (std::size_t k = 0; k < order.size() && k < 3; ++k) {
+            heaviest += (k == 0 ? "" : ", ") + batch_name[order[k]] + " " + std::to_string(weight[order[k]]);
+        }
+        out("%s: costliest batches (calls): %s\n", m.tag.c_str(), heaviest.c_str());
+    }
+    out("%s: %zu functions, %zu resumable, catch continuations in %zu functions; %zu batches (%zu KiB windows), %zu to translate on %u threads (largest %zu calls, budget %zu calls at once)\n",
+        m.tag.c_str(), entries.size(), info.resumable.size(), eh.by_function.size(), n_batches, batch, todo.size(), o.jobs,
+        largest, budget);
     if (o.progress) o.progress(m.tag, 0, todo.size());
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> done{0};
     std::atomic<bool> failed{false};
     std::mutex print_m;
+    std::mutex budget_m;
+    std::condition_variable budget_cv;
+    std::size_t in_flight = 0;
     auto worker = [&]() {
         Discoverer disc(view);
         disc.set_function_ranges(&m.img.functions);
         for (std::size_t i = next++; i < todo.size() && !failed; i = next++) {
             const std::size_t b = todo[i];
+            {
+                std::unique_lock<std::mutex> lock(budget_m);
+                budget_cv.wait(lock, [&] { return in_flight == 0 || in_flight + weight[b] <= budget || failed; });
+                in_flight += weight[b];
+            }
+            struct Release {
+                std::mutex& m;
+                std::condition_variable& cv;
+                std::size_t& in_flight;
+                std::size_t w;
+                ~Release() {
+                    release_free_memory();
+                    {
+                        const std::lock_guard<std::mutex> lock(m);
+                        in_flight -= w;
+                    }
+                    cv.notify_all();
+                }
+            } release{budget_m, budget_cv, in_flight, weight[b]};
             const std::vector<std::uint64_t> vas(all.begin() + static_cast<std::ptrdiff_t>(batch_range[b].first),
                                                  all.begin() + static_cast<std::ptrdiff_t>(batch_range[b].second));
             R1Translator tr(info);
@@ -352,7 +467,7 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
             }
             std::vector<char> obj;
             std::string log;
-            const fs::path obj_path = so_dir / (m.tag + "_w" + std::to_string(batch_window[b]) + ".o");
+            const fs::path obj_path = so_dir / (batch_name[b] + ".o");
             if (e.empty() && !tr.emit_object(o.opt, obj, nullptr, &e) && e.empty()) e = "emit failed";
             if (e.empty()) {
                 std::ofstream(obj_path, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
@@ -367,7 +482,7 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
                 failed = true;
                 return;
             }
-            std::ofstream(so_dir / (m.tag + "_w" + std::to_string(batch_window[b]) + ".key")) << key << "\n" << batch_hash(b) << "\n";
+            std::ofstream(so_dir / (batch_name[b] + ".key")) << key << "\n" << batch_hash(b) << "\n";
             const std::size_t d = ++done;
             out("  %s batch %zu done (%zu/%zu, %.0f s)\n", m.tag.c_str(), b, d, todo.size(), ms_since(t0) / 1000.0);
             if (o.progress) o.progress(m.tag, d, todo.size());
@@ -376,6 +491,7 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
     std::vector<std::thread> pool;
     for (unsigned j = 0; j < std::max(1U, o.jobs); ++j) pool.emplace_back(worker);
     for (std::thread& t : pool) t.join();
+    budget_cv.notify_all();
     if (failed) return false;
     if (o.translate_only) {
         out("%s: %zu batches ready in %s (%.0f s)\n", m.tag.c_str(), n_batches, so_dir.string().c_str(), ms_since(t0) / 1000.0);
@@ -407,28 +523,62 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
     return true;
 }
 
-// Import tracing: first calls in order, and the last few calls of the run.
+// Import tracing: first calls in order, and the last few calls of the run. The game makes
+// hundreds of thousands of import calls a minute on several threads, so the per-call path takes no
+// lock: a ring of the latest slots, and one atomic "seen" flag per import slot (indexed once before
+// the run); only an import's first call takes `g_trace_m`, to record and print it.
 std::mutex g_trace_m;
-std::set<std::uint64_t> g_seen;
-std::vector<std::uint64_t> g_first;
-std::deque<std::uint64_t> g_recent;
+std::set<std::uint64_t> g_seen;              // slots without an index (none expected), under g_trace_m
+std::vector<std::uint64_t> g_first;          // under g_trace_m
+std::atomic<std::size_t> g_distinct{0};
 std::atomic<std::uint64_t> g_calls{0};
+constexpr std::size_t kRecent = 16;
+std::array<std::atomic<std::uint64_t>, kRecent> g_ring{};
+std::atomic<std::uint64_t> g_ring_pos{0};
+std::unordered_map<std::uint64_t, std::size_t> g_slot_index;  // filled before the run, then read-only
+std::unique_ptr<std::atomic<bool>[]> g_slot_seen;
 Runtime* g_rt = nullptr;
-std::string g_last_raise;  // the last RaiseException's report (under g_trace_m)
+std::mutex g_raise_m;
+std::string g_last_raise;  // the last RaiseException's report (under g_raise_m)
+
+// The last calls, oldest first. Lock-free, so a crash handler can call it.
+std::vector<std::uint64_t> recent_slots() {
+    std::vector<std::uint64_t> r;
+    const std::uint64_t end = g_ring_pos.load(std::memory_order_acquire);
+    const std::uint64_t begin = end > 12 ? end - 12 : 0;
+    for (std::uint64_t i = begin; i < end; ++i) r.push_back(g_ring[i % kRecent].load(std::memory_order_relaxed));
+    return r;
+}
 
 void print_recent() {
     out("last imports called (oldest first):\n");
-    for (const std::uint64_t slot : g_recent) {
+    for (const std::uint64_t slot : recent_slots()) {
         out("  %s\n", g_rt->import_name(slot).c_str());
     }
-    out("%llu import calls, %zu distinct\n", static_cast<unsigned long long>(g_calls.load()), g_first.size());
+    out("%llu import calls, %zu distinct\n", static_cast<unsigned long long>(g_calls.load()), g_distinct.load());
 }
 
 // A host fault: the address, the host pc and the function holding it (translated functions are
 // exported as wse_fn_<guest VA>, so dladdr names the guest function when the batch was loaded by
 // the system loader). Diagnostics only: formatting in a signal handler is not async-signal-safe,
 // which is acceptable at the point of a crash.
+// If reporting blocks (the crash hit while that thread held the log's or a shim's lock), the
+// watchdog ends the process after 3 s with a short line written straight to stderr, instead of the
+// app hanging with no report. A second crash while reporting ends the process at once.
+void on_watchdog(int) {
+    static const char kMsg[] = "\nRESULT host-signal (the crash report did not finish)\n";
+    (void)!write(2, kMsg, sizeof(kMsg) - 1);
+    std::_Exit(kStartupHostSignal);
+}
+
 void on_signal(int sig, siginfo_t* info, void* uctx) {
+    static std::atomic<int> entered{0};
+    if (entered.exchange(1) != 0) std::_Exit(kStartupHostSignal);
+    struct sigaction wd {};
+    wd.sa_handler = &on_watchdog;
+    sigemptyset(&wd.sa_mask);
+    sigaction(SIGALRM, &wd, nullptr);
+    alarm(3);
     std::uint64_t pc = 0;
 #if defined(__x86_64__)
     pc = static_cast<std::uint64_t>(static_cast<ucontext_t*>(uctx)->uc_mcontext.gregs[REG_RIP]);
@@ -509,9 +659,11 @@ int run_startup(const StartupOptions& o) {
         if (faulted.exchange(true)) return;
         out("\nFAULT: %s at 0x%llx (rip 0x%llx)%s%s\n", fault_name(f.kind), static_cast<unsigned long long>(f.va),
             static_cast<unsigned long long>(f.rip), f.what.empty() ? "" : ": ", f.what.c_str());
-        const std::lock_guard<std::mutex> lock(g_trace_m);
-        if (f.what == "unhandled guest exception" && !g_last_raise.empty()) {
-            out("%s", g_last_raise.c_str());
+        {
+            const std::lock_guard<std::mutex> lock(g_raise_m);
+            if (f.what == "unhandled guest exception" && !g_last_raise.empty()) {
+                out("%s", g_last_raise.c_str());
+            }
         }
         print_recent();
         out("RESULT fault\n");
@@ -519,14 +671,18 @@ int run_startup(const StartupOptions& o) {
     };
     const bool quiet = o.quiet;
     rt.trace_import = [quiet](std::uint64_t slot) {
-        ++g_calls;
-        const std::lock_guard<std::mutex> lock(g_trace_m);
-        if (g_seen.insert(slot).second) {
-            g_first.push_back(slot);
-            if (!quiet) out("  import #%zu %s\n", g_first.size(), g_rt->import_name(slot).c_str());
+        g_calls.fetch_add(1, std::memory_order_relaxed);
+        g_ring[g_ring_pos.fetch_add(1, std::memory_order_acq_rel) % kRecent].store(slot, std::memory_order_relaxed);
+        const auto it = g_slot_index.find(slot);
+        if (it != g_slot_index.end()) {
+            std::atomic<bool>& seen = g_slot_seen[it->second];
+            if (seen.load(std::memory_order_relaxed) || seen.exchange(true)) return;
         }
-        g_recent.push_back(slot);
-        if (g_recent.size() > 12) g_recent.pop_front();
+        const std::lock_guard<std::mutex> lock(g_trace_m);
+        if (it == g_slot_index.end() && !g_seen.insert(slot).second) return;
+        g_first.push_back(slot);
+        g_distinct.store(g_first.size(), std::memory_order_relaxed);
+        if (!quiet) out("  import #%zu %s\n", g_first.size(), g_rt->import_name(slot).c_str());
     };
     for (const auto& [rows, n] : lx.tables) rt.add_table(rows, n);
     for (const auto& [rows, n] : ll.tables) rt.add_table(rows, n);
@@ -542,6 +698,14 @@ int run_startup(const StartupOptions& o) {
     out("linked %zu imports across modules%s\n", cross, unresolved.empty() ? "" : "; unresolved:");
     for (const std::string& u : unresolved) out("  %s\n", u.c_str());
     rt.fill_iat();
+    {
+        const std::vector<PeImport>& list = rt.import_list();
+        g_slot_seen = std::make_unique<std::atomic<bool>[]>(list.size());
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            g_slot_index.emplace(list[i].slot_va, i);
+            g_slot_seen[i].store(false, std::memory_order_relaxed);
+        }
+    }
     // LuaJIT's JIT compiles Lua to x86 code at run time, which nothing here can run (and translating
     // during play is not allowed): every state the exe creates gets luaJIT_setmode(L, 0,
     // LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF) and runs in the interpreter.
@@ -632,7 +796,7 @@ int run_startup(const StartupOptions& o) {
             const std::lock_guard<std::mutex> lock(g_trace_m);
             out("\n%llu frames presented in %.1f s with no fault: %llu import calls, %zu distinct\n",
                 static_cast<unsigned long long>(frames), ms_since(t_start) / 1000.0,
-                static_cast<unsigned long long>(g_calls.load()), g_first.size());
+                static_cast<unsigned long long>(g_calls.load()), g_distinct.load());
             out("RESULT pass %llu frames\n", static_cast<unsigned long long>(frames));
             std::_Exit(kStartupFrameLimit);
         };
@@ -738,7 +902,7 @@ int run_startup(const StartupOptions& o) {
                 run.clear();
             }
             {
-                const std::lock_guard<std::mutex> lock(g_trace_m);
+                const std::lock_guard<std::mutex> lock(g_raise_m);
                 g_last_raise = r;
             }
             original(st);
@@ -835,10 +999,9 @@ int run_startup(const StartupOptions& o) {
             std::uint64_t last_calls = 0;
             for (;;) {
                 std::this_thread::sleep_for(std::chrono::seconds(every));
-                const std::lock_guard<std::mutex> lock(g_trace_m);
                 const std::uint64_t calls = g_calls.load();
                 std::string latest;
-                for (const std::uint64_t slot : g_recent) latest += " " + g_rt->import_name(slot);
+                for (const std::uint64_t slot : recent_slots()) latest += " " + g_rt->import_name(slot);
                 out("\n[%.0f s] %llu import calls (+%llu), %llu frames presented; latest:%s\n", ms_since(t0) / 1000.0,
                     static_cast<unsigned long long>(calls), static_cast<unsigned long long>(calls - last_calls),
                     static_cast<unsigned long long>(d3d9.frames()), latest.c_str());

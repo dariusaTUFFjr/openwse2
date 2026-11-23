@@ -6,6 +6,9 @@
 // loads and stores. The TSO lowering (`LDAPR`/`STLR`, LSE atomics) of `docs/RECOMP_PLAN.md`
 // lands with R3; R0 only runs a single-threaded leaf function.
 
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#endif
 #include "recomp_llvm.h"
 #include "llvm_common.h"
 
@@ -83,10 +86,15 @@ bool chosen_target(CodeTarget& out) {
         g_target = {};
         const std::string process = llvm::sys::getProcessTriple();
         if (process.rfind("aarch64", 0) == 0 && process.find("android") != std::string::npos) {
-            llvm::StringMap<bool> host;
-            if (llvm::sys::getHostCPUFeatures(host) && host.lookup("lse") && host.lookup("rcpc")) {
+#if defined(__aarch64__) && defined(__linux__)
+            // The kernel's HWCAP bits (asm/hwcap.h: ATOMICS bit 8, LRCPC bit 15): LLVM 18's host
+            // feature list never reports "rcpc" (it does not map /proc/cpuinfo's "lrcpc"), so asking
+            // it always fell back to the host CPU and no PC-prepared batch matched (2026-11-22).
+            const unsigned long hwcap = getauxval(AT_HWCAP);
+            if ((hwcap & (1UL << 8)) != 0 && (hwcap & (1UL << 15)) != 0) {
                 g_target = portable_android_target();
             }
+#endif
         }
     }
     out = g_target;
