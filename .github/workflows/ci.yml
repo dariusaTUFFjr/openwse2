@@ -257,6 +257,18 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.12'
+          # By default the Gradle cache is saved only on the default branch, and the work happens on
+          # feature branches, so every run downloaded every dependency from Maven Central again and
+          # was rate-limited (HTTP 429, 2026-11-22/23). Save it from every branch.
+          cache-read-only: false
+
+      # Robolectric downloads its Android runtime jars itself at test time into ~/.m2, outside the
+      # Gradle cache; keep them between runs (keyed by the Robolectric version in build.gradle.kts).
+      - name: Cache Robolectric runtime jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-4.14.1-sdk34-v1
 
       - name: Build arm64-v8a debug APK
         env:
