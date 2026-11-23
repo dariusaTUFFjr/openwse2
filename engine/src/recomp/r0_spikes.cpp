@@ -240,12 +240,25 @@ struct R2Reference {
 sigjmp_buf g_r2_jmp;
 volatile sig_atomic_t g_r2_armed = 0;
 volatile sig_atomic_t g_r2_why = 0;  // 1 fault, 2 timeout
+volatile pid_t g_r2_tid = 0;           // the thread that runs the cases (the only one that may jump)
 
+// The 2 s timeout is a process timer, so the kernel may deliver its SIGALRM to any thread: on the
+// phone the check runs inside the launcher, which has dozens (ART, UI, binder), and jumping to the
+// R2 thread's saved state from another thread crashed the app (2026-11-23; on a single-threaded
+// Linux host it always landed on the right thread). Only the R2 thread jumps; an alarm that lands
+// elsewhere is passed on to it, and an alarm arriving after the case ended is ignored.
 void r2_signal(int sig, siginfo_t*, void*) {
-    if (g_r2_armed != 0) {
+    const auto self = static_cast<pid_t>(syscall(SYS_gettid));
+    if (g_r2_armed != 0 && self == g_r2_tid) {
         g_r2_armed = 0;
         g_r2_why = sig == SIGALRM ? 2 : 1;
         siglongjmp(g_r2_jmp, 1);
+    }
+    if (sig == SIGALRM) {
+        if (g_r2_armed != 0 && g_r2_tid != 0) {
+            (void)syscall(SYS_tgkill, getpid(), g_r2_tid, SIGALRM);
+        }
+        return;
     }
     signal(sig, SIG_DFL);
     raise(sig);
@@ -407,6 +420,7 @@ void run_r2_differential(Report& rep, Workspace& ws, LoadMethod method, const Pe
     std::vector<std::uint64_t> mismatched;
     const auto t1 = std::chrono::steady_clock::now();
     R2Guard guard;
+    g_r2_tid = static_cast<pid_t>(syscall(SYS_gettid));
     for (R2Batch& batch : batches) {
         not_lifted += batch.not_lifted;
         LoadedCode code;
