@@ -264,6 +264,10 @@ android {
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
+            // Robolectric downloads its Android runtime jars itself; take them from the same mirror.
+            all {
+                it.systemProperty("robolectric.dependency.repo.url", "https://maven-central.storage-download.googleapis.com/maven2/")
+            }
         }
     }
 }
