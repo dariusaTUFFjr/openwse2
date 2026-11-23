@@ -810,7 +810,7 @@ if(WSE_ENABLE_LLVM)
         # The translator on the phone: Advanced > "R0 spikes" (`r0_jni.cpp`), "R4 startup run",
         # and R5a live Vulkan run (`r4_jni.cpp`, run in the isolated `:recomp` process).
         add_library(wse_r0 SHARED platform/android/r0_jni.cpp platform/android/r4_jni.cpp)
-        target_link_libraries(wse_r0 PRIVATE wse_recomp wse_vulkan android log)
+        target_link_libraries(wse_r0 PRIVATE wse_recomp wse_vulkan wse_audio android aaudio log)
         target_link_options(wse_r0 PRIVATE "-Wl,--gc-sections" "-Wl,--exclude-libs,ALL")
         wse_apply_strict_warnings(wse_r0)
     endif()

@@ -1008,6 +1008,55 @@ own, and none blocks another.
     background, and layout editor specs live in `docs/PLATFORM_PLAN.md` ("P14").
   - **Note on `lua5164`:** Already translated and verified in R4; R6 verifies Lua scripts stay
     working under live input and audio.
+  - **R6 as decided on 2026-11-23 (interview with the user, after clean-room v4.3 control UX review):**
+    - **Adaptive per-scene & within-battle touch UX (clean-room v4.3 concept, no assets/coordinates copied):**
+      Auto-switch control scenes (`Battle`, `Orders` 4-button sub-pad, `Campaign Map`, `Party`, `Trade`,
+      `Dialog`, `Screens`) using `ShowCursor` + PDB-resolved screen/agent state (with a safe fallback to
+      showing buttons whenever a condition cannot be read so the player is never locked out, plus a corner
+      manual scene override pill). Within `Battle`, buttons auto-hide by equipment and state: a single
+      multi-variant `Use` button (*Interact/Talk/Pick up* on foot, *Mount* near a horse, *Dismount* when
+      riding; hidden otherwise); a multi-variant `Kick` button (*Kick* on foot, *Interact* when riding);
+      *Switch Weapon* (`when: weapons`), *Next Shield* (`when: shield`), *Weapon Mode* (`when: mode_switch`),
+      *Drop* (`when: armed`), *Crouch* (`when: crouch`), and *Orders* / *Orders More* (`when: troops`,
+      opening the 4-button `Up / Choose / Down / Back` orders sub-scene). Include **simplistic procedural
+      vector icons** for every core and mod control (`wse/platform/touch_icons.h`, zero texture assets,
+      crisp at native resolution) and **10 user-assignable extra buttons** (`extra1..10`, hidden by default,
+      hold or toggle, with a text label or any of **28+ simplistic vector icons** including mod-specific
+      icons: spells, blessings, horse whistle, spear brace, shield bash, warcry horn, shieldwall formations,
+      sprint/dodge, volley fire, naval helm, tactical map, potion/heal, plus general RPG icons).
+    - **Automatic Mod-Control Detection (`wse/platform/mod_controls_detector.h`):** When a module is
+      selected or launched, scan its `module.ini` (`can_crouch`, `use_advanced_formation`, etc.) plus its
+      compiled `mission_templates.txt` (`key_clicked` `71` / `key_is_down` `70`), `scripts.txt`,
+      `strings.txt`, `quick_strings.txt`, and `variables.txt` via `Vfs` to auto-activate matching mod
+      buttons (e.g., Crouch, Spells/Blessings for *Phantasy Calradia*, Horse Whistle for *Viking Conquest* /
+      *Floris*, Brace Spear / Formations for *PBOD*, Shield Bash, Warcry, Sprint/Dodge, Volley Fire,
+      Tactical Map), while letting any player layout override stick per module.
+    - **Menu Touch Ergonomics & Readability:** In cursor scenes (`ShowCursor(TRUE)`), use a two-phase tap
+      and drop state machine (move cursor on frame $N$, press on $N+1$, hold drop coordinates through
+      release) so the first tap always clicks and dragged items drop where lifted, convert vertical drags
+      over lists to mouse-wheel scroll (`DIMOFS_Z`), and allow two-finger pinch-zoom in `Present()` with
+      inverse-mapped touch coordinates.
+    - **Attack aiming, Zoom & Party/Trade/Dialog helpers:** Holding and sliding the **Attack** button aims
+      the swing direction (or aims a ranged weapon). **Zoom** defaults to *Hold to zoom/aim* (`aimHold`,
+      toggleable in settings). **Campaign Map** provides a `Map Look` pan/zoom toggle, a variant
+      `Follow / Recenter (Home)` camera button, `Stop / Rest` (pauses/resumes map time while keeping the
+      destination), and `Fast Travel` (`Ctrl+Space`). **Party** provides sticky-toggle *Move Stack* (`Ctrl`)
+      and *Move 10* (`Shift`, labeled `10`) when a stack is movable; **Trade** provides *Take All*,
+      *Give All*, and *Cancel*; **Dialog** provides *Up*, *Select*, and *Down* (with *Up/Down* dimmed
+      unless multiple choices exist); general **Screens** provide a clean *Back/Close* button.
+    - **Movement stick, camera look & gyro:** Fixed left virtual joystick + right-side drag-to-look at
+      medium default sensitivity; low-pass filtered **gyro aiming OFF by default** (opt-in when zooming or
+      aiming).
+    - **Combat haptics (hit vibration):** **ON by default** with separate toggles for *"When you are hit"*
+      (default ON) and *"When you land a hit"* (default ON), pulse intensity scaled by blow/sound heaviness
+      (shield block, hit impact, couched lance near the player's agent), and a **Strength** slider
+      (`10–100%`, default `60%`).
+    - **Audio & external input priority:** Pause both music and sound effects cleanly when the app moves to
+      the background and resume on return; default volume `100%` (follows phone media volume). Mix on the
+      audio worker thread (never the game thread) and read sound files through `Vfs` (`CachingVfs`). For
+      external inputs, wire **Gamepad first** (including `L1` fast-travel and `L2`/`R2` party stack/ten &
+      notes shortcuts, auto-hiding touch chrome), followed by **Mouse/Keyboard + Desktop Mode (DeX /
+      external display)** with raw Pointer Capture.
 - **Depends on:** R5a (for Vulkan overlay pass in `Present()`); P6 `WseAudioMixer`; P7/P11 input &
   touch layout primitives.
 - **Done when:**

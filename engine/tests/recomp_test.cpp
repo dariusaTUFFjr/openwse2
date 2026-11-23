@@ -24,8 +24,12 @@
 #include <utility>
 #include <vector>
 
+#include "wse/platform/mod_controls_detector.h"
+#include "wse/platform/touch_icons.h"
+#include "wse/recomp/combat_haptics.h"
 #include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/fx_effect.h"
+#include "wse/recomp/input_hub.h"
 #include "wse/recomp/pdb_reader.h"
 #include "wse/recomp/pe_image.h"
 #include "wse/recomp/r0_inputs.h"
@@ -6190,6 +6194,361 @@ void test_d3d9_backend_and_preshader() {
     }
 }
 
+std::vector<std::uint8_t> make_test_wav_pcm16(std::uint32_t sample_rate, std::size_t frames, float freq_hz) {
+    const std::uint32_t data_bytes = static_cast<std::uint32_t>(frames * 2U);
+    std::vector<std::uint8_t> out(44U + data_bytes, 0U);
+    auto put16 = [&](std::size_t off, std::uint16_t v) { std::memcpy(out.data() + off, &v, 2U); };
+    auto put32 = [&](std::size_t off, std::uint32_t v) { std::memcpy(out.data() + off, &v, 4U); };
+    std::memcpy(out.data() + 0U, "RIFF", 4U);
+    put32(4U, 36U + data_bytes);
+    std::memcpy(out.data() + 8U, "WAVEfmt ", 8U);
+    put32(16U, 16U);
+    put16(20U, 1U);
+    put16(22U, 1U);
+    put32(24U, sample_rate);
+    put32(28U, sample_rate * 2U);
+    put16(32U, 2U);
+    put16(34U, 16U);
+    std::memcpy(out.data() + 36U, "data", 4U);
+    put32(40U, data_bytes);
+    constexpr float kTwoPi = 6.28318530717958647692F;
+    for (std::size_t i = 0U; i < frames; ++i) {
+        const float s = 0.65F * std::sin(kTwoPi * freq_hz * static_cast<float>(i) / static_cast<float>(sample_rate));
+        const auto q = static_cast<std::int16_t>(std::lround(s * 32767.0F));
+        std::memcpy(out.data() + 44U + i * 2U, &q, 2U);
+    }
+    return out;
+}
+
+void test_r6_fmod_audio_and_haptics() {
+    using namespace wse::recomp;
+    using namespace wse::recomp::shim;
+    Runtime rt;
+    FmodSteam fmod(rt);
+    const std::vector<std::uint8_t> hit_wav = make_test_wav_pcm16(48000U, 4800U, 440.0F);
+    const std::vector<std::uint8_t> music_wav = make_test_wav_pcm16(48000U, 9600U, 220.0F);
+    fmod.read_file = [&](const std::string& path, std::vector<std::uint8_t>& out) -> bool {
+        if (path.find("shield_hit") != std::string::npos) {
+            out = hit_wav;
+            return true;
+        }
+        if (path.find("town_neutral") != std::string::npos) {
+            out = music_wav;
+            return true;
+        }
+        return false;
+    };
+
+    wse::platform::CaptureAudioDevice dev;
+    expect(dev.open(wse::platform::AudioDeviceSpec{48000U, 2U}), "R6 FMOD: open CaptureAudioDevice");
+    fmod.set_audio_device(&dev, false);
+
+    std::vector<CombatHapticPulse> pulses;
+    fmod.on_haptic = [&](const CombatHapticPulse& p) { pulses.push_back(p); };
+    fmod.install();
+
+    GuestStack fmod_stack(128 * 1024);
+    CpuState fmod_s{};
+    fmod_stack.prepare(fmod_s);
+    rt.attach(fmod_s);
+    auto call = [&](const char* name, std::initializer_list<std::uint64_t> args) -> std::uint64_t {
+        return u32_test::call(rt, fmod_s, "fmodex64.dll", name, args);
+    };
+
+    std::uint64_t sys = 0, snd_3d = 0, snd_stream = 0, ch_3d = 0, ch_stream = 0;
+    expect(call("FMOD_System_Create", {reinterpret_cast<std::uintptr_t>(&sys)}) == 0U && sys != 0U,
+           "R6 FMOD: System_Create");
+    expect(call("?init@System@FMOD@@QEAA?AW4FMOD_RESULT@@HIPEAX@Z", {sys, 64U, 0U, 0U}) == 0U, "R6 FMOD: init");
+
+    // Listener at origin facing +Z, up +Y => FMOD LH right = up x forward = (+1, 0, 0).
+    float lpos[3] = {0.0F, 0.0F, 0.0F};
+    float lfwd[3] = {0.0F, 0.0F, 1.0F};
+    float lup[3] = {0.0F, 1.0F, 0.0F};
+    expect(call("?set3DListenerAttributes@System@FMOD@@QEAA?AW4FMOD_RESULT@@HPEBUFMOD_VECTOR@@000@Z",
+                {sys, 0U, reinterpret_cast<std::uintptr_t>(lpos), 0U,
+                 reinterpret_cast<std::uintptr_t>(lfwd), reinterpret_cast<std::uintptr_t>(lup)}) == 0U,
+           "R6 FMOD: set3DListenerAttributes");
+
+    const char* hit_path = "Sounds/shield_hit_wood.wav";
+    const char* mus_path = "Music/town_neutral.wav";
+    expect(call("?createSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIPEAUFMOD_CREATESOUNDEXINFO@@PEAPEAVSound@2@@Z",
+                {sys, reinterpret_cast<std::uintptr_t>(hit_path), kFmod3D | kFmodLoopOff, 0U,
+                 reinterpret_cast<std::uintptr_t>(&snd_3d)}) == 0U && snd_3d != 0U,
+           "R6 FMOD: createSound 3D");
+    expect(call("?createStream@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIPEAUFMOD_CREATESOUNDEXINFO@@PEAPEAVSound@2@@Z",
+                {sys, reinterpret_cast<std::uintptr_t>(mus_path), kFmod2D | kFmodLoopNormal, 0U,
+                 reinterpret_cast<std::uintptr_t>(&snd_stream)}) == 0U && snd_stream != 0U,
+           "R6 FMOD: createStream 2D looping");
+
+    std::uint32_t len_ms = 0U;
+    expect(call("?getLength@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@PEAII@Z",
+                {snd_3d, reinterpret_cast<std::uintptr_t>(&len_ms), kFmodTimeUnitMs}) == 0U &&
+               len_ms == 100U,
+           "R6 FMOD: Sound::getLength reports real 100 ms WAV duration");
+
+    // Start 3D sound paused, place it to the right (+1.5 m), unpause => triggers haptic + right-panned mix.
+    expect(call("?playSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_CHANNELINDEX@@PEAVSound@2@_NPEAPEAVChannel@2@@Z",
+                {sys, static_cast<std::uint64_t>(static_cast<std::int64_t>(-1)), snd_3d, 1U,
+                 reinterpret_cast<std::uintptr_t>(&ch_3d)}) == 0U && ch_3d != 0U,
+           "R6 FMOD: playSound paused");
+    float spos[3] = {1.5F, 0.0F, 0.0F};
+    expect(call("?set3DAttributes@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEBUFMOD_VECTOR@@0@Z",
+                {ch_3d, reinterpret_cast<std::uintptr_t>(spos), 0U}) == 0U,
+           "R6 FMOD: set3DAttributes");
+    expect(pulses.empty(), "R6 Haptics: does not fire while channel is still paused");
+    expect(call("?setPaused@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@_N@Z", {ch_3d, 0U}) == 0U, "R6 FMOD: unpause");
+    expect(pulses.size() == 1U && pulses[0].kind == CombatHapticKind::shield_block && pulses[0].amplitude > 0U,
+           "R6 Haptics: nearby shield_hit fires shield_block pulse on unpause");
+
+    std::uint8_t playing = 0U;
+    expect(call("?isPlaying@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEA_N@Z",
+                {ch_3d, reinterpret_cast<std::uintptr_t>(&playing)}) == 0U && playing == 1U,
+           "R6 FMOD: isPlaying is true");
+
+    expect(fmod.pump_once(1024U, 512U) == 1024U, "R6 FMOD: pump_once mixes 1024 stereo frames");
+    expect(dev.rms_right() > dev.rms_left() * 2.0 && dev.rms_right() > 0.05,
+           "R6 FMOD: 3D source at +X pans cleanly to right speaker");
+
+    // Start 2D looping stream music (non-combat => no haptic) and verify background pause silences output.
+    expect(call("?playSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_CHANNELINDEX@@PEAVSound@2@_NPEAPEAVChannel@2@@Z",
+                {sys, static_cast<std::uint64_t>(static_cast<std::int64_t>(-1)), snd_stream, 0U,
+                 reinterpret_cast<std::uintptr_t>(&ch_stream)}) == 0U,
+           "R6 FMOD: playSound 2D stream");
+    expect(pulses.size() == 1U, "R6 Haptics: music stream does not fire combat haptic");
+
+    fmod.set_app_paused(true);
+    expect(dev.paused() && fmod.pump_once(2048U, 512U) == 0U, "R6 FMOD: background pause halts device & pump");
+    fmod.set_app_paused(false);
+    dev.clear();
+    expect(!dev.paused() && fmod.pump_once(1024U, 512U) == 1024U && dev.rms_left() > 0.05,
+           "R6 FMOD: resume restores streaming music cleanly");
+
+    expect(call("?stop@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", {ch_3d}) == 0U, "R6 FMOD: stop channel");
+    expect(call("?update@System@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", {sys}) == 0U, "R6 FMOD: System::update");
+}
+
+void test_r6_input_shims_and_adaptive_touch() {
+    using namespace wse::recomp;
+    using namespace wse::recomp::shim;
+    Runtime rt;
+    RecompInputHub hub;
+    hub.set_screen_size(2412, 1080);
+
+    User32 u32(rt, DisplayConfig{2412, 1080});
+    u32.input_hub = &hub;
+    hub.set_window_msg_sink([&](std::uint32_t msg, std::uint64_t wp, std::uint64_t lp) {
+        (void)u32.post_to_main(msg, wp, lp);
+    });
+    u32.install();
+
+    D3d9 d3d(rt);
+    d3d.input_hub = &hub;
+    d3d.install();
+
+    SystemDlls sys(rt);
+    sys.input_hub = &hub;
+    sys.install();
+
+    // 1. DirectInput 8 keyboard & mouse devices
+    const FnRow u32_rows[] = {{u32_test::kProcVa, &u32_test::wndproc}};
+    rt.add_table(u32_rows, 1);
+    GuestStack com_stack(128 * 1024);
+    CpuState com_s{};
+    com_stack.prepare(com_s);
+    rt.attach(com_s);
+    alignas(16) static std::uint8_t r6_teb[0x2000]{};
+    com_s.teb = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(r6_teb));
+    namespace ci = wse::recomp::com;
+
+    auto call_imp = [&](const char* dll, const char* name, std::initializer_list<std::uint64_t> args) -> std::uint64_t {
+        return u32_test::call(rt, com_s, dll, name, args);
+    };
+
+    std::uint64_t di = 0, kbd = 0, mouse = 0;
+    expect(call_imp("DINPUT8.dll", "DirectInput8Create",
+                    {0U, 0x0800U, reinterpret_cast<std::uintptr_t>(ci::kIDirectInput8A.iid),
+                     reinterpret_cast<std::uintptr_t>(&di), 0U}) == 0U && di != 0U,
+           "R6 DInput: DirectInput8Create");
+    const std::uint32_t guid_kbd[4] = {0x6F1D2B61U, 0U, 0U, 0U};
+    const std::uint32_t guid_mouse[4] = {0x6F1D2B60U, 0U, 0U, 0U};
+    expect(d3d_test::com(com_s, di, ci::kIDirectInput8A, "CreateDevice",
+                         {reinterpret_cast<std::uintptr_t>(guid_kbd), reinterpret_cast<std::uintptr_t>(&kbd), 0U}) == 0U && kbd != 0U,
+           "R6 DInput: CreateDevice keyboard");
+    expect(d3d_test::com(com_s, di, ci::kIDirectInput8A, "CreateDevice",
+                         {reinterpret_cast<std::uintptr_t>(guid_mouse), reinterpret_cast<std::uintptr_t>(&mouse), 0U}) == 0U && mouse != 0U,
+           "R6 DInput: CreateDevice mouse");
+
+    hub.inject_key(dik::kW, true);
+    hub.inject_mouse_delta(14, -9);
+    hub.inject_mouse_button(0, true);
+
+    std::uint8_t kstate[256]{};
+    expect(d3d_test::com(com_s, kbd, ci::kIDirectInputDevice8A, "GetDeviceState",
+                         {256U, reinterpret_cast<std::uintptr_t>(kstate)}) == 0U && kstate[dik::kW] == 0x80U,
+           "R6 DInput: keyboard GetDeviceState reads DIK_W");
+
+    std::uint8_t dod[24 * 4]{};
+    std::uint32_t dod_n = 4U;
+    expect(d3d_test::com(com_s, kbd, ci::kIDirectInputDevice8A, "GetDeviceData",
+                         {24U, reinterpret_cast<std::uintptr_t>(dod), reinterpret_cast<std::uintptr_t>(&dod_n), 0U}) == 0U &&
+               dod_n == 1U,
+           "R6 DInput: keyboard GetDeviceData returns 1 buffered event");
+
+    std::uint8_t mstate[20]{};
+    expect(d3d_test::com(com_s, mouse, ci::kIDirectInputDevice8A, "GetDeviceState",
+                         {20U, reinterpret_cast<std::uintptr_t>(mstate)}) == 0U, "R6 DInput: mouse GetDeviceState");
+    std::int32_t lx = 0, ly = 0;
+    std::memcpy(&lx, mstate + 0U, 4U);
+    std::memcpy(&ly, mstate + 4U, 4U);
+    expect(lx == 14 && ly == -9 && mstate[12] == 0x80U, "R6 DInput: mouse deltas and LMB match");
+
+    // 2. XInput 1.3 + overlay auto-hide on gamepad
+    std::uint8_t xstate[16]{};
+    expect(call_imp("XINPUT1_3.dll", "#2", {0U, reinterpret_cast<std::uintptr_t>(xstate)}) == kErrorDeviceNotConnected,
+           "R6 XInput: disconnected before pad connects");
+    XInputPadState pad{};
+    pad.connected = true;
+    pad.buttons = 0x1000U;  // A
+    pad.left_trigger = 200U;
+    pad.thumb_lx = 16000;
+    hub.update_gamepad(0U, pad);
+    expect(call_imp("XINPUT1_3.dll", "#2", {0U, reinterpret_cast<std::uintptr_t>(xstate)}) == 0U,
+           "R6 XInput: connected returns ERROR_SUCCESS");
+    std::uint16_t xb = 0U;
+    std::int16_t xlx = 0;
+    std::memcpy(&xb, xstate + 4U, 2U);
+    std::memcpy(&xlx, xstate + 8U, 2U);
+    expect(xb == 0x1000U && xstate[6] == 200U && xlx == 16000, "R6 XInput: buttons, trigger and thumbstick match");
+
+    wse::platform::GeometryFrame ov_frame;
+    expect(!hub.build_overlay_geometry(ov_frame, 2412U, 1080U),
+           "R6 Touch UX: gamepad activity auto-hides touch overlay");
+
+    // 3. Touch brings overlay back + two-phase menu tap + WM_CHAR injection
+    hub.on_show_cursor(true);
+    hub.on_touch_event(1, 0, 1200.0F, 540.0F);
+    expect(hub.build_overlay_geometry(ov_frame, 2412U, 1080U) && !ov_frame.vertices.empty(),
+           "R6 Touch UX: touch restores procedural overlay geometry");
+    std::int32_t pt[2]{};
+    expect(call_imp("USER32.dll", "GetCursorPos", {reinterpret_cast<std::uintptr_t>(pt)}) == 1U &&
+               pt[0] == 1200 && pt[1] == 540,
+           "R6 Touch UX: first phase moves GetCursorPos to tapped coordinates");
+
+    // Create a window and test WM_CHAR delivery from soft keyboard.
+    const std::u16string wcls = u"WseR6Test";
+    alignas(8) std::uint8_t wc[80]{};
+    const std::uint32_t wc_sz = 80U;
+    std::memcpy(wc, &wc_sz, 4U);
+    std::memcpy(wc + 8U, &u32_test::kProcVa, 8U);
+    const auto cls_ptr = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(wcls.c_str()));
+    std::memcpy(wc + 64U, &cls_ptr, 8U);
+    (void)call_imp("USER32.dll", "RegisterClassExW", {reinterpret_cast<std::uintptr_t>(wc)});
+    const std::uint64_t hwnd = call_imp("USER32.dll", "CreateWindowExW", {0U, cls_ptr, 0U, 0U, 0U, 0U, 800U, 600U, 0U, 0U, 0U, 0U});
+    expect(hwnd != 0U, "R6 USER32: window created for WM_CHAR test");
+
+    hub.inject_text_utf8("Hi");
+    std::uint8_t msg_buf[48]{};
+    expect(call_imp("USER32.dll", "PeekMessageW", {reinterpret_cast<std::uintptr_t>(msg_buf), hwnd, 0U, 0U, kPmRemove}) == 1U,
+           "R6 USER32: PeekMessageW pops injected WM_CHAR 'H'");
+    std::uint32_t msg_id = 0U;
+    std::uint64_t msg_wp = 0U;
+    std::memcpy(&msg_id, msg_buf + 8U, 4U);
+    std::memcpy(&msg_wp, msg_buf + 16U, 8U);
+    expect(msg_id == kWmChar && msg_wp == static_cast<std::uint64_t>('H'), "R6 USER32: WM_CHAR carries 'H'");
+
+    // 4. Adaptive within-battle context gating & multi-variant `use` icon
+    hub.on_show_cursor(false);
+    expect(hub.current_scene() == TouchScene::battle, "R6 Scene: ShowCursor(FALSE) switches to Battle");
+    BattleContextFlags bctx{};
+    bctx.known_mask = BattleContextFlags::kDismount | BattleContextFlags::kCrouchAllowed | BattleContextFlags::kMultiplayer;
+    bctx.value_mask = BattleContextFlags::kDismount;  // riding + stopped => dismount variant, crouch off, mp off
+    hub.set_battle_context(bctx);
+    const auto vis = hub.visible_buttons_snapshot();
+    bool saw_dismount_use = false;
+    bool saw_crouch = false;
+    for (const auto& b : vis) {
+        if (b.id == "use" && b.icon == wse::platform::TouchIconId::horse_dismount) saw_dismount_use = true;
+        if (b.id == "crouch") saw_crouch = true;
+    }
+    expect(saw_dismount_use && !saw_crouch, "R6 Battle UX: Use switches to Dismount icon and hides disabled Crouch");
+
+    // 5. Context-aware Cheats menu: hidden when off, shown in every area when cheats are on
+    hub.set_cheats_enabled(false);
+    auto has_id = [](const std::vector<TouchButtonSpec>& v, std::string_view id) {
+        for (const auto& b : v) {
+            if (b.id == id) return true;
+        }
+        return false;
+    };
+    expect(!has_id(hub.visible_buttons_snapshot(), "cheat_menu"), "R6 Cheats: hidden when cheats are off");
+    hub.set_cheats_enabled(true, true);
+    expect(has_id(hub.visible_buttons_snapshot(), "cheat_heal") &&
+               has_id(hub.visible_buttons_snapshot(), "cheat_ko_all") &&
+               !has_id(hub.visible_buttons_snapshot(), "cheat_gold"),
+           "R6 Cheats: Battle shows Heal/KO All and hides Trade-only Gold cheat");
+    hub.set_inferred_scene(TouchScene::trade);
+    expect(has_id(hub.visible_buttons_snapshot(), "cheat_gold") &&
+               has_id(hub.visible_buttons_snapshot(), "cheat_console_t") &&
+               !has_id(hub.visible_buttons_snapshot(), "cheat_heal"),
+           "R6 Cheats: Trade shows +1000 Gold & Console and hides Battle-only cheats");
+    hub.set_inferred_scene(TouchScene::campaign_map);
+    expect(has_id(hub.visible_buttons_snapshot(), "cheat_teleport") &&
+               has_id(hub.visible_buttons_snapshot(), "cheat_reveal_map"),
+           "R6 Cheats: Campaign Map shows Teleport & Reveal Map");
+}
+
+void test_r6_mod_controls_detector_and_icons() {
+    using namespace wse::platform;
+
+    // 1. Phantasy Calradia detection (module.ini + mission_templates key_clicked + strings)
+    {
+        MemoryVfs vfs;
+        vfs.write_text("Modules/Phantasy/module.ini", "can_crouch = 1\n");
+        vfs.write_text("Modules/Phantasy/mission_templates.txt", "mst_lead_charge 71 1 48 71 1 49\n");
+        vfs.write_text("Modules/Phantasy/strings.txt", "str_cast_spell Cast_Spell\nstr_blessing Divine_Blessing\n");
+        const DetectedModControls det = detect_mod_controls(vfs, "Modules/Phantasy", "Phantasy Calradia");
+        expect(det.crouch_supported, "R6 ModDetect: can_crouch=1 enables Crouch");
+        bool has_spells = false, has_blessings = false;
+        for (const auto& b : det.buttons) {
+            if (b.id == "mod_spells" && b.dik_code == 0x30U && b.icon == TouchIconId::spell_spark) has_spells = true;
+            if (b.id == "mod_blessings" && b.dik_code == 0x31U && b.icon == TouchIconId::sun_blessing) has_blessings = true;
+        }
+        expect(has_spells && has_blessings, "R6 ModDetect: Phantasy Calradia activates Spells (B) & Blessings (N)");
+    }
+
+    // 2. Warsword Conquest, World of Vasnar, 108 Heroes, and Viking Conquest/PBOD detection
+    {
+        MemoryVfs vfs;
+        vfs.write_text("Modules/Omni/module.ini", "use_advanced_formation = 1\n");
+        vfs.write_text("Modules/Omni/strings.txt",
+                       "warsword focus_willpower drink_potion vasnar necromancy 108_heroes hero_skill "
+                       "whistle_for_horse spear_bracing shield_bash warcry\n");
+        const DetectedModControls det = detect_mod_controls(vfs, "Modules/Omni", "OmniMod");
+        expect(det.advanced_formations && det.buttons.size() >= 6U,
+               "R6 ModDetect: detects Warsword, Vasnar, 108 Heroes, VC and PBOD hotkeys");
+    }
+
+    // 3. Every simplistic procedural vector icon emits finite, in-bounds geometry
+    GeometryFrame frame;
+    for (int i = 1; i < static_cast<int>(TouchIconId::count_); ++i) {
+        frame.vertices.clear();
+        frame.indices.clear();
+        emit_touch_icon(frame, 0U, static_cast<TouchIconId>(i), 100.0F, 100.0F, 24.0F, 1.0F, 1.0F, 1.0F, 1.0F);
+        bool ok = !frame.vertices.empty() && !frame.indices.empty() && (frame.indices.size() % 3U == 0U);
+        for (const auto idx : frame.indices) {
+            if (idx < 0 || static_cast<std::size_t>(idx) >= frame.vertices.size()) ok = false;
+        }
+        for (const auto& v : frame.vertices) {
+            if (!std::isfinite(v.x) || !std::isfinite(v.y)) ok = false;
+        }
+        if (!ok) {
+            expect(false, "R6 Icons: procedural icon produced invalid geometry");
+            break;
+        }
+    }
+    expect(static_cast<int>(TouchIconId::count_) >= 60, "R6 Icons: full core + mod + extra icon catalog present");
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -6238,6 +6597,9 @@ int run_recomp_suite(const char* fixture_path) {
     test_d3d9_capture();
     test_d3d9_backend_and_preshader();
     test_unwinder();
+    test_r6_fmod_audio_and_haptics();
+    test_r6_input_shims_and_adaptive_touch();
+    test_r6_mod_controls_detector_and_icons();
     {
         GuestStack gs(64 * 1024);
         expect(gs.data() != nullptr && gs.usable_size() >= 64 * 1024 + 64,

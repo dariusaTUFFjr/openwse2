@@ -35,16 +35,23 @@
 
 #include "../../engine/src/recomp/r4_startup.h"
 #include "../../engine/src/recomp/recomp_llvm.h"
+#include "aaudio_device.h"
 #include "d3d9_vulkan.h"
 #include "driver_loader.h"
 #include "saf_jni_util.h"
+#include "wse/asset/audio_codecs.h"
 #include "wse/platform/caching_vfs.h"
+#include "wse/platform/mod_controls_detector.h"
 #include "wse/platform/performance.h"
 #include "wse/platform/rhi.h"
 #include "wse/platform/saf_vfs.h"
 #include "wse/platform/vfs.h"
+#include "wse/recomp/input_hub.h"
 #include "wse/recomp/screen.h"
 #include "wse/recomp/shim_d3d9.h"
+#include "wse/recomp/shim_fmod_steam.h"
+#include "wse/recomp/shim_system.h"
+#include "wse/recomp/shim_user32.h"
 
 namespace {
 
@@ -253,19 +260,18 @@ public:
         listener_ = env->NewGlobalRef(listener);
         jclass cls = env->GetObjectClass(listener);
         mid_update_ = env->GetMethodID(cls, "onHudUpdate", "(Ljava/lang/String;)V");
-        env->DeleteLocalRef(cls);
         if (clear_if_exception(env)) mid_update_ = nullptr;
+        mid_haptic_ = env->GetMethodID(cls, "onHapticPulse", "(II)V");
+        if (clear_if_exception(env)) mid_haptic_ = nullptr;
+        mid_ui_action_ = env->GetMethodID(cls, "onUiAction", "(Ljava/lang/String;)V");
+        if (clear_if_exception(env)) mid_ui_action_ = nullptr;
+        env->DeleteLocalRef(cls);
     }
 
     void update(std::string_view text) const {
         if (vm_ == nullptr || listener_ == nullptr || mid_update_ == nullptr) return;
-        JNIEnv* env = nullptr;
-        void* raw = nullptr;
-        if (vm_->GetEnv(&raw, JNI_VERSION_1_6) == JNI_OK && raw != nullptr) {
-            env = static_cast<JNIEnv*>(raw);
-        } else if (vm_->AttachCurrentThread(&env, nullptr) != JNI_OK || env == nullptr) {
-            return;
-        }
+        JNIEnv* env = attach_env();
+        if (env == nullptr) return;
         jstring js = utf8_to_jstring(env, text);
         if (js != nullptr) {
             env->CallVoidMethod(listener_, mid_update_, js);
@@ -274,10 +280,41 @@ public:
         }
     }
 
+    void haptic_pulse(std::uint32_t duration_ms, std::uint8_t amplitude) const {
+        if (vm_ == nullptr || listener_ == nullptr || mid_haptic_ == nullptr) return;
+        JNIEnv* env = attach_env();
+        if (env == nullptr) return;
+        env->CallVoidMethod(listener_, mid_haptic_, static_cast<jint>(duration_ms), static_cast<jint>(amplitude));
+        (void)clear_if_exception(env);
+    }
+
+    void ui_action(std::string_view action) const {
+        if (vm_ == nullptr || listener_ == nullptr || mid_ui_action_ == nullptr) return;
+        JNIEnv* env = attach_env();
+        if (env == nullptr) return;
+        jstring js = utf8_to_jstring(env, action);
+        if (js != nullptr) {
+            env->CallVoidMethod(listener_, mid_ui_action_, js);
+            env->DeleteLocalRef(js);
+            (void)clear_if_exception(env);
+        }
+    }
+
 private:
+    [[nodiscard]] JNIEnv* attach_env() const {
+        JNIEnv* env = nullptr;
+        void* raw = nullptr;
+        if (vm_->GetEnv(&raw, JNI_VERSION_1_6) == JNI_OK && raw != nullptr) {
+            return static_cast<JNIEnv*>(raw);
+        }
+        return (vm_->AttachCurrentThread(&env, nullptr) == JNI_OK) ? env : nullptr;
+    }
+
     JavaVM* vm_ = nullptr;
     jobject listener_ = nullptr;
     jmethodID mid_update_ = nullptr;
+    jmethodID mid_haptic_ = nullptr;
+    jmethodID mid_ui_action_ = nullptr;
 };
 
 std::mutex g_report_m;
@@ -355,6 +392,16 @@ std::mutex g_vk_m;
 std::shared_ptr<wse::platform::VulkanD3d9Backend> g_vk_backend;
 ANativeWindow* g_pending_window = nullptr;
 
+// Live R6 audio & VFS handles shared with `FmodSteam::created_hook()` and `nativeSetPaused`.
+std::mutex g_audio_m;
+wse::recomp::shim::FmodSteam* g_active_fmod = nullptr;
+std::unique_ptr<wse::platform::AAudioDevice> g_aaudio_dev;
+wse::platform::Vfs* g_audio_install_vfs = nullptr;
+wse::platform::Vfs* g_audio_user_vfs = nullptr;
+std::shared_ptr<HudNotifier> g_active_hud;
+float g_audio_master_volume = 1.0F;
+wse::recomp::shim::CombatHapticsSettings g_haptics_cfg{};
+
 // Background pause state: the game thread blocks at the end of `on_frame_presented`
 // while the activity is paused or has no surface, and wakes immediately on resume or shutdown.
 std::mutex g_pause_m;
@@ -424,6 +471,33 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     }
     g_install_cache.store(install_cache.get(), std::memory_order_release);
     static wse::platform::HostVfs user(work / "user");
+    {
+        const std::lock_guard<std::mutex> lock(g_audio_m);
+        g_audio_install_vfs = game_install;
+        g_audio_user_vfs = &user;
+    }
+
+    const std::string resolved_mod = module_name.empty() ? std::string("Native") : module_name;
+    const auto detected_mods = wse::platform::detect_mod_controls(*game_install, "Modules/" + resolved_mod, resolved_mod);
+    if (!detected_mods.buttons.empty() || detected_mods.crouch_supported) {
+        report("mod-controls: " + detected_mods.summary_text() + "\n");
+    }
+    wse::recomp::shim::RecompInputHub::shared().apply_detected_mod_controls(detected_mods);
+
+    // Auto-enable the Cheats overlay menu in every scene when `cheat_mode = 1` in rgl_config.txt.
+    {
+        std::string rgl_cfg;
+        bool cheats_on = false;
+        if (user.read_text("Documents/Mount&Blade Warband/rgl_config.txt", rgl_cfg) ||
+            user.read_text("Documents/Mount&Blade Warband WSE2/rgl_config.txt", rgl_cfg)) {
+            const std::string low = wse::platform::mod_detect_detail::to_lower_ascii(rgl_cfg);
+            (void)wse::platform::mod_detect_detail::parse_ini_bool(low, "cheat_mode", cheats_on);
+        }
+        wse::recomp::shim::RecompInputHub::shared().set_cheats_enabled(cheats_on);
+        if (cheats_on) {
+            report("cheats-menu: enabled (cheat_mode = 1 in rgl_config.txt)\n");
+        }
+    }
 
     wse::recomp::StartupOptions o;
     if (hud) hud->update("Reading the game…");
@@ -482,6 +556,9 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     }
     g_progress_path = (work / "progress.txt").string();
     wse::recomp::shim::D3d9::created_hook() = nullptr;
+    wse::recomp::shim::User32::created_hook() = nullptr;
+    wse::recomp::shim::SystemDlls::created_hook() = nullptr;
+    wse::recomp::shim::FmodSteam::created_hook() = nullptr;
     return run_startup_common(env, bridge, jstring_to_utf8(env, jcopy_dir), work, jstring_to_utf8(env, jmodule),
                               jobs, frames, nullptr);
 }
@@ -589,12 +666,32 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     // Widescreen: the game draws at the screen's own shape (e.g. 2412 x 1080 on a 20:9 phone) when
     // the shims report it as the desktop; without a window it stays 1920 x 1080.
     if (init_win != nullptr) {
-        wse::recomp::shim::set_screen_size(ANativeWindow_getWidth(init_win), ANativeWindow_getHeight(init_win));
+        const int sw = ANativeWindow_getWidth(init_win);
+        const int sh = ANativeWindow_getHeight(init_win);
+        wse::recomp::shim::set_screen_size(sw, sh);
+        wse::recomp::shim::RecompInputHub::shared().set_screen_size(sw, sh);
+    } else {
+        const auto sz = wse::recomp::shim::screen_size();
+        wse::recomp::shim::RecompInputHub::shared().set_screen_size(sz.width, sz.height);
     }
+    {
+        const std::lock_guard<std::mutex> lock(g_audio_m);
+        g_active_hud = hud;
+    }
+    wse::recomp::shim::RecompInputHub::shared().set_ui_action_sink([hud](std::string_view act) {
+        if (hud) hud->ui_action(act);
+    });
     report("screen: " + std::to_string(wse::recomp::shim::screen_size().width) + "x" +
            std::to_string(wse::recomp::shim::screen_size().height) + "\n");
 
     wse::platform::VulkanD3d9Config cfg{};
+    cfg.build_touch_overlay = [](wse::platform::GeometryFrame& out_frame, std::uint32_t w, std::uint32_t h) {
+        return wse::recomp::shim::RecompInputHub::shared().build_overlay_geometry(out_frame, w, h);
+    };
+    cfg.query_menu_zoom = []() -> std::array<float, 3> {
+        const auto mv = wse::recomp::shim::RecompInputHub::shared().menu_zoom_view();
+        return {mv.zoom, mv.pan_x, mv.pan_y};
+    };
     cfg.pipeline_cache_path = (work / "r5_pipeline_cache.bin").string();
     {
         const std::filesystem::path tex_cache_dir = work / "texcache";
@@ -765,10 +862,53 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
         ANativeWindow_release(late_win);
     }
 
-    // Hook into `shim::D3d9`'s constructor without modifying `r4_startup.cpp` (preserves translator_fingerprint).
+    // Hook into the R4/R5/R6 shims without modifying `r4_startup.cpp` (preserves translator_fingerprint).
     wse::recomp::shim::D3d9::created_hook() = [](wse::recomp::shim::D3d9& d3d) {
         const std::lock_guard<std::mutex> lock(g_vk_m);
         if (g_vk_backend) d3d.backend = g_vk_backend.get();
+        d3d.input_hub = &wse::recomp::shim::RecompInputHub::shared();
+    };
+    wse::recomp::shim::User32::created_hook() = [](wse::recomp::shim::User32& u) {
+        u.input_hub = &wse::recomp::shim::RecompInputHub::shared();
+        wse::recomp::shim::RecompInputHub::shared().set_window_msg_sink(
+            [&u](std::uint32_t msg, std::uint64_t wp, std::uint64_t lp) { (void)u.post_to_main(msg, wp, lp); });
+    };
+    wse::recomp::shim::SystemDlls::created_hook() = [](wse::recomp::shim::SystemDlls& sys) {
+        sys.input_hub = &wse::recomp::shim::RecompInputHub::shared();
+    };
+    wse::recomp::shim::FmodSteam::created_hook() = [](wse::recomp::shim::FmodSteam& fmod) {
+        const std::lock_guard<std::mutex> lock(g_audio_m);
+        g_active_fmod = &fmod;
+        fmod.set_codec_backend(wse::asset::create_audio_codec_backend());
+        fmod.set_master_volume(g_audio_master_volume);
+        fmod.set_haptics_settings(g_haptics_cfg);
+        wse::platform::Vfs* ivfs = g_audio_install_vfs;
+        wse::platform::Vfs* uvfs = g_audio_user_vfs;
+        fmod.read_file = [ivfs, uvfs](const std::string& path, std::vector<std::uint8_t>& out) -> bool {
+            std::string p = path;
+            std::string low = p;
+            for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            static constexpr std::string_view kRoot = "c:\\wse2\\";
+            if (low.rfind(kRoot, 0U) == 0U) p = p.substr(kRoot.size());
+            for (char& c : p) {
+                if (c == '\\') c = '/';
+            }
+            while (!p.empty() && p.front() == '/') p.erase(p.begin());
+            return (ivfs != nullptr && ivfs->read_file(p, out)) || (uvfs != nullptr && uvfs->read_file(p, out));
+        };
+        std::shared_ptr<HudNotifier> hud_cb = g_active_hud;
+        fmod.on_haptic = [hud_cb](const wse::recomp::shim::CombatHapticPulse& pulse) {
+            if (hud_cb && pulse.duration_ms > 0U && pulse.amplitude > 0U) {
+                hud_cb->haptic_pulse(pulse.duration_ms, pulse.amplitude);
+            }
+        };
+        g_aaudio_dev = std::make_unique<wse::platform::AAudioDevice>();
+        if (g_aaudio_dev->open(wse::platform::AudioDeviceSpec{48000U, 2U})) {
+            fmod.set_audio_device(g_aaudio_dev.get(), true);
+            report("audio: Android AAudio opened at " + std::to_string(g_aaudio_dev->spec().sample_rate) + " Hz stereo\n");
+        } else {
+            report("audio: AAudio open failed (continuing silent)\n");
+        }
     };
 
     return run_startup_common(env, bridge, jstring_to_utf8(env, jcopy_dir), work, jstring_to_utf8(env, jmodule),
@@ -804,9 +944,16 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
 
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetPaused(JNIEnv*, jclass,
                                                                                           jboolean paused) {
+    const bool is_paused = (paused == JNI_TRUE);
     {
         const std::lock_guard<std::mutex> lock(g_pause_m);
-        g_activity_paused = (paused == JNI_TRUE);
+        g_activity_paused = is_paused;
+    }
+    {
+        const std::lock_guard<std::mutex> lock(g_audio_m);
+        if (g_active_fmod != nullptr) {
+            g_active_fmod->set_app_paused(is_paused);
+        }
     }
     g_pause_cv.notify_all();
 }
@@ -818,6 +965,17 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
     }
     g_pause_cv.notify_all();
     if (g_finished_report.exchange(true)) return;
+    {
+        const std::lock_guard<std::mutex> lock(g_audio_m);
+        if (g_active_fmod != nullptr) {
+            g_active_fmod->stop_worker();
+            g_active_fmod = nullptr;
+        }
+        if (g_aaudio_dev) {
+            g_aaudio_dev->close();
+            g_aaudio_dev.reset();
+        }
+    }
 
     std::shared_ptr<wse::platform::VulkanD3d9Backend> bk;
     {
@@ -891,4 +1049,108 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_wse2_android_launcher_R4Native_cl
     if (raw.empty()) return JNI_FALSE;
     const std::filesystem::path cache_root = std::filesystem::path(raw) / "r4" / "texcache";
     return wse::platform::CachingVfs::clear(cache_root) ? JNI_TRUE : JNI_FALSE;
+}
+
+// ---- Phase 5 R6: Touch, Keyboard, Mouse, Gamepad, Gyro & Audio JNI entries ----
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeTouchEvent(
+    JNIEnv*, jclass, jint pointer_id, jint action, jfloat x, jfloat y) {
+    wse::recomp::shim::RecompInputHub::shared().on_touch_event(
+        static_cast<int>(pointer_id), static_cast<int>(action), static_cast<float>(x), static_cast<float>(y));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeKeyEvent(
+    JNIEnv*, jclass, jint dik_code, jint vk_code, jboolean down) {
+    wse::recomp::shim::RecompInputHub::shared().inject_key(
+        static_cast<std::uint8_t>(dik_code & 0xFF), down == JNI_TRUE, static_cast<std::uint32_t>(vk_code));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeTextInput(
+    JNIEnv* env, jclass, jstring jutf8) {
+    const std::string utf8 = jstring_to_utf8(env, jutf8);
+    if (!utf8.empty()) {
+        wse::recomp::shim::RecompInputHub::shared().inject_text_utf8(utf8);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeMouseMove(
+    JNIEnv*, jclass, jint x, jint y, jboolean relative) {
+    if (relative == JNI_TRUE) {
+        wse::recomp::shim::RecompInputHub::shared().inject_mouse_delta(static_cast<int>(x), static_cast<int>(y));
+    } else {
+        wse::recomp::shim::RecompInputHub::shared().inject_mouse_move_abs(static_cast<int>(x), static_cast<int>(y));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeMouseButton(
+    JNIEnv*, jclass, jint button, jboolean down) {
+    wse::recomp::shim::RecompInputHub::shared().inject_mouse_button(static_cast<int>(button), down == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeMouseWheel(
+    JNIEnv*, jclass, jint delta) {
+    wse::recomp::shim::RecompInputHub::shared().inject_mouse_wheel(static_cast<int>(delta));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeGamepadState(
+    JNIEnv*, jclass, jint user_index, jboolean connected, jint buttons, jint left_trigger, jint right_trigger,
+    jint thumb_lx, jint thumb_ly, jint thumb_rx, jint thumb_ry) {
+    wse::recomp::shim::XInputPadState st{};
+    st.connected = (connected == JNI_TRUE);
+    st.buttons = static_cast<std::uint16_t>(buttons & 0xFFFF);
+    st.left_trigger = static_cast<std::uint8_t>(std::clamp<int>(left_trigger, 0, 255));
+    st.right_trigger = static_cast<std::uint8_t>(std::clamp<int>(right_trigger, 0, 255));
+    st.thumb_lx = static_cast<std::int16_t>(std::clamp<int>(thumb_lx, -32768, 32767));
+    st.thumb_ly = static_cast<std::int16_t>(std::clamp<int>(thumb_ly, -32768, 32767));
+    st.thumb_rx = static_cast<std::int16_t>(std::clamp<int>(thumb_rx, -32768, 32767));
+    st.thumb_ry = static_cast<std::int16_t>(std::clamp<int>(thumb_ry, -32768, 32767));
+    wse::recomp::shim::RecompInputHub::shared().update_gamepad(static_cast<std::uint32_t>(std::max<jint>(0, user_index)), st);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeGyroSample(
+    JNIEnv*, jclass, jfloat rx, jfloat ry, jfloat dt_sec) {
+    wse::recomp::shim::RecompInputHub::shared().on_gyro_sample(
+        static_cast<float>(rx), static_cast<float>(ry), static_cast<float>(dt_sec));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetSafeArea(
+    JNIEnv*, jclass, jfloat left, jfloat top, jfloat right, jfloat bottom) {
+    wse::platform::SafeAreaInsets in{};
+    in.left = std::clamp(static_cast<float>(left), 0.0F, 0.25F);
+    in.top = std::clamp(static_cast<float>(top), 0.0F, 0.25F);
+    in.right = std::clamp(static_cast<float>(right), 0.0F, 0.25F);
+    in.bottom = std::clamp(static_cast<float>(bottom), 0.0F, 0.25F);
+    wse::recomp::shim::RecompInputHub::shared().set_safe_area(in);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetTouchConfig(
+    JNIEnv*, jclass, jfloat opacity, jfloat button_scale, jfloat look_sens, jboolean aim_hold,
+    jboolean gyro_enabled, jboolean show_touch) {
+    auto cfg = wse::recomp::shim::RecompInputHub::shared().config();
+    cfg.opacity = static_cast<float>(opacity);
+    cfg.button_scale = static_cast<float>(button_scale);
+    cfg.look_sensitivity = static_cast<float>(look_sens);
+    cfg.aim_hold = (aim_hold == JNI_TRUE);
+    cfg.gyro_enabled = (gyro_enabled == JNI_TRUE);
+    cfg.show_touch_controls = (show_touch == JNI_TRUE);
+    wse::recomp::shim::RecompInputHub::shared().set_config(cfg);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetAudioConfig(
+    JNIEnv*, jclass, jfloat master_volume, jboolean haptics_enabled, jboolean when_hit,
+    jboolean when_dealing, jint haptic_strength) {
+    const std::lock_guard<std::mutex> lock(g_audio_m);
+    g_audio_master_volume = std::clamp(static_cast<float>(master_volume), 0.0F, 1.0F);
+    g_haptics_cfg.enabled = (haptics_enabled == JNI_TRUE);
+    g_haptics_cfg.when_hit = (when_hit == JNI_TRUE);
+    g_haptics_cfg.when_dealing = (when_dealing == JNI_TRUE);
+    g_haptics_cfg.strength_percent = std::clamp<int>(static_cast<int>(haptic_strength), 0, 100);
+    if (g_active_fmod != nullptr) {
+        g_active_fmod->set_master_volume(g_audio_master_volume);
+        g_active_fmod->set_haptics_settings(g_haptics_cfg);
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_org_wse2_android_launcher_R4Native_nativeIsCursorVisible(JNIEnv*, jclass) {
+    return wse::recomp::shim::RecompInputHub::shared().cursor_visible() ? JNI_TRUE : JNI_FALSE;
 }

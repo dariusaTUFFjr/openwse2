@@ -10,6 +10,8 @@ import org.wse2.android.WseSafBridge
 object R4Native {
     interface HudListener {
         fun onHudUpdate(text: String)
+        fun onHapticPulse(durationMs: Int, amplitude: Int) {}
+        fun onUiAction(action: String) {}
     }
 
     val loadError: String? by lazy {
@@ -84,4 +86,65 @@ object R4Native {
     // Deletes the converted ETC2 textures under `<workDir>/r4/texcache`.
     @JvmStatic
     external fun clearTextureCache(workDir: String): Boolean
+
+    // ---- Phase 5 R6: Sound, Input, Touch Controls, Gamepad & Desktop Mode ----
+
+    @JvmStatic
+    external fun nativeTouchEvent(pointerId: Int, action: Int, x: Float, y: Float)
+
+    @JvmStatic
+    external fun nativeKeyEvent(dikCode: Int, vkCode: Int, down: Boolean)
+
+    @JvmStatic
+    external fun nativeTextInput(utf8: String)
+
+    @JvmStatic
+    external fun nativeMouseMove(x: Int, y: Int, relative: Boolean)
+
+    @JvmStatic
+    external fun nativeMouseButton(button: Int, down: Boolean)
+
+    @JvmStatic
+    external fun nativeMouseWheel(delta: Int)
+
+    @JvmStatic
+    external fun nativeGamepadState(
+        userIndex: Int,
+        connected: Boolean,
+        buttons: Int,
+        leftTrigger: Int,
+        rightTrigger: Int,
+        thumbLx: Int,
+        thumbLy: Int,
+        thumbRx: Int,
+        thumbRy: Int
+    )
+
+    @JvmStatic
+    external fun nativeGyroSample(radPerSecX: Float, radPerSecY: Float, dtSec: Float)
+
+    @JvmStatic
+    external fun nativeSetSafeArea(left: Float, top: Float, right: Float, bottom: Float)
+
+    @JvmStatic
+    external fun nativeSetTouchConfig(
+        opacity: Float,
+        buttonScale: Float,
+        lookSensitivity: Float,
+        aimHold: Boolean,
+        gyroEnabled: Boolean,
+        showTouch: Boolean
+    )
+
+    @JvmStatic
+    external fun nativeSetAudioConfig(
+        masterVolume: Float,
+        hapticsEnabled: Boolean,
+        whenHit: Boolean,
+        whenDealing: Boolean,
+        hapticStrength: Int
+    )
+
+    @JvmStatic
+    external fun nativeIsCursorVisible(): Boolean
 }

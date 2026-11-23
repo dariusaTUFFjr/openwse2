@@ -42,6 +42,7 @@
 #include "wse/recomp/d3d9_backend.h"
 #include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/fx_effect.h"
+#include "wse/recomp/input_hub.h"
 #include "wse/recomp/screen.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/shim_crt.h"
@@ -99,6 +100,9 @@ public:
     // Optional rendering backend (Phase 5 R5a step 4, e.g. `VulkanD3d9Backend`). When set,
     // live D3D9/D3DX calls drive it directly; when null, the device stays headless (R4).
     D3d9Backend* backend = nullptr;
+    // Optional R6 input hub: feeds DirectInput 8 keyboard/mouse state & events, receives
+    // `ShowCursor` visibility transitions, and advances the touch tap state machine on Present.
+    RecompInputHub* input_hub = nullptr;
 
     [[nodiscard]] std::uint64_t frames() const noexcept { return frames_; }
     // The current value of a parsed effect's parameter (the R5 device uploads these; tests read
@@ -272,6 +276,7 @@ private:
     struct Obj {
         Kind kind = Kind::d3d;
         int variant = 0;  // DirectInput: 0 = A, 1 = W
+        int di_kind = 0;  // DirectInputDevice: 0 = unknown, 1 = keyboard, 2 = mouse
         std::uint32_t refs = 1;
         Desc desc;
         std::vector<std::size_t> sizes;                  // per level (x6 faces for a cube) or the buffer
@@ -1193,10 +1198,17 @@ inline void D3d9::build_vtables() {
          }},
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
              if (backend != nullptr) (void)backend->present();
+             if (input_hub != nullptr) input_hub->tick_frame();
              sweep_released();
              ++frames_;
              if (on_present) on_present(frames_);
              ret(s, 0);
+         }},
+        {"ShowCursor", [this, ret](CpuState& s, Obj&, std::uint64_t) {
+             const bool show = (win64_arg(s, 1) != 0);
+             const bool prev = (input_hub != nullptr) ? input_hub->cursor_visible() : true;
+             if (input_hub != nullptr) input_hub->on_show_cursor(show);
+             ret(s, prev ? 1U : 0U);
          }},
         // GetBackBuffer(iSwapChain, iBackBuffer, Type, ppBackBuffer)
         {"GetBackBuffer", [this, ret](CpuState& s, Obj&, std::uint64_t self) {
@@ -1654,6 +1666,7 @@ inline void D3d9::build_vtables() {
     make_table(Kind::swapchain, 0, com::kIDirect3DSwapChain9, {
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
              if (backend != nullptr) (void)backend->present();
+             if (input_hub != nullptr) input_hub->tick_frame();
              sweep_released();
              ++frames_;
              if (on_present) on_present(frames_);
@@ -2158,27 +2171,63 @@ inline void D3d9::build_vtables() {
         {"GetBufferSize", [ret](CpuState& s, Obj& o, std::uint64_t) { ret(s, o.sizes.empty() ? 0 : o.sizes[0]); }},
     });
 
-    // DirectInput 8 (A and W): devices with nothing pressed.
+    // DirectInput 8 (A and W): live keyboard & mouse devices when `input_hub` is attached.
     for (int v = 0; v < 2; ++v) {
         make_table(Kind::dinput, v, v == 0 ? com::kIDirectInput8A : com::kIDirectInput8W, {
             // CreateDevice(rguid, ppDevice, pUnkOuter)
             {"CreateDevice", [this, ret, v](CpuState& s, Obj&, std::uint64_t self) {
                  if (win64_arg(s, 2) == 0) return ret(s, kD3dErrInvalidCall);
-                 crt_detail::put<std::uint64_t>(win64_arg(s, 2), create(Kind::didevice, v, {}, self));
+                 const std::uint64_t dev_addr = create(Kind::didevice, v, {}, self);
+                 const std::uint64_t rguid = win64_arg(s, 1);
+                 if (rguid != 0) {
+                     const auto d1 = crt_detail::get<std::uint32_t>(rguid);
+                     const std::lock_guard<std::mutex> lock(m_);
+                     const auto it = objs_.find(dev_addr);
+                     if (it != objs_.end()) {
+                         if (d1 == 0x6F1D2B61U) it->second->di_kind = 1;       // GUID_SysKeyboard
+                         else if (d1 == 0x6F1D2B60U) it->second->di_kind = 2;  // GUID_SysMouse
+                     }
+                 }
+                 crt_detail::put<std::uint64_t>(win64_arg(s, 2), dev_addr);
                  ret(s, 0);
              }},
             {"EnumDevices", [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 0); }},  // nothing beyond the system keyboard and mouse
             {"GetDeviceStatus", [ret](CpuState& s, Obj&, std::uint64_t) { ret(s, 0); }},
         });
         make_table(Kind::didevice, v, v == 0 ? com::kIDirectInputDevice8A : com::kIDirectInputDevice8W, {
-            // GetDeviceState(cbData, lpvData): nothing pressed.
-            {"GetDeviceState", [ret](CpuState& s, Obj&, std::uint64_t) {
-                 if (win64_arg(s, 2) != 0) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(win64_arg(s, 2))), 0, static_cast<std::uint32_t>(win64_arg(s, 1)));
+            // GetDeviceState(cbData, lpvData)
+            {"GetDeviceState", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
+                 const auto cb = static_cast<std::uint32_t>(win64_arg(s, 1));
+                 const std::uint64_t dst = win64_arg(s, 2);
+                 if (dst != 0 && cb > 0U) {
+                     auto* ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst));
+                     if (input_hub != nullptr && (o.di_kind == 1 || cb == 256U)) {
+                         input_hub->fill_dinput_keyboard_state(static_cast<std::uint8_t*>(ptr), cb);
+                     } else if (input_hub != nullptr && (o.di_kind == 2 || cb == 16U || cb == 20U)) {
+                         input_hub->fill_dinput_mouse_state(ptr, cb);
+                     } else {
+                         std::memset(ptr, 0, cb);
+                     }
+                 }
                  ret(s, 0);
              }},
-            // GetDeviceData(cbObjectData, rgdod, pdwInOut, dwFlags): no events.
-            {"GetDeviceData", [ret](CpuState& s, Obj&, std::uint64_t) {
-                 if (win64_arg(s, 3) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 3), 0);
+            // GetDeviceData(cbObjectData, rgdod, pdwInOut, dwFlags)
+            {"GetDeviceData", [this, ret](CpuState& s, Obj& o, std::uint64_t) {
+                 const auto stride = static_cast<std::uint32_t>(win64_arg(s, 1));
+                 const std::uint64_t rgdod = win64_arg(s, 2);
+                 const std::uint64_t pdw_in_out = win64_arg(s, 3);
+                 const auto flags = static_cast<std::uint32_t>(win64_arg(s, 4));
+                 if (pdw_in_out != 0) {
+                     if (input_hub != nullptr) {
+                         const auto max_n = crt_detail::get<std::uint32_t>(pdw_in_out);
+                         const bool peek = (flags & 1U) != 0U;  // DIGDD_PEEK
+                         void* out_ptr = (rgdod != 0) ? reinterpret_cast<void*>(static_cast<std::uintptr_t>(rgdod)) : nullptr;
+                         const std::uint32_t got = input_hub->read_dinput_events(o.di_kind == 2, stride, out_ptr, max_n, peek);
+                         crt_detail::put<std::uint32_t>(pdw_in_out, got);
+                     } else {
+                         crt_detail::put<std::uint32_t>(pdw_in_out, 0U);
+                     }
+                 }
                  ret(s, 0);
              }},
             // GetCapabilities(DIDEVCAPS*): attached.

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -17,6 +18,7 @@
 
 #include "driver_loader.h"
 #include "wse/platform/performance.h"
+#include "wse/platform/rhi_geometry.h"
 #include "wse/recomp/d3d9_backend.h"
 
 namespace wse::platform {
@@ -86,6 +88,11 @@ struct VulkanD3d9Config {
     float target_fps = 60.0F;
     float sharpness = 0.0F;          // 0 = off; RCAS strength in FSR stops (e.g. 0.2)
     bool fxaa = false;
+    // R6 full-resolution touch overlay pass (drawn after FSR/RCAS/FXAA so icons stay razor-sharp).
+    std::function<bool(GeometryFrame& out_frame, std::uint32_t width, std::uint32_t height)>
+        build_touch_overlay{};
+    // R6 / P14.5 menu pinch-to-zoom query: returns {zoom, pan_x, pan_y}; zoom <= 1.01 disables.
+    std::function<std::array<float, 3>()> query_menu_zoom{};
 };
 
 class VulkanD3d9Backend final : public wse::recomp::D3d9Backend {

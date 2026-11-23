@@ -1216,6 +1216,27 @@ struct VulkanD3d9Backend::Impl {
     std::array<PostImg, 2> post_imgs{};
     VkDescriptorSet post_bb_ds = VK_NULL_HANDLE;
 
+    // R6 full-resolution procedural touch overlay & menu pinch-to-zoom pass.
+    static constexpr VkDeviceSize kOverlayVbBytes = 256ULL * 1024ULL;
+    static constexpr VkDeviceSize kOverlayIbBytes = 128ULL * 1024ULL;
+    struct OverlayVertex {
+        float x, y, r, g, b, a;
+    };
+    bool overlay_attempted = false;
+    bool overlay_ok = false;
+    VkShaderModule overlay_vs = VK_NULL_HANDLE;
+    VkShaderModule overlay_fs = VK_NULL_HANDLE;
+    VkShaderModule post_zoom_fs = VK_NULL_HANDLE;
+    VkPipelineLayout overlay_pipeline_layout = VK_NULL_HANDLE;
+    VkRenderPass overlay_rp = VK_NULL_HANDLE;
+    VkPipeline overlay_pip = VK_NULL_HANDLE;
+    VkPipeline post_zoom_pip = VK_NULL_HANDLE;
+    VkFramebuffer overlay_bb_fb = VK_NULL_HANDLE;
+    std::array<VkFramebuffer, 2> overlay_post_fbs{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    std::array<RingBuf, kFramesInFlight> overlay_vb{};
+    std::array<RingBuf, kFramesInFlight> overlay_ib{};
+    GeometryFrame overlay_frame{};
+
 #ifdef __ANDROID__
     enum class AndroidPresentPath { none, swapchain, ahb_surface_control, native_window_cpu };
     AndroidPresentPath android_path = AndroidPresentPath::none;
@@ -2706,6 +2727,16 @@ struct VulkanD3d9Backend::Impl {
             p.ds = VK_NULL_HANDLE;
         }
         post_bb_ds = VK_NULL_HANDLE;
+        if (overlay_bb_fb != VK_NULL_HANDLE) {
+            vk.destroy_framebuffer(h.device, overlay_bb_fb, nullptr);
+            overlay_bb_fb = VK_NULL_HANDLE;
+        }
+        for (VkFramebuffer& fb : overlay_post_fbs) {
+            if (fb != VK_NULL_HANDLE) {
+                vk.destroy_framebuffer(h.device, fb, nullptr);
+                fb = VK_NULL_HANDLE;
+            }
+        }
         if (post_desc_pool != VK_NULL_HANDLE) {
             vk.destroy_desc_pool(h.device, post_desc_pool, nullptr);
             post_desc_pool = VK_NULL_HANDLE;
@@ -2714,18 +2745,33 @@ struct VulkanD3d9Backend::Impl {
 
     void destroy_postfx_pipelines() noexcept {
         destroy_postfx_targets();
-        for (VkPipeline* p : {&post_easu_pip, &post_rcas_pip, &post_fxaa_pip}) {
+        for (VkPipeline* p : {&post_easu_pip, &post_rcas_pip, &post_fxaa_pip, &post_zoom_pip, &overlay_pip}) {
             if (*p != VK_NULL_HANDLE) {
                 vk.destroy_pipeline(h.device, *p, nullptr);
                 *p = VK_NULL_HANDLE;
             }
         }
-        for (VkShaderModule* m : {&post_vs, &post_easu_fs, &post_rcas_fs, &post_fxaa_fs}) {
+        for (VkShaderModule* m : {&post_vs, &post_easu_fs, &post_rcas_fs, &post_fxaa_fs,
+                                  &post_zoom_fs, &overlay_vs, &overlay_fs}) {
             if (*m != VK_NULL_HANDLE) {
                 vk.destroy_shader_module(h.device, *m, nullptr);
                 *m = VK_NULL_HANDLE;
             }
         }
+        if (overlay_rp != VK_NULL_HANDLE) {
+            vk.destroy_render_pass(h.device, overlay_rp, nullptr);
+            overlay_rp = VK_NULL_HANDLE;
+        }
+        if (overlay_pipeline_layout != VK_NULL_HANDLE) {
+            vk.destroy_pipeline_layout(h.device, overlay_pipeline_layout, nullptr);
+            overlay_pipeline_layout = VK_NULL_HANDLE;
+        }
+        for (std::size_t i = 0; i < kFramesInFlight; ++i) {
+            destroy_ring(overlay_vb[i]);
+            destroy_ring(overlay_ib[i]);
+        }
+        overlay_attempted = false;
+        overlay_ok = false;
         if (post_rp != VK_NULL_HANDLE) {
             vk.destroy_render_pass(h.device, post_rp, nullptr);
             post_rp = VK_NULL_HANDLE;
@@ -3090,6 +3136,368 @@ struct VulkanD3d9Backend::Impl {
         return true;
     }
 
+    bool ensure_overlay_locked() {
+        if (!gpu_ready || bb_img == VK_NULL_HANDLE || bb_view == VK_NULL_HANDLE) return false;
+        if (!overlay_attempted) {
+            overlay_attempted = true;
+            overlay_ok = false;
+            static constexpr std::string_view kOverlayVert = R"(
+#version 450
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec4 aColor;
+layout(push_constant) uniform PC { vec2 invExtent; } pc;
+layout(location = 0) out vec4 vColor;
+void main() {
+    gl_Position = vec4(aPos * pc.invExtent - 1.0, 0.0, 1.0);
+    vColor = aColor;
+}
+)";
+            static constexpr std::string_view kOverlayFrag = R"(
+#version 450
+layout(location = 0) in vec4 vColor;
+layout(location = 0) out vec4 outColor;
+void main() {
+    outColor = vColor;
+}
+)";
+            std::string err_msg;
+            if (!compile_post_shader(kOverlayVert, wse::asset::SpirvStage::Vertex, overlay_vs, err_msg) ||
+                !compile_post_shader(kOverlayFrag, wse::asset::SpirvStage::Fragment, overlay_fs, err_msg)) {
+                return false;
+            }
+            if (vk.cmd_push_constants == nullptr) return false;
+
+            VkPushConstantRange pcr{};
+            pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            pcr.offset = 0U;
+            pcr.size = sizeof(float) * 2U;
+            VkPipelineLayoutCreateInfo pl_ci{};
+            pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            pl_ci.pushConstantRangeCount = 1U;
+            pl_ci.pPushConstantRanges = &pcr;
+            if (vk.create_pipeline_layout(h.device, &pl_ci, nullptr, &overlay_pipeline_layout) != VK_SUCCESS) {
+                return false;
+            }
+
+            VkAttachmentDescription att{};
+            att.format = VK_FORMAT_R8G8B8A8_UNORM;
+            att.samples = VK_SAMPLE_COUNT_1_BIT;
+            att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            VkAttachmentReference cref{0U, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+            VkSubpassDescription sub{};
+            sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            sub.colorAttachmentCount = 1U;
+            sub.pColorAttachments = &cref;
+            VkRenderPassCreateInfo rp_ci{};
+            rp_ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+            rp_ci.attachmentCount = 1U;
+            rp_ci.pAttachments = &att;
+            rp_ci.subpassCount = 1U;
+            rp_ci.pSubpasses = &sub;
+            if (vk.create_render_pass(h.device, &rp_ci, nullptr, &overlay_rp) != VK_SUCCESS) {
+                return false;
+            }
+
+            std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+            stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = overlay_vs;
+            stages[0].pName = "main";
+            stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = overlay_fs;
+            stages[1].pName = "main";
+
+            VkVertexInputBindingDescription vbind{};
+            vbind.binding = 0U;
+            vbind.stride = sizeof(OverlayVertex);
+            vbind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            std::array<VkVertexInputAttributeDescription, 2> vattrs{};
+            vattrs[0] = {0U, 0U, VK_FORMAT_R32G32_SFLOAT, 0U};
+            vattrs[1] = {1U, 0U, VK_FORMAT_R32G32B32A32_SFLOAT, static_cast<std::uint32_t>(sizeof(float) * 2U)};
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            vi.vertexBindingDescriptionCount = 1U;
+            vi.pVertexBindingDescriptions = &vbind;
+            vi.vertexAttributeDescriptionCount = 2U;
+            vi.pVertexAttributeDescriptions = vattrs.data();
+
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1U;
+            vp.scissorCount = 1U;
+
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_NONE;
+            rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+            rs.lineWidth = 1.0F;
+
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            VkPipelineDepthStencilStateCreateInfo ds{};
+            ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+            VkPipelineColorBlendAttachmentState cba{};
+            cba.blendEnable = VK_TRUE;
+            cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cba.colorBlendOp = VK_BLEND_OP_ADD;
+            cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cba.alphaBlendOp = VK_BLEND_OP_ADD;
+            cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cb{};
+            cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cb.attachmentCount = 1U;
+            cb.pAttachments = &cba;
+
+            std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dy{};
+            dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dy.dynamicStateCount = 2U;
+            dy.pDynamicStates = dyn_states.data();
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.stageCount = 2U;
+            gpci.pStages = stages.data();
+            gpci.pVertexInputState = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState = &ms;
+            gpci.pDepthStencilState = &ds;
+            gpci.pColorBlendState = &cb;
+            gpci.pDynamicState = &dy;
+            gpci.layout = overlay_pipeline_layout;
+            gpci.renderPass = overlay_rp;
+            if (vk.create_graphics_pipelines(h.device, pipeline_cache, 1U, &gpci, nullptr, &overlay_pip) != VK_SUCCESS) {
+                return false;
+            }
+            for (std::size_t i = 0; i < kFramesInFlight; ++i) {
+                if (!create_host_ring(overlay_vb[i], kOverlayVbBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &last_error) ||
+                    !create_host_ring(overlay_ib[i], kOverlayIbBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &last_error)) {
+                    return false;
+                }
+            }
+            overlay_frame.vertices.reserve(4096U);
+            overlay_frame.indices.reserve(12288U);
+            overlay_ok = true;
+        }
+        if (!overlay_ok) return false;
+
+        auto make_fb = [&](VkImageView view, VkFramebuffer& dst) -> bool {
+            if (dst != VK_NULL_HANDLE || view == VK_NULL_HANDLE) return dst != VK_NULL_HANDLE;
+            VkFramebufferCreateInfo fbci{};
+            fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            fbci.renderPass = overlay_rp;
+            fbci.attachmentCount = 1U;
+            fbci.pAttachments = &view;
+            fbci.width = bb_width;
+            fbci.height = bb_height;
+            fbci.layers = 1U;
+            return vk.create_framebuffer(h.device, &fbci, nullptr, &dst) == VK_SUCCESS;
+        };
+        if (!make_fb(bb_view, overlay_bb_fb)) return false;
+        for (std::size_t i = 0; i < 2U; ++i) {
+            if (post_imgs[i].view != VK_NULL_HANDLE) {
+                (void)make_fb(post_imgs[i].view, overlay_post_fbs[i]);
+            }
+        }
+        return true;
+    }
+
+    bool ensure_menu_zoom_pipeline_locked() {
+        if (post_zoom_pip != VK_NULL_HANDLE) return true;
+        if (!ensure_postfx_targets_locked()) return false;
+        static constexpr std::string_view kMenuZoomFrag = R"(
+#version 450
+layout(set = 0, binding = 0) uniform sampler2D srcTex;
+layout(push_constant) uniform PC { vec4 zoomPan; } pc;
+layout(location = 0) in vec2 vUv;
+layout(location = 0) out vec4 outColor;
+void main() {
+    vec2 uv = pc.zoomPan.yz + (vUv - 0.5) / max(pc.zoomPan.x, 1.0);
+    outColor = texture(srcTex, clamp(uv, vec2(0.0), vec2(1.0)));
+}
+)";
+        std::string err_msg;
+        if (!compile_post_shader(kMenuZoomFrag, wse::asset::SpirvStage::Fragment, post_zoom_fs, err_msg)) {
+            return false;
+        }
+        std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = post_vs;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = post_zoom_fs;
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        VkPipelineInputAssemblyStateCreateInfo ia{};
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{};
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = 1U;
+        vp.scissorCount = 1U;
+        VkPipelineRasterizationStateCreateInfo rs{};
+        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        rs.lineWidth = 1.0F;
+        VkPipelineMultisampleStateCreateInfo ms{};
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds{};
+        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{};
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1U;
+        cb.pAttachments = &cba;
+        std::array<VkDynamicState, 2> dyn_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dy{};
+        dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dy.dynamicStateCount = 2U;
+        dy.pDynamicStates = dyn_states.data();
+        VkGraphicsPipelineCreateInfo gpci{};
+        gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gpci.stageCount = 2U;
+        gpci.pStages = stages.data();
+        gpci.pVertexInputState = &vi;
+        gpci.pInputAssemblyState = &ia;
+        gpci.pViewportState = &vp;
+        gpci.pRasterizationState = &rs;
+        gpci.pMultisampleState = &ms;
+        gpci.pDepthStencilState = &ds;
+        gpci.pColorBlendState = &cb;
+        gpci.pDynamicState = &dy;
+        gpci.layout = post_pipeline_layout;
+        gpci.renderPass = post_rp;
+        return vk.create_graphics_pipelines(h.device, pipeline_cache, 1U, &gpci, nullptr, &post_zoom_pip) == VK_SUCCESS;
+    }
+
+    void run_touch_overlay_pass_locked(VkImage& out_img, VkImageLayout& out_layout) {
+        if (!config.build_touch_overlay || !gpu_ready || bb_width == 0U || bb_height == 0U) {
+            return;
+        }
+        if (!config.build_touch_overlay(overlay_frame, bb_width, bb_height)) {
+            return;
+        }
+        if (overlay_frame.vertices.empty() || overlay_frame.indices.empty()) {
+            return;
+        }
+        if (!ensure_overlay_locked() || !ensure_frame_recording()) {
+            return;
+        }
+
+        VkFramebuffer target_fb = VK_NULL_HANDLE;
+        if (out_img == bb_img) {
+            target_fb = overlay_bb_fb;
+        } else if (out_img == post_imgs[0].img) {
+            target_fb = overlay_post_fbs[0];
+        } else if (out_img == post_imgs[1].img) {
+            target_fb = overlay_post_fbs[1];
+        }
+        if (target_fb == VK_NULL_HANDLE) return;
+
+        const std::size_t slot = cur_slot % kFramesInFlight;
+        RingBuf& vb = overlay_vb[slot];
+        RingBuf& ib = overlay_ib[slot];
+        if (vb.mem.mapped == nullptr || ib.mem.mapped == nullptr) return;
+
+        const std::size_t max_v = static_cast<std::size_t>(kOverlayVbBytes / sizeof(OverlayVertex));
+        const std::size_t max_i = static_cast<std::size_t>(kOverlayIbBytes / sizeof(std::uint32_t));
+        const std::size_t v_count = std::min(overlay_frame.vertices.size(), max_v);
+        const std::size_t i_count = std::min(overlay_frame.indices.size(), max_i);
+        if (v_count == 0U || i_count == 0U) return;
+
+        auto* vdst = static_cast<OverlayVertex*>(vb.mem.mapped);
+        for (std::size_t i = 0U; i < v_count; ++i) {
+            const GeometryVertex& s = overlay_frame.vertices[i];
+            vdst[i] = OverlayVertex{s.x, s.y, s.r, s.g, s.b, s.a};
+        }
+        auto* idst = static_cast<std::uint32_t*>(ib.mem.mapped);
+        std::size_t valid_indices = 0U;
+        for (std::size_t i = 0U; i + 2U < i_count; i += 3U) {
+            const std::int32_t i0 = overlay_frame.indices[i];
+            const std::int32_t i1 = overlay_frame.indices[i + 1U];
+            const std::int32_t i2 = overlay_frame.indices[i + 2U];
+            if (i0 < 0 || i1 < 0 || i2 < 0 ||
+                static_cast<std::size_t>(i0) >= v_count ||
+                static_cast<std::size_t>(i1) >= v_count ||
+                static_cast<std::size_t>(i2) >= v_count) {
+                continue;
+            }
+            idst[valid_indices++] = static_cast<std::uint32_t>(i0);
+            idst[valid_indices++] = static_cast<std::uint32_t>(i1);
+            idst[valid_indices++] = static_cast<std::uint32_t>(i2);
+        }
+        if (valid_indices == 0U) return;
+
+        alloc.flush(vb.mem, 0U, v_count * sizeof(OverlayVertex));
+        alloc.flush(ib.mem, 0U, valid_indices * sizeof(std::uint32_t));
+
+        if (out_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+            VkImageMemoryBarrier bar{};
+            bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            bar.oldLayout = out_layout;
+            bar.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.image = out_img;
+            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+            bar.srcAccessMask = 0U;
+            bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+            out_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            if (out_img == bb_img) bb_layout = out_layout;
+        }
+
+        VkRenderPassBeginInfo rpbi{};
+        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpbi.renderPass = overlay_rp;
+        rpbi.framebuffer = target_fb;
+        rpbi.renderArea = {{0, 0}, {bb_width, bb_height}};
+        vk.cmd_begin_render_pass(frame_cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+        vk.cmd_bind_pipeline(frame_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pip);
+        VkViewport vp{0.0F, 0.0F, static_cast<float>(bb_width), static_cast<float>(bb_height), 0.0F, 1.0F};
+        VkRect2D sc{{0, 0}, {bb_width, bb_height}};
+        vk.cmd_set_viewport(frame_cmd, 0U, 1U, &vp);
+        vk.cmd_set_scissor(frame_cmd, 0U, 1U, &sc);
+        const float inv_ext[2] = {2.0F / static_cast<float>(bb_width), 2.0F / static_cast<float>(bb_height)};
+        vk.cmd_push_constants(frame_cmd, overlay_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0U, sizeof(inv_ext), inv_ext);
+        const VkDeviceSize zero_off = 0U;
+        vk.cmd_bind_vertex_buffers(frame_cmd, 0U, 1U, &vb.buf, &zero_off);
+        vk.cmd_bind_index_buffer(frame_cmd, ib.buf, 0U, VK_INDEX_TYPE_UINT32);
+        vk.cmd_draw_indexed(frame_cmd, static_cast<std::uint32_t>(valid_indices), 1U, 0U, 0, 0U);
+        vk.cmd_end_render_pass(frame_cmd);
+
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_sampler_set = VK_NULL_HANDLE;
+    }
+
     void run_postfx_passes_locked(VkImage& out_img, VkImageLayout& out_layout) {
         out_img = bb_img;
         out_layout = bb_layout;
@@ -3097,84 +3505,97 @@ struct VulkanD3d9Backend::Impl {
         const bool do_fxaa = config.fxaa;
         const bool do_easu = (rscale < 1.0F);
         const bool do_rcas = (config.sharpness > 0.0F);
-        if (!do_fxaa && !do_easu && !do_rcas) return;
-        if (!ensure_postfx_targets_locked()) return;
-        if (!ensure_frame_recording()) return;
+        std::array<float, 3> zoom_pan{1.0F, 0.5F, 0.5F};
+        if (config.query_menu_zoom) {
+            zoom_pan = config.query_menu_zoom();
+        }
+        const bool do_zoom = (zoom_pan[0] > 1.01F);
 
-        const auto [sw, sh] = do_easu ? scaled_render_extent(bb_width, bb_height, rscale)
-                                      : std::pair<std::uint32_t, std::uint32_t>{bb_width, bb_height};
+        if (do_fxaa || do_easu || do_rcas || do_zoom) {
+            if (ensure_postfx_targets_locked() && ensure_frame_recording()) {
+                const auto [sw, sh] = do_easu ? scaled_render_extent(bb_width, bb_height, rscale)
+                                              : std::pair<std::uint32_t, std::uint32_t>{bb_width, bb_height};
 
-        VkImage src_img = bb_img;
-        VkImageLayout src_layout = bb_layout;
-        VkDescriptorSet src_ds = post_bb_ds;
-        int dst_idx = 0;
+                VkImage src_img = bb_img;
+                VkImageLayout src_layout = bb_layout;
+                VkDescriptorSet src_ds = post_bb_ds;
+                int dst_idx = 0;
 
-        auto run_pass = [&](VkPipeline pip, VkDescriptorSet ds, std::uint32_t out_w, std::uint32_t out_h,
-                            const void* pc_data, std::uint32_t pc_size) {
-            VkImageMemoryBarrier bar{};
-            bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            bar.oldLayout = src_layout;
-            bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            bar.image = src_img;
-            bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
-            bar.srcAccessMask = (src_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-                                    ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-                                    : 0U;
-            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
-            if (src_img == bb_img) bb_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                auto run_pass = [&](VkPipeline pip, VkDescriptorSet ds, std::uint32_t out_w, std::uint32_t out_h,
+                                    const void* pc_data, std::uint32_t pc_size) {
+                    VkImageMemoryBarrier bar{};
+                    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    bar.oldLayout = src_layout;
+                    bar.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bar.image = src_img;
+                    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
+                    bar.srcAccessMask = (src_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                                            ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                            : 0U;
+                    bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
+                    if (src_img == bb_img) bb_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            PostImg& dst = post_imgs[static_cast<std::size_t>(dst_idx)];
-            VkRenderPassBeginInfo rpbi{};
-            rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            rpbi.renderPass = post_rp;
-            rpbi.framebuffer = dst.fb;
-            rpbi.renderArea = {{0, 0}, {out_w, out_h}};
-            vk.cmd_begin_render_pass(frame_cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-            vk.cmd_bind_pipeline(frame_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pip);
-            VkViewport vp{0.0F, 0.0F, static_cast<float>(out_w), static_cast<float>(out_h), 0.0F, 1.0F};
-            VkRect2D sc{{0, 0}, {out_w, out_h}};
-            vk.cmd_set_viewport(frame_cmd, 0U, 1U, &vp);
-            vk.cmd_set_scissor(frame_cmd, 0U, 1U, &sc);
-            vk.cmd_bind_desc_sets(frame_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, post_pipeline_layout,
-                                  0U, 1U, &ds, 0U, nullptr);
-            if (pc_size > 0U && pc_data != nullptr) {
-                vk.cmd_push_constants(frame_cmd, post_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
-                                      0U, pc_size, pc_data);
+                    PostImg& dst = post_imgs[static_cast<std::size_t>(dst_idx)];
+                    VkRenderPassBeginInfo rpbi{};
+                    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                    rpbi.renderPass = post_rp;
+                    rpbi.framebuffer = dst.fb;
+                    rpbi.renderArea = {{0, 0}, {out_w, out_h}};
+                    vk.cmd_begin_render_pass(frame_cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+                    vk.cmd_bind_pipeline(frame_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pip);
+                    VkViewport vp{0.0F, 0.0F, static_cast<float>(out_w), static_cast<float>(out_h), 0.0F, 1.0F};
+                    VkRect2D sc{{0, 0}, {out_w, out_h}};
+                    vk.cmd_set_viewport(frame_cmd, 0U, 1U, &vp);
+                    vk.cmd_set_scissor(frame_cmd, 0U, 1U, &sc);
+                    vk.cmd_bind_desc_sets(frame_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, post_pipeline_layout,
+                                          0U, 1U, &ds, 0U, nullptr);
+                    if (pc_size > 0U && pc_data != nullptr) {
+                        vk.cmd_push_constants(frame_cmd, post_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                              0U, pc_size, pc_data);
+                    }
+                    vk.cmd_draw(frame_cmd, 3U, 1U, 0U, 0U);
+                    vk.cmd_end_render_pass(frame_cmd);
+
+                    dst.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    src_img = dst.img;
+                    src_layout = dst.layout;
+                    src_ds = dst.ds;
+                    dst_idx = 1 - dst_idx;
+                };
+
+                if (do_fxaa) {
+                    const float fxaa_pc[2] = {0.166F, 0.0833F};
+                    run_pass(post_fxaa_pip, src_ds, sw, sh, fxaa_pc, sizeof(fxaa_pc));
+                }
+                if (do_easu) {
+                    const EasuConstants con = easu_constants(
+                        static_cast<float>(bb_width), static_cast<float>(bb_height),
+                        static_cast<float>(sw), static_cast<float>(sh),
+                        static_cast<float>(bb_width), static_cast<float>(bb_height));
+                    run_pass(post_easu_pip, src_ds, bb_width, bb_height, con.con, sizeof(con.con));
+                }
+                if (do_rcas) {
+                    const RcasConstants con = rcas_constants(config.sharpness);
+                    run_pass(post_rcas_pip, src_ds, bb_width, bb_height, con.con, sizeof(con.con));
+                }
+                if (do_zoom && ensure_menu_zoom_pipeline_locked()) {
+                    const float zpc[4] = {zoom_pan[0], zoom_pan[1], zoom_pan[2], 0.0F};
+                    run_pass(post_zoom_pip, src_ds, bb_width, bb_height, zpc, sizeof(zpc));
+                }
+
+                bound_pipeline = VK_NULL_HANDLE;
+                bound_sampler_set = VK_NULL_HANDLE;
+                out_img = src_img;
+                out_layout = src_layout;
             }
-            vk.cmd_draw(frame_cmd, 3U, 1U, 0U, 0U);
-            vk.cmd_end_render_pass(frame_cmd);
-
-            dst.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            src_img = dst.img;
-            src_layout = dst.layout;
-            src_ds = dst.ds;
-            dst_idx = 1 - dst_idx;
-        };
-
-        if (do_fxaa) {
-            const float fxaa_pc[2] = {0.166F, 0.0833F};
-            run_pass(post_fxaa_pip, src_ds, sw, sh, fxaa_pc, sizeof(fxaa_pc));
-        }
-        if (do_easu) {
-            const EasuConstants con = easu_constants(
-                static_cast<float>(bb_width), static_cast<float>(bb_height),
-                static_cast<float>(sw), static_cast<float>(sh),
-                static_cast<float>(bb_width), static_cast<float>(bb_height));
-            run_pass(post_easu_pip, src_ds, bb_width, bb_height, con.con, sizeof(con.con));
-        }
-        if (do_rcas) {
-            const RcasConstants con = rcas_constants(config.sharpness);
-            run_pass(post_rcas_pip, src_ds, bb_width, bb_height, con.con, sizeof(con.con));
         }
 
-        bound_pipeline = VK_NULL_HANDLE;
-        bound_sampler_set = VK_NULL_HANDLE;
-        out_img = src_img;
-        out_layout = src_layout;
+        // Final full-resolution touch overlay pass (never upscaled or blurred).
+        run_touch_overlay_pass_locked(out_img, out_layout);
     }
 
     void destroy_backbuffer() noexcept {

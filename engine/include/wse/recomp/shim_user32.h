@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/input_hub.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/screen.h"
 #include "wse/recomp/shim_crt.h"
@@ -84,11 +85,38 @@ public:
         std::thread::id owner;
     };
 
-    User32(Runtime& rt, DisplayConfig display = {}) : rt_(rt), display_(display), start_(std::chrono::steady_clock::now()) {}
+    static std::function<void(User32&)>& created_hook() {
+        static std::function<void(User32&)> hook;
+        return hook;
+    }
+
+    User32(Runtime& rt, DisplayConfig display = {}) : rt_(rt), display_(display), start_(std::chrono::steady_clock::now()) {
+        if (auto& hook = created_hook()) hook(*this);
+    }
     User32(const User32&) = delete;
     User32& operator=(const User32&) = delete;
 
     std::function<void(const std::string& caption, const std::string& text)> on_message_box;
+    RecompInputHub* input_hub = nullptr;
+
+    // Queues a message for the main visible window (or first created window) for live R6 input.
+    bool post_to_main(std::uint32_t message, std::uint64_t wparam, std::uint64_t lparam) {
+        std::uint64_t target_hwnd = 0;
+        std::thread::id owner;
+        {
+            const std::lock_guard<std::mutex> lock(m_);
+            for (const auto& kv : windows_) {
+                if (target_hwnd == 0 || kv.second.visible) {
+                    target_hwnd = kv.first;
+                    owner = kv.second.owner;
+                    if (kv.second.visible) break;
+                }
+            }
+        }
+        if (target_hwnd == 0) return false;
+        enqueue(owner, Msg{target_hwnd, message, wparam, lparam, now_ms()});
+        return true;
+    }
 
     // Queues a message for `hwnd`'s thread (the embedder's input path). False for an unknown window.
     bool post(std::uint64_t hwnd, std::uint32_t message, std::uint64_t wparam, std::uint64_t lparam) {
@@ -306,15 +334,30 @@ public:
         // Cursor, icons, metrics
         user("GetCursorPos", [this](CpuState& s) {
             if (win64_arg(s, 0) == 0) return fail(s, teb::kErrorInvalidParameter);
-            const std::lock_guard<std::mutex> lock(m_);
-            put<std::int32_t>(win64_arg(s, 0), cursor_x_);
-            put<std::int32_t>(win64_arg(s, 0) + 4, cursor_y_);
+            int cx = 0;
+            int cy = 0;
+            if (input_hub != nullptr) {
+                input_hub->get_cursor_pos(cx, cy);
+            } else {
+                const std::lock_guard<std::mutex> lock(m_);
+                cx = cursor_x_;
+                cy = cursor_y_;
+            }
+            put<std::int32_t>(win64_arg(s, 0), cx);
+            put<std::int32_t>(win64_arg(s, 0) + 4, cy);
             win64_return(s, 1);
         });
         user("SetCursorPos", [this](CpuState& s) {
-            const std::lock_guard<std::mutex> lock(m_);
-            cursor_x_ = clamp(static_cast<int>(win64_arg(s, 0)), clip_[0], clip_[2] - 1);
-            cursor_y_ = clamp(static_cast<int>(win64_arg(s, 1)), clip_[1], clip_[3] - 1);
+            int nx = 0;
+            int ny = 0;
+            {
+                const std::lock_guard<std::mutex> lock(m_);
+                cursor_x_ = clamp(static_cast<int>(win64_arg(s, 0)), clip_[0], clip_[2] - 1);
+                cursor_y_ = clamp(static_cast<int>(win64_arg(s, 1)), clip_[1], clip_[3] - 1);
+                nx = cursor_x_;
+                ny = cursor_y_;
+            }
+            if (input_hub != nullptr) input_hub->set_cursor_pos(nx, ny);
             win64_return(s, 1);
         });
         user("ClipCursor", [this](CpuState& s) {

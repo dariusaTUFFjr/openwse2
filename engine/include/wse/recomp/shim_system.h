@@ -30,6 +30,7 @@
 #include <string>
 
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/input_hub.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/shim_crt.h"
 #include "wse/recomp/teb.h"
@@ -43,12 +44,20 @@ inline constexpr std::uint32_t kSeErrNoAssoc = 31;
 
 class SystemDlls {
 public:
-    explicit SystemDlls(Runtime& rt) : rt_(rt) {}
+    static std::function<void(SystemDlls&)>& created_hook() {
+        static std::function<void(SystemDlls&)> hook;
+        return hook;
+    }
+
+    explicit SystemDlls(Runtime& rt) : rt_(rt) {
+        if (auto& hook = created_hook()) hook(*this);
+    }
     SystemDlls(const SystemDlls&) = delete;
     SystemDlls& operator=(const SystemDlls&) = delete;
 
     // ShellExecuteA / CreateProcessA: what the program tried to start.
     std::function<void(const std::string&)> on_launch;
+    RecompInputHub* input_hub = nullptr;
 
     std::size_t install() {
         std::size_t n = 0;
@@ -192,10 +201,48 @@ public:
             win64_return(s, 1);
         });
 
-        // XINPUT1_3: no controller.
-        bind("XINPUT1_3.dll", "#2", [](CpuState& s) { win64_return(s, kErrorDeviceNotConnected); });  // XInputGetState
-        bind("XINPUT1_3.dll", "#3", [](CpuState& s) { win64_return(s, kErrorDeviceNotConnected); });  // XInputSetState
-        bind("XINPUT1_3.dll", "#5", [](CpuState& s) { win64_return(s, 0); });                         // XInputEnable
+        // XINPUT1_3: live controller state when `input_hub` is attached, else disconnected.
+        bind("XINPUT1_3.dll", "#2", [this](CpuState& s) {  // XInputGetState(dwUserIndex, XINPUT_STATE*)
+            const auto idx = static_cast<std::uint32_t>(win64_arg(s, 0));
+            const std::uint64_t p_state = win64_arg(s, 1);
+            if (p_state == 0) {
+                win64_return(s, teb::kErrorInvalidParameter);
+                return;
+            }
+            XInputPadState pad{};
+            if (input_hub == nullptr || !input_hub->get_xinput_state(idx, pad)) {
+                win64_return(s, kErrorDeviceNotConnected);
+                return;
+            }
+            put<std::uint32_t>(p_state + 0U, pad.packet_number);
+            put<std::uint16_t>(p_state + 4U, pad.buttons);
+            put<std::uint8_t>(p_state + 6U, pad.left_trigger);
+            put<std::uint8_t>(p_state + 7U, pad.right_trigger);
+            put<std::int16_t>(p_state + 8U, pad.thumb_lx);
+            put<std::int16_t>(p_state + 10U, pad.thumb_ly);
+            put<std::int16_t>(p_state + 12U, pad.thumb_rx);
+            put<std::int16_t>(p_state + 14U, pad.thumb_ry);
+            win64_return(s, 0);
+        });
+        bind("XINPUT1_3.dll", "#3", [this](CpuState& s) {  // XInputSetState(dwUserIndex, XINPUT_VIBRATION*)
+            const auto idx = static_cast<std::uint32_t>(win64_arg(s, 0));
+            const std::uint64_t p_vib = win64_arg(s, 1);
+            if (p_vib == 0) {
+                win64_return(s, teb::kErrorInvalidParameter);
+                return;
+            }
+            const auto left_m = get<std::uint16_t>(p_vib + 0U);
+            const auto right_m = get<std::uint16_t>(p_vib + 2U);
+            if (input_hub == nullptr || !input_hub->set_xinput_vibration(idx, left_m, right_m)) {
+                win64_return(s, kErrorDeviceNotConnected);
+                return;
+            }
+            win64_return(s, 0);
+        });
+        bind("XINPUT1_3.dll", "#5", [this](CpuState& s) {  // XInputEnable(BOOL enable)
+            if (input_hub != nullptr) input_hub->set_xinput_enabled(win64_arg(s, 0) != 0);
+            win64_return(s, 0);
+        });
         return n;
     }
 
