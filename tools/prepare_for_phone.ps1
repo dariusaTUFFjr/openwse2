@@ -104,7 +104,17 @@ if [ ! -f "`$OUT/CMakeCache.txt" ]; then
     -DWSE_BUILD_TESTS=OFF -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DLLD_DIR=/usr/lib/llvm-18/lib/cmake/lld \
     "-DCMAKE_CXX_FLAGS=-Wno-#warnings" >"`$OUT/configure.log" 2>&1 || { tail -20 "`$OUT/configure.log"; exit 1; }
 fi
-cmake --build "`$OUT" -j2 --target r4_run >"`$OUT/build.log" 2>&1 || { grep -m20 error "`$OUT/build.log"; exit 1; }
+# A progress bar from the build's own percentages; the full output goes to build.log.
+set -o pipefail
+cmake --build "`$OUT" -j2 --target r4_run 2>&1 | tee "`$OUT/build.log" | awk '
+  /^\[ *[0-9]+%\]/ {
+    p = `$0; sub(/^\[ */, "", p); sub(/%.*/, "", p); p += 0
+    if (p < last) next; last = p
+    w = 30; f = int(w * p / 100); bar = ""
+    for (i = 0; i < w; i++) bar = bar (i < f ? "#" : "-")
+    printf "\r  building [%s] %3d%%   ", bar, p; fflush()
+  }
+  END { printf "\n" }' || { grep -m20 error "`$OUT/build.log"; exit 1; }
 "@
 if ($code -ne 0) { Fail "Could not build the translator (details above). Please share this window's text." }
 
