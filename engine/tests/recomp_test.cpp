@@ -6325,6 +6325,46 @@ void test_r6_fmod_audio_and_haptics() {
 
     expect(call("?stop@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", {ch_3d}) == 0U, "R6 FMOD: stop channel");
     expect(call("?update@System@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", {sys}) == 0U, "R6 FMOD: System::update");
+
+    // C2: Missing sound file returns FMOD_ERR_FILE_NOTFOUND (23) so module->root fallback proceeds.
+    const std::string missing_path = "Modules\\Native\\Sounds\\does_not_exist.ogg";
+    std::uint64_t snd_missing = 0xDEADU;
+    expect(call("?createSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@PEBDIPEAUFMOD_CREATESOUNDEXINFO@@PEAPEAVSound@2@@Z",
+                {sys, reinterpret_cast<std::uintptr_t>(missing_path.c_str()), kFmod2D, 0U,
+                 reinterpret_cast<std::uintptr_t>(&snd_missing)}) == kFmodErrFileNotFound && snd_missing == 0U,
+           "R6 FMOD C2: missing file returns FMOD_ERR_FILE_NOTFOUND and zeroes out handle");
+
+    // C3: Fixed channel pool (0..maxchannels-1), voice-cap eviction, and stale handle invalidation.
+    expect(call("?init@System@FMOD@@QEAA?AW4FMOD_RESULT@@HIPEAX@Z", {sys, 2U, 0U, 0U}) == 0U,
+           "R6 FMOD C3: System::init with maxchannels=2");
+    std::uint64_t c0 = 0, c1 = 0, c2 = 0;
+    expect(call("?playSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_CHANNELINDEX@@PEAVSound@2@_NPEAPEAVChannel@2@@Z",
+                {sys, static_cast<std::uint64_t>(static_cast<std::int64_t>(-1)), snd_stream, 0U,
+                 reinterpret_cast<std::uintptr_t>(&c0)}) == 0U && c0 != 0U, "R6 FMOD C3: play slot 0");
+    expect(call("?playSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_CHANNELINDEX@@PEAVSound@2@_NPEAPEAVChannel@2@@Z",
+                {sys, static_cast<std::uint64_t>(static_cast<std::int64_t>(-1)), snd_stream, 0U,
+                 reinterpret_cast<std::uintptr_t>(&c1)}) == 0U && c1 != 0U, "R6 FMOD C3: play slot 1");
+    expect(call("?playSound@System@FMOD@@QEAA?AW4FMOD_RESULT@@W4FMOD_CHANNELINDEX@@PEAVSound@2@_NPEAPEAVChannel@2@@Z",
+                {sys, static_cast<std::uint64_t>(static_cast<std::int64_t>(-1)), snd_stream, 0U,
+                 reinterpret_cast<std::uintptr_t>(&c2)}) == 0U && c2 != 0U, "R6 FMOD C3: 3rd sound evicts oldest");
+    std::int32_t idx2 = -1;
+    expect(call("?getIndex@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z",
+                {c2, reinterpret_cast<std::uintptr_t>(&idx2)}) == 0U && idx2 >= 0 && idx2 < 2,
+           "R6 FMOD C3: Channel::getIndex stays within 0..maxchannels-1");
+    std::uint8_t stale_playing = 1U;
+    expect(call("?isPlaying@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEA_N@Z",
+                {c0, reinterpret_cast<std::uintptr_t>(&stale_playing)}) == kFmodErrInvalidHandle,
+           "R6 FMOD C3: evicted channel handle returns FMOD_ERR_INVALID_HANDLE");
+
+    // H7: Unpositioned 3D sound does NOT trigger haptics until set3DAttributes supplies position,
+    // and man_grunt / distant man_hit do not false-fire "when you are hit".
+    CombatHapticsClassifier hc(CombatHapticsSettings{true, true, false, 60, 3.8F, 0U});
+    expect(hc.evaluate("man_grunt_1.ogg", true, 0.2F, 1.0F, 100U).kind == CombatHapticKind::none,
+           "R6 Haptics H7: man_grunt is not classified as player_hit");
+    expect(hc.evaluate("man_hit_1.ogg", true, 1.8F, 1.0F, 200U).kind == CombatHapticKind::none,
+           "R6 Haptics H7: enemy man_hit at 1.8m does not fire when_hit-only");
+    expect(hc.evaluate("man_hit_1.ogg", true, 0.4F, 1.0F, 300U).kind == CombatHapticKind::player_hit,
+           "R6 Haptics H7: close man_hit at 0.4m fires player_hit");
 }
 
 void test_r6_input_shims_and_adaptive_touch() {
@@ -6495,6 +6535,72 @@ void test_r6_input_shims_and_adaptive_touch() {
     expect(has_id(hub.visible_buttons_snapshot(), "cheat_teleport") &&
                has_id(hub.visible_buttons_snapshot(), "cheat_reveal_map"),
            "R6 Cheats: Campaign Map shows Teleport & Reveal Map");
+
+    // 6. Regression checks from independent review (M3, M4, H4, H5, H6, H9):
+    // M3: GetDeviceData rejects invalid cbObjectData < 16 with E_INVALIDARG.
+    std::uint32_t bad_n = 4U;
+    expect(d3d_test::com(com_s, kbd, ci::kIDirectInputDevice8A, "GetDeviceData",
+                         {8U, reinterpret_cast<std::uintptr_t>(dod), reinterpret_cast<std::uintptr_t>(&bad_n), 0U}) ==
+               0x80070057U,
+           "R6 DInput M3: GetDeviceData rejects cbObjectData < 16");
+
+    // M4: XInputEnable(FALSE) returns ERROR_SUCCESS with neutral zeroed state (not ERROR_DEVICE_NOT_CONNECTED).
+    call_imp("XINPUT1_3.dll", "#5", {0U});
+    std::memset(xstate, 0xFF, sizeof(xstate));
+    expect(call_imp("XINPUT1_3.dll", "#2", {0U, reinterpret_cast<std::uintptr_t>(xstate)}) == 0U,
+           "R6 XInput M4: XInputEnable(FALSE) still returns ERROR_SUCCESS for connected pad");
+    std::uint16_t neutral_b = 0xFFFFU;
+    std::memcpy(&neutral_b, xstate + 4U, 2U);
+    expect(neutral_b == 0U && xstate[6] == 0U, "R6 XInput M4: XInputEnable(FALSE) returns neutral buttons/triggers");
+    call_imp("XINPUT1_3.dll", "#5", {1U});
+
+    // H4: Dialog vertical drag scrolls without firing an accidental LMB click.
+    hub.set_inferred_scene(TouchScene::dialog);
+    hub.on_touch_event(10, 0, 1200.0F, 500.0F);
+    hub.tick_frame();
+    std::memset(mstate, 0, sizeof(mstate));
+    (void)d3d_test::com(com_s, mouse, ci::kIDirectInputDevice8A, "GetDeviceState",
+                        {20U, reinterpret_cast<std::uintptr_t>(mstate)});
+    expect(mstate[12] == 0U, "R6 Touch UX H4: Dialog touch-down defers LMB until lift");
+    hub.on_touch_event(10, 2, 1200.0F, 580.0F);
+    hub.on_touch_event(10, 1, 1200.0F, 580.0F);
+    hub.tick_frame();
+    (void)d3d_test::com(com_s, mouse, ci::kIDirectInputDevice8A, "GetDeviceState",
+                        {20U, reinterpret_cast<std::uintptr_t>(mstate)});
+    expect(mstate[12] == 0U, "R6 Touch UX H4: Dialog list scroll suppresses accidental click on lift");
+
+    // H6: Sub-pixel gyro aiming accumulates fractional deltas instead of rounding to 0 at 200 Hz.
+    auto gcfg = hub.config();
+    gcfg.gyro_enabled = true;
+    gcfg.aim_hold = false;
+    hub.set_config(gcfg);
+    hub.on_show_cursor(false);
+    // Tap Zoom button to activate zoom_active_.
+    for (const auto& b : hub.visible_buttons_snapshot()) {
+        if (b.id == "zoom") {
+            hub.on_touch_event(20, 0, b.nx * 2412.0F, b.ny * 1080.0F);
+            hub.on_touch_event(20, 1, b.nx * 2412.0F, b.ny * 1080.0F);
+            break;
+        }
+    }
+    // Drain prior mouse deltas, then feed 20 small 5 ms gyro samples (each < 1 px individually).
+    (void)d3d_test::com(com_s, mouse, ci::kIDirectInputDevice8A, "GetDeviceState",
+                        {20U, reinterpret_cast<std::uintptr_t>(mstate)});
+    for (int i = 0; i < 20; ++i) {
+        hub.on_gyro_sample(0.35F, 0.0F, 0.005F, false);
+    }
+    (void)d3d_test::com(com_s, mouse, ci::kIDirectInputDevice8A, "GetDeviceState",
+                        {20U, reinterpret_cast<std::uintptr_t>(mstate)});
+    std::int32_t gdx = 0;
+    std::memcpy(&gdx, mstate + 0U, 4U);
+    expect(gdx != 0, "R6 Gyro H6: sub-pixel 200 Hz gyro samples accumulate non-zero yaw delta");
+
+    // H5: release_all clears held movement & modifiers cleanly.
+    hub.release_all();
+    (void)d3d_test::com(com_s, kbd, ci::kIDirectInputDevice8A, "GetDeviceState",
+                        {256U, reinterpret_cast<std::uintptr_t>(kstate)});
+    expect(kstate[dik::kLShift] == 0U && kstate[dik::kLCtrl] == 0U,
+           "R6 Touch UX H5: release_all clears latched/held modifier keys");
 }
 
 void test_r6_mod_controls_detector_and_icons() {
@@ -6526,6 +6632,15 @@ void test_r6_mod_controls_detector_and_icons() {
         const DetectedModControls det = detect_mod_controls(vfs, "Modules/Omni", "OmniMod");
         expect(det.advanced_formations && det.buttons.size() >= 6U,
                "R6 ModDetect: detects Warsword, Vasnar, 108 Heroes, VC and PBOD hotkeys");
+    }
+
+    // 2b. Vanilla Native with `prsnt_battle` does NOT false-trigger mod_tactical_map (M2)
+    {
+        MemoryVfs vfs;
+        vfs.write_text("Modules/Native/mission_templates.txt", "mst_lead_charge 71 1 15 71 1 14\n");
+        vfs.write_text("Modules/Native/presentations.txt", "prsnt_battle 0 0\n");
+        const DetectedModControls det = detect_mod_controls(vfs, "Modules/Native", "Native");
+        expect(det.buttons.empty(), "R6 ModDetect M2: vanilla Native stays clean with zero mod false positives");
     }
 
     // 3. Every simplistic procedural vector icon emits finite, in-bounds geometry

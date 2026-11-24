@@ -90,9 +90,8 @@ public:
             return CombatHapticKind::heavy_blow;
         }
 
-        // Player/agent hurt vocalizations or direct hits taken.
-        if (has("man_hit") || has("woman_hit") || has("player_hit") || has("man_die") ||
-            has("woman_die") || has("man_grunt") || has("woman_grunt")) {
+        // Player/agent hurt vocalizations (exclude swing exertion grunts like man_grunt/woman_grunt).
+        if (has("man_hit") || has("woman_hit") || has("player_hit") || has("man_die") || has("woman_die")) {
             return CombatHapticKind::player_hit;
         }
 
@@ -121,9 +120,15 @@ public:
         if (is_3d && (!std::isfinite(distance_meters) || distance_meters > settings_.max_distance)) {
             return {};
         }
-        const CombatHapticKind kind = classify_sound_name(sound_name);
+        CombatHapticKind kind = classify_sound_name(sound_name);
         if (kind == CombatHapticKind::none) {
             return {};
+        }
+        // 3D man_hit/woman_hit/man_die vocalizations more than ~0.85 m away from the player's
+        // camera/listener are enemies or nearby troops being struck rather than the player taking
+        // a direct hit; reclassify them as melee_hit so "When you are hit" does not false-fire.
+        if (kind == CombatHapticKind::player_hit && is_3d && distance_meters > 0.85F) {
+            kind = CombatHapticKind::melee_hit;
         }
         if (kind == CombatHapticKind::player_hit && !settings_.when_hit) {
             return {};

@@ -1224,6 +1224,7 @@ struct VulkanD3d9Backend::Impl {
     };
     bool overlay_attempted = false;
     bool overlay_ok = false;
+    bool post_zoom_attempted = false;
     VkShaderModule overlay_vs = VK_NULL_HANDLE;
     VkShaderModule overlay_fs = VK_NULL_HANDLE;
     VkShaderModule post_zoom_fs = VK_NULL_HANDLE;
@@ -2772,6 +2773,7 @@ struct VulkanD3d9Backend::Impl {
         }
         overlay_attempted = false;
         overlay_ok = false;
+        post_zoom_attempted = false;
         if (post_rp != VK_NULL_HANDLE) {
             vk.destroy_render_pass(h.device, post_rp, nullptr);
             post_rp = VK_NULL_HANDLE;
@@ -2841,11 +2843,45 @@ struct VulkanD3d9Backend::Impl {
         post_shaders_attempted = true;
         post_shaders_ok = false;
 
+        static constexpr std::string_view kOverlayVert = R"(
+#version 450
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec4 aColor;
+layout(push_constant) uniform PC { vec2 invExtent; } pc;
+layout(location = 0) out vec4 vColor;
+void main() {
+    gl_Position = vec4(aPos * pc.invExtent - 1.0, 0.0, 1.0);
+    vColor = aColor;
+}
+)";
+        static constexpr std::string_view kOverlayFrag = R"(
+#version 450
+layout(location = 0) in vec4 vColor;
+layout(location = 0) out vec4 outColor;
+void main() {
+    outColor = vColor;
+}
+)";
+        static constexpr std::string_view kMenuZoomFrag = R"(
+#version 450
+layout(set = 0, binding = 0) uniform sampler2D srcTex;
+layout(push_constant) uniform PC { vec4 zoomPan; } pc;
+layout(location = 0) in vec2 vUv;
+layout(location = 0) out vec4 outColor;
+void main() {
+    vec2 uv = pc.zoomPan.yz + (vUv - 0.5) / max(pc.zoomPan.x, 1.0);
+    outColor = texture(srcTex, clamp(uv, vec2(0.0), vec2(1.0)));
+}
+)";
+
         std::string err_msg;
         if (!compile_post_shader(kPostVertex, wse::asset::SpirvStage::Vertex, post_vs, err_msg) ||
             !compile_post_shader(kFsrEasu, wse::asset::SpirvStage::Fragment, post_easu_fs, err_msg) ||
             !compile_post_shader(kFsrRcas, wse::asset::SpirvStage::Fragment, post_rcas_fs, err_msg) ||
-            !compile_post_shader(kFxaa, wse::asset::SpirvStage::Fragment, post_fxaa_fs, err_msg)) {
+            !compile_post_shader(kFxaa, wse::asset::SpirvStage::Fragment, post_fxaa_fs, err_msg) ||
+            !compile_post_shader(kOverlayVert, wse::asset::SpirvStage::Vertex, overlay_vs, err_msg) ||
+            !compile_post_shader(kOverlayFrag, wse::asset::SpirvStage::Fragment, overlay_fs, err_msg) ||
+            !compile_post_shader(kMenuZoomFrag, wse::asset::SpirvStage::Fragment, post_zoom_fs, err_msg)) {
             post_shader_status = "failed(" + err_msg + ")";
             report.missing_features.push_back("postfx_shaders: " + err_msg);
             destroy_postfx_pipelines();
@@ -3161,8 +3197,10 @@ void main() {
 }
 )";
             std::string err_msg;
-            if (!compile_post_shader(kOverlayVert, wse::asset::SpirvStage::Vertex, overlay_vs, err_msg) ||
-                !compile_post_shader(kOverlayFrag, wse::asset::SpirvStage::Fragment, overlay_fs, err_msg)) {
+            if ((overlay_vs == VK_NULL_HANDLE &&
+                 !compile_post_shader(kOverlayVert, wse::asset::SpirvStage::Vertex, overlay_vs, err_msg)) ||
+                (overlay_fs == VK_NULL_HANDLE &&
+                 !compile_post_shader(kOverlayFrag, wse::asset::SpirvStage::Fragment, overlay_fs, err_msg))) {
                 return false;
             }
             if (vk.cmd_push_constants == nullptr) return false;
@@ -3193,12 +3231,23 @@ void main() {
             sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
             sub.colorAttachmentCount = 1U;
             sub.pColorAttachments = &cref;
+            // Explicit external dependency so tile-based GPUs (Mali/Adreno) finish the preceding
+            // scene/post-FX color-attachment write before LOAD_OP_LOAD blends the touch overlay.
+            VkSubpassDependency dep{};
+            dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+            dep.dstSubpass = 0U;
+            dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             VkRenderPassCreateInfo rp_ci{};
             rp_ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
             rp_ci.attachmentCount = 1U;
             rp_ci.pAttachments = &att;
             rp_ci.subpassCount = 1U;
             rp_ci.pSubpasses = &sub;
+            rp_ci.dependencyCount = 1U;
+            rp_ci.pDependencies = &dep;
             if (vk.create_render_pass(h.device, &rp_ci, nullptr, &overlay_rp) != VK_SUCCESS) {
                 return false;
             }
@@ -3323,7 +3372,9 @@ void main() {
 
     bool ensure_menu_zoom_pipeline_locked() {
         if (post_zoom_pip != VK_NULL_HANDLE) return true;
+        if (post_zoom_attempted) return false;
         if (!ensure_postfx_targets_locked()) return false;
+        post_zoom_attempted = true;
         static constexpr std::string_view kMenuZoomFrag = R"(
 #version 450
 layout(set = 0, binding = 0) uniform sampler2D srcTex;
@@ -3336,7 +3387,8 @@ void main() {
 }
 )";
         std::string err_msg;
-        if (!compile_post_shader(kMenuZoomFrag, wse::asset::SpirvStage::Fragment, post_zoom_fs, err_msg)) {
+        if (post_zoom_fs == VK_NULL_HANDLE &&
+            !compile_post_shader(kMenuZoomFrag, wse::asset::SpirvStage::Fragment, post_zoom_fs, err_msg)) {
             return false;
         }
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
@@ -3458,6 +3510,9 @@ void main() {
         alloc.flush(vb.mem, 0U, v_count * sizeof(OverlayVertex));
         alloc.flush(ib.mem, 0U, valid_indices * sizeof(std::uint32_t));
 
+        if (out_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            return;
+        }
         if (out_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
             VkImageMemoryBarrier bar{};
             bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -3467,9 +3522,12 @@ void main() {
             bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             bar.image = out_img;
             bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
-            bar.srcAccessMask = 0U;
+            const bool from_shader_read = (out_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            bar.srcAccessMask = from_shader_read ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            vk.cmd_pipeline_barrier(frame_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            vk.cmd_pipeline_barrier(frame_cmd,
+                                    from_shader_read ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                                     : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &bar);
             out_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             if (out_img == bb_img) bb_layout = out_layout;

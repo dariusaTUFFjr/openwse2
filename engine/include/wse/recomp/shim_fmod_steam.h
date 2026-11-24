@@ -89,6 +89,7 @@ public:
     }
 
     explicit FmodSteam(Runtime& rt) : rt_(rt) {
+        init_channel_pool_locked(max_channels_);
         if (auto& hook = created_hook()) {
             hook(*this);
         }
@@ -100,6 +101,7 @@ public:
     // Embedder hooks (safe to configure from `created_hook()` or before `install()`).
     ReadFileFn read_file;
     HapticFn on_haptic;
+    std::function<bool()> on_device_recover;
 
     void set_codec_backend(std::shared_ptr<wse::asset::AudioCodecBackend> backend) {
         const std::lock_guard<std::mutex> lock(m_);
@@ -160,9 +162,6 @@ public:
         }
         {
             const std::lock_guard<std::mutex> lock(m_);
-            if (audio_device_ == nullptr || !audio_device_->is_open()) {
-                return;
-            }
             stop_worker_ = false;
         }
         worker_ = std::thread([this] { worker_loop(); });
@@ -204,8 +203,8 @@ public:
     [[nodiscard]] std::size_t active_channel_count() const {
         const std::lock_guard<std::mutex> lock(m_);
         std::size_t n = 0U;
-        for (const auto& kv : channels_) {
-            if (kv.second.playing) ++n;
+        for (const auto& c : channels_) {
+            if (c.playing) ++n;
         }
         return n;
     }
@@ -234,6 +233,7 @@ public:
             {
                 const std::lock_guard<std::mutex> lock(m_);
                 max_channels_ = std::clamp(max_ch > 0 ? max_ch : 64, 1, 256);
+                init_channel_pool_locked(max_channels_);
             }
             win64_return(s, kFmodOk);
         });
@@ -242,7 +242,7 @@ public:
         fmod("?close@System@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", [this](CpuState& s) {
             {
                 const std::lock_guard<std::mutex> lock(m_);
-                channels_.clear();
+                init_channel_pool_locked(max_channels_);
                 sounds_.clear();
                 pending_end_callbacks_.clear();
             }
@@ -251,7 +251,7 @@ public:
         fmod("?release@System@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", [this](CpuState& s) {
             {
                 const std::lock_guard<std::mutex> lock(m_);
-                channels_.clear();
+                init_channel_pool_locked(max_channels_);
                 sounds_.clear();
                 pending_end_callbacks_.clear();
             }
@@ -358,17 +358,17 @@ public:
                 return;
             }
             const std::lock_guard<std::mutex> lock(m_);
-            for (const auto& kv : channels_) {
-                if (kv.second.index == ch_idx) {
-                    crt_detail::put<std::uint64_t>(out, kv.first);
-                    win64_return(s, kFmodOk);
-                    return;
-                }
+            if (ch_idx < 0 || static_cast<std::size_t>(ch_idx) >= channels_.size()) {
+                crt_detail::put<std::uint64_t>(out, 0U);
+                win64_return(s, kFmodErrInvalidParam);
+                return;
             }
-            const std::uint64_t h = next_handle_locked();
-            Channel& c = channels_[h];
-            c.index = ch_idx;
-            crt_detail::put<std::uint64_t>(out, h);
+            Channel& c = channels_[static_cast<std::size_t>(ch_idx)];
+            if (!c.handle_valid || c.handle == 0U) {
+                c.handle = make_channel_handle(static_cast<std::size_t>(ch_idx), ++generation_);
+                c.handle_valid = true;
+            }
+            crt_detail::put<std::uint64_t>(out, c.handle);
             win64_return(s, kFmodOk);
         });
 
@@ -418,8 +418,8 @@ public:
             if (win64_arg(s, 1) != 0) {
                 const std::lock_guard<std::mutex> lock(m_);
                 std::int32_t count = 0;
-                for (const auto& kv : channels_) {
-                    if (kv.second.playing) ++count;
+                for (const auto& c : channels_) {
+                    if (c.playing) ++count;
                 }
                 crt_detail::put<std::int32_t>(win64_arg(s, 1), count);
             }
@@ -491,32 +491,38 @@ public:
         fmod("?release@Sound@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", [this](CpuState& s) {
             const std::uint64_t h = win64_arg(s, 0);
             const std::lock_guard<std::mutex> lock(m_);
-            for (auto& kv : channels_) {
-                if (kv.second.sound_handle == h) {
-                    stop_channel_locked(kv.first, kv.second, false);
+            for (auto& c : channels_) {
+                if (c.sound_handle == h) {
+                    stop_channel_locked(c, false);
                 }
             }
             sounds_.erase(h);
             win64_return(s, kFmodOk);
         });
 
-        // Channel methods
+        // Channel methods (all validate generation-checked pool handles; stale handles return FMOD_ERR_INVALID_HANDLE).
         fmod("?isPlaying@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEA_N@Z", [this](CpuState& s) {
             const std::uint64_t out = win64_arg(s, 1);
+            const std::lock_guard<std::mutex> lock(m_);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                if (out != 0) crt_detail::put<std::uint8_t>(out, 0U);
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
             if (out != 0) {
-                const std::lock_guard<std::mutex> lock(m_);
-                const auto it = channels_.find(win64_arg(s, 0));
-                const bool playing = (it != channels_.end() && it->second.playing);
-                crt_detail::put<std::uint8_t>(out, playing ? 1U : 0U);
+                crt_detail::put<std::uint8_t>(out, c->playing ? 1U : 0U);
             }
             win64_return(s, kFmodOk);
         });
         fmod("?stop@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
-            const auto it = channels_.find(win64_arg(s, 0));
-            if (it != channels_.end()) {
-                stop_channel_locked(it->first, it->second, true);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
             }
+            stop_channel_locked(*c, true);
             win64_return(s, kFmodOk);
         });
         fmod("?setPaused@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@_N@Z", [this](CpuState& s) {
@@ -525,14 +531,16 @@ public:
             HapticFn haptic_cb;
             {
                 const std::lock_guard<std::mutex> lock(m_);
-                const auto it = channels_.find(win64_arg(s, 0));
-                if (it != channels_.end()) {
-                    const bool was_paused = it->second.paused;
-                    it->second.paused = paused;
-                    if (was_paused && !paused && it->second.playing && !it->second.haptic_fired) {
-                        pulse = maybe_trigger_haptic_locked(it->second);
-                        haptic_cb = on_haptic;
-                    }
+                Channel* c = resolve_channel_locked(win64_arg(s, 0));
+                if (c == nullptr) {
+                    win64_return(s, kFmodErrInvalidHandle);
+                    return;
+                }
+                const bool was_paused = c->paused;
+                c->paused = paused;
+                if (was_paused && !paused && c->playing && !c->haptic_fired) {
+                    pulse = maybe_trigger_haptic_locked(*c);
+                    haptic_cb = on_haptic;
                 }
             }
             if (pulse.kind != CombatHapticKind::none && haptic_cb) {
@@ -544,14 +552,18 @@ public:
             const auto pos = static_cast<std::uint32_t>(win64_arg(s, 1));
             const auto unit = static_cast<std::uint32_t>(win64_arg(s, 2));
             const std::lock_guard<std::mutex> lock(m_);
-            const auto it = channels_.find(win64_arg(s, 0));
-            if (it != channels_.end() && it->second.sound != nullptr) {
-                const double target_frame = unit_to_frame(*it->second.sound, pos, unit);
-                if (it->second.sound->is_stream) {
-                    seek_stream_channel_locked(it->second, static_cast<std::size_t>(std::max(0.0, target_frame)));
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            if (c->sound != nullptr) {
+                const double target_frame = unit_to_frame(*c->sound, pos, unit);
+                if (c->sound->is_stream) {
+                    seek_stream_channel_locked(*c, static_cast<std::size_t>(std::max(0.0, target_frame)));
                 } else {
-                    const std::size_t total = it->second.sound->total_frames;
-                    it->second.cursor_frame =
+                    const std::size_t total = c->sound->total_frames;
+                    c->cursor_frame =
                         total > 0U ? std::clamp(target_frame, 0.0, static_cast<double>(total - 1U)) : 0.0;
                 }
             }
@@ -560,101 +572,176 @@ public:
         fmod("?getPosition@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAII@Z", [this](CpuState& s) {
             const std::uint64_t out = win64_arg(s, 1);
             const auto unit = static_cast<std::uint32_t>(win64_arg(s, 2));
+            const std::lock_guard<std::mutex> lock(m_);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                if (out != 0) crt_detail::put<std::uint32_t>(out, 0U);
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
             if (out != 0) {
-                const std::lock_guard<std::mutex> lock(m_);
-                const auto it = channels_.find(win64_arg(s, 0));
-                std::uint32_t val = 0U;
-                if (it != channels_.end() && it->second.sound != nullptr) {
-                    val = frame_to_unit(*it->second.sound, it->second.cursor_frame, unit);
-                }
+                const std::uint32_t val =
+                    (c->sound != nullptr) ? frame_to_unit(*c->sound, c->cursor_frame, unit) : 0U;
                 crt_detail::put<std::uint32_t>(out, val);
             }
             win64_return(s, kFmodOk);
         });
         fmod("?setFrequency@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@M@Z", [this](CpuState& s) {
             const float freq = win64_arg_f32(s, 1);
+            const std::lock_guard<std::mutex> lock(m_);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
             if (std::isfinite(freq) && freq > 1.0F) {
-                const std::lock_guard<std::mutex> lock(m_);
-                channels_[win64_arg(s, 0)].frequency = std::clamp(freq, 100.0F, 384000.0F);
+                c->frequency = std::clamp(freq, 100.0F, 384000.0F);
             }
             win64_return(s, kFmodOk);
         });
         fmod("?set3DAttributes@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEBUFMOD_VECTOR@@0@Z", [this](CpuState& s) {
             const std::uint64_t p_pos = win64_arg(s, 1);
             const std::uint64_t p_vel = win64_arg(s, 2);
-            const std::lock_guard<std::mutex> lock(m_);
-            Channel& c = channels_[win64_arg(s, 0)];
-            if (p_pos != 0) {
-                read_vec3(p_pos, c.position);
-                c.has_3d_pos = true;
+            CombatHapticPulse pulse{};
+            HapticFn haptic_cb;
+            {
+                const std::lock_guard<std::mutex> lock(m_);
+                Channel* c = resolve_channel_locked(win64_arg(s, 0));
+                if (c == nullptr) {
+                    win64_return(s, kFmodErrInvalidHandle);
+                    return;
+                }
+                if (p_pos != 0) {
+                    read_vec3(p_pos, c->position);
+                    c->has_3d_pos = true;
+                }
+                if (p_vel != 0) read_vec3(p_vel, c->velocity);
+                if (c->playing && !c->paused && !c->haptic_fired && c->has_3d_pos) {
+                    pulse = maybe_trigger_haptic_locked(*c);
+                    haptic_cb = on_haptic;
+                }
             }
-            if (p_vel != 0) read_vec3(p_vel, c.velocity);
+            if (pulse.kind != CombatHapticKind::none && haptic_cb) {
+                haptic_cb(pulse);
+            }
             win64_return(s, kFmodOk);
         });
         fmod("?get3DAttributes@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAUFMOD_VECTOR@@0@Z", [this](CpuState& s) {
             const std::uint64_t p_pos = win64_arg(s, 1);
             const std::uint64_t p_vel = win64_arg(s, 2);
             const std::lock_guard<std::mutex> lock(m_);
-            const auto it = channels_.find(win64_arg(s, 0));
-            const wse::core::WseVec4 pos = (it != channels_.end()) ? it->second.position : wse::core::WseVec4{};
-            const wse::core::WseVec4 vel = (it != channels_.end()) ? it->second.velocity : wse::core::WseVec4{};
-            if (p_pos != 0) write_vec3(p_pos, pos);
-            if (p_vel != 0) write_vec3(p_vel, vel);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            if (p_pos != 0) write_vec3(p_pos, c->position);
+            if (p_vel != 0) write_vec3(p_vel, c->velocity);
             win64_return(s, kFmodOk);
         });
         fmod("?setUserData@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAX@Z", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
-            channels_[win64_arg(s, 0)].user = win64_arg(s, 1);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            c->user = win64_arg(s, 1);
             win64_return(s, kFmodOk);
         });
         fmod("?getUserData@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAX@Z", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
-            if (win64_arg(s, 1) != 0) crt_detail::put<std::uint64_t>(win64_arg(s, 1), channels_[win64_arg(s, 0)].user);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            if (win64_arg(s, 1) != 0) crt_detail::put<std::uint64_t>(win64_arg(s, 1), c->user);
             win64_return(s, kFmodOk);
         });
         fmod("?getCurrentSound@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAPEAVSound@2@@Z", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
             if (win64_arg(s, 1) != 0) {
-                crt_detail::put<std::uint64_t>(win64_arg(s, 1), channels_[win64_arg(s, 0)].sound_handle);
+                crt_detail::put<std::uint64_t>(win64_arg(s, 1), c->sound_handle);
             }
             win64_return(s, kFmodOk);
         });
         fmod("?getIndex@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAH@Z", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
-            if (win64_arg(s, 1) != 0) crt_detail::put<std::int32_t>(win64_arg(s, 1), channels_[win64_arg(s, 0)].index);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            if (win64_arg(s, 1) != 0) crt_detail::put<std::int32_t>(win64_arg(s, 1), c->index);
             win64_return(s, kFmodOk);
         });
         fmod("?setMode@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@I@Z", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
-            channels_[win64_arg(s, 0)].mode = static_cast<std::uint32_t>(win64_arg(s, 1));
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            c->mode = static_cast<std::uint32_t>(win64_arg(s, 1));
             win64_return(s, kFmodOk);
         });
         fmod("?getMode@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAI@Z", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
-            if (win64_arg(s, 1) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 1), channels_[win64_arg(s, 0)].mode);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            if (win64_arg(s, 1) != 0) crt_detail::put<std::uint32_t>(win64_arg(s, 1), c->mode);
             win64_return(s, kFmodOk);
         });
         fmod("?setVolume@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@M@Z", [this](CpuState& s) {
             const float vol = win64_arg_f32(s, 1);
             const std::lock_guard<std::mutex> lock(m_);
-            channels_[win64_arg(s, 0)].volume = std::clamp(std::isfinite(vol) ? vol : 1.0F, 0.0F, 4.0F);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            c->volume = std::clamp(std::isfinite(vol) ? vol : 1.0F, 0.0F, 4.0F);
             win64_return(s, kFmodOk);
         });
         fmod("?getVolume@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@PEAM@Z", [this](CpuState& s) {
             const std::lock_guard<std::mutex> lock(m_);
-            if (win64_arg(s, 1) != 0) crt_detail::put<float>(win64_arg(s, 1), channels_[win64_arg(s, 0)].volume);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            if (win64_arg(s, 1) != 0) crt_detail::put<float>(win64_arg(s, 1), c->volume);
             win64_return(s, kFmodOk);
         });
         fmod("?setPriority@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@H@Z", [this](CpuState& s) {
             const auto prio = static_cast<std::int32_t>(win64_arg(s, 1));
             const std::lock_guard<std::mutex> lock(m_);
-            channels_[win64_arg(s, 0)].priority = std::clamp(prio, 0, 256);
+            Channel* c = resolve_channel_locked(win64_arg(s, 0));
+            if (c == nullptr) {
+                win64_return(s, kFmodErrInvalidHandle);
+                return;
+            }
+            c->priority = std::clamp(prio, 0, 256);
             win64_return(s, kFmodOk);
         });
         fmod("?setCallback@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@P6A?AW43@PEAUFMOD_CHANNEL@@W4FMOD_CHANNEL_CALLBACKTYPE@@PEAX2@Z@Z",
              [this](CpuState& s) {
                  const std::lock_guard<std::mutex> lock(m_);
-                 channels_[win64_arg(s, 0)].callback_va = win64_arg(s, 1);
+                 Channel* c = resolve_channel_locked(win64_arg(s, 0));
+                 if (c == nullptr) {
+                     win64_return(s, kFmodErrInvalidHandle);
+                     return;
+                 }
+                 c->callback_va = win64_arg(s, 1);
                  win64_return(s, kFmodOk);
              });
 
@@ -694,6 +781,8 @@ public:
     }
 
 private:
+    static constexpr std::uint64_t kChannelHandleTag = 0x7E00000000000000ULL;
+
     struct Sound {
         std::string name;
         std::uint32_t mode = kFmod2D | kFmodLoopOff;
@@ -709,9 +798,12 @@ private:
         float max_dist = 80.0F;
         std::shared_ptr<const wse::asset::AudioPcmBuffer> pcm;
         std::shared_ptr<const std::vector<std::uint8_t>> stream_bytes;
+        std::unique_ptr<wse::asset::AudioStreamDecoder> initial_stream;
     };
 
     struct Channel {
+        std::uint64_t handle = 0U;
+        bool handle_valid = false;
         std::uint64_t sound_handle = 0;
         std::shared_ptr<Sound> sound;
         std::uint64_t user = 0;
@@ -735,6 +827,7 @@ private:
         // Streaming state (used only when `sound->is_stream` is true).
         std::unique_ptr<wse::asset::AudioStreamDecoder> stream;
         std::vector<float> stream_buf;
+        std::vector<float> stream_scratch;
         std::size_t stream_buf_frames = 0U;
         double stream_buf_cursor = 0.0;
         bool stream_eof = false;
@@ -744,6 +837,35 @@ private:
         std::uint64_t channel = 0;
         std::uint64_t fn_va = 0;
     };
+
+    static std::uint64_t make_channel_handle(std::size_t slot_idx, std::uint64_t gen) noexcept {
+        return kChannelHandleTag | ((gen & 0x0000FFFFFFFFULL) << 16U) |
+               static_cast<std::uint64_t>((slot_idx + 1U) & 0xFFFFU);
+    }
+
+    void init_channel_pool_locked(std::int32_t count) {
+        const auto n = static_cast<std::size_t>(std::clamp(count, 1, 256));
+        channels_.clear();
+        channels_.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            channels_[i].index = static_cast<std::int32_t>(i);
+        }
+    }
+
+    Channel* resolve_channel_locked(std::uint64_t handle) noexcept {
+        if ((handle & 0xFF00000000000000ULL) != kChannelHandleTag) {
+            return nullptr;
+        }
+        const std::size_t slot_1 = static_cast<std::size_t>(handle & 0xFFFFU);
+        if (slot_1 == 0U || slot_1 > channels_.size()) {
+            return nullptr;
+        }
+        Channel& c = channels_[slot_1 - 1U];
+        if (!c.handle_valid || c.handle != handle) {
+            return nullptr;
+        }
+        return &c;
+    }
 
     static void read_vec3(std::uint64_t ptr, wse::core::WseVec4& out) noexcept {
         out.x = crt_detail::get<float>(ptr);
@@ -823,16 +945,25 @@ private:
                 len = crt_detail::get<std::uint32_t>(exinfo + 4U);  // FMOD_CREATESOUNDEXINFO::length
             }
             constexpr std::uint32_t kMaxMemSoundBytes = 128U * 1024U * 1024U;
-            if (name_or_data != 0 && len > 0U && len <= kMaxMemSoundBytes) {
-                raw_bytes.resize(len);
-                std::memcpy(raw_bytes.data(),
-                            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(name_or_data)), len);
+            if (name_or_data == 0 || len == 0U || len > kMaxMemSoundBytes) {
+                crt_detail::put<std::uint64_t>(out_sound, 0U);
+                win64_return(s, kFmodErrInvalidParam);
+                return;
             }
+            raw_bytes.resize(len);
+            std::memcpy(raw_bytes.data(),
+                        reinterpret_cast<const void*>(static_cast<std::uintptr_t>(name_or_data)), len);
             sound_name = "<memory>";
         } else {
             sound_name = read_guest_cstr(name_or_data);
-            if (read_file && !sound_name.empty()) {
-                (void)read_file(sound_name, raw_bytes);
+            if (read_file) {
+                if (sound_name.empty() || !read_file(sound_name, raw_bytes)) {
+                    // Return FMOD_ERR_FILE_NOTFOUND so Warband's 4-step module -> root
+                    // sound/music fallback probes the next path instead of halting on silence.
+                    crt_detail::put<std::uint64_t>(out_sound, 0U);
+                    win64_return(s, kFmodErrFileNotFound);
+                    return;
+                }
             }
         }
 
@@ -862,6 +993,7 @@ private:
                                                                    : static_cast<std::size_t>(snd->sample_rate);
                     snd->default_frequency = static_cast<float>(snd->sample_rate);
                     snd->stream_bytes = std::move(shared_bytes);
+                    snd->initial_stream = std::move(probe);
                 } else {
                     auto pcm = std::make_shared<wse::asset::AudioPcmBuffer>();
                     if (wse::asset::decode_audio_bytes(*shared_bytes, sound_name, codec.get(), *pcm, &err) &&
@@ -909,61 +1041,75 @@ private:
 
         {
             const std::lock_guard<std::mutex> lock(m_);
+            if (channels_.empty()) {
+                init_channel_pool_locked(max_channels_);
+            }
             const auto sit = sounds_.find(sound_handle);
             std::shared_ptr<Sound> snd = (sit != sounds_.end()) ? sit->second : nullptr;
+            const std::int32_t new_prio = snd ? snd->default_priority : 128;
 
+            Channel* slot = nullptr;
             if (ch_id == kFmodChannelReuse && out_ch != 0) {
                 const std::uint64_t existing = crt_detail::get<std::uint64_t>(out_ch);
-                if (existing != 0 && channels_.find(existing) != channels_.end()) {
-                    ch_handle = existing;
-                }
-            } else if (ch_id >= 0) {
-                for (const auto& kv : channels_) {
-                    if (kv.second.index == ch_id) {
-                        ch_handle = kv.first;
+                slot = resolve_channel_locked(existing);
+            } else if (ch_id >= 0 && static_cast<std::size_t>(ch_id) < channels_.size()) {
+                slot = &channels_[static_cast<std::size_t>(ch_id)];
+            }
+
+            if (slot == nullptr) {
+                // Find an idle slot first.
+                for (auto& c : channels_) {
+                    if (!c.playing) {
+                        slot = &c;
                         break;
                     }
                 }
-            }
-
-            if (ch_handle == 0) {
-                evict_if_full_locked(snd ? snd->default_priority : 128);
-                ch_handle = next_handle_locked();
-                channels_[ch_handle].index = (ch_id >= 0) ? ch_id : next_channel_index_++;
-            }
-
-            Channel& c = channels_[ch_handle];
-            c.sound_handle = sound_handle;
-            c.sound = snd;
-            c.mode = snd ? snd->mode : (kFmod2D | kFmodLoopOff);
-            c.volume = snd ? snd->default_volume : 1.0F;
-            c.frequency = snd ? snd->default_frequency : 44100.0F;
-            c.priority = snd ? snd->default_priority : 128;
-            c.generation = ++generation_;
-            c.playing = (snd != nullptr && (snd->pcm != nullptr || snd->stream_bytes != nullptr));
-            c.paused = paused;
-            c.has_3d_pos = false;
-            c.haptic_fired = false;
-            c.cursor_frame = 0.0;
-            c.has_gain = false;
-            c.gain_l = 0.0F;
-            c.gain_r = 0.0F;
-            c.stream.reset();
-            c.stream_buf.clear();
-            c.stream_buf_frames = 0U;
-            c.stream_buf_cursor = 0.0;
-            c.stream_eof = false;
-
-            if (snd && snd->is_stream && snd->stream_bytes) {
-                std::string err;
-                c.stream = wse::asset::open_audio_stream(*snd->stream_bytes, snd->name, codec_backend_.get(), &err);
-                if (!c.stream) {
-                    c.playing = false;
+                // All slots busy: evict lowest-priority (highest numeric priority), oldest channel.
+                if (slot == nullptr) {
+                    slot = find_eviction_victim_locked(new_prio);
+                }
+                if (slot == nullptr) {
+                    if (out_ch != 0) crt_detail::put<std::uint64_t>(out_ch, 0U);
+                    win64_return(s, kFmodErrInvalidHandle);
+                    return;
                 }
             }
 
-            if (c.playing && !c.paused) {
-                pulse = maybe_trigger_haptic_locked(c);
+            if (slot->playing) {
+                stop_channel_locked(*slot, true);
+            }
+
+            const std::int32_t saved_index = slot->index;
+            *slot = Channel{};
+            slot->index = saved_index;
+            slot->generation = ++generation_;
+            slot->handle = make_channel_handle(static_cast<std::size_t>(saved_index), slot->generation);
+            slot->handle_valid = true;
+            slot->sound_handle = sound_handle;
+            slot->sound = snd;
+            slot->mode = snd ? snd->mode : (kFmod2D | kFmodLoopOff);
+            slot->volume = snd ? snd->default_volume : 1.0F;
+            slot->frequency = snd ? snd->default_frequency : 44100.0F;
+            slot->priority = new_prio;
+            slot->playing = (snd != nullptr && (snd->pcm != nullptr || snd->stream_bytes != nullptr));
+            slot->paused = paused;
+
+            if (snd && snd->is_stream && snd->stream_bytes) {
+                if (snd->initial_stream) {
+                    slot->stream = std::move(snd->initial_stream);
+                } else {
+                    std::string err;
+                    slot->stream =
+                        wse::asset::open_audio_stream(*snd->stream_bytes, snd->name, codec_backend_.get(), &err);
+                }
+                if (!slot->stream) {
+                    slot->playing = false;
+                }
+            }
+
+            ch_handle = slot->handle;
+            if (slot->playing && !slot->paused) {
+                pulse = maybe_trigger_haptic_locked(*slot);
                 haptic_cb = on_haptic;
             }
         }
@@ -982,8 +1128,12 @@ private:
             return {};
         }
         const bool is_3d = ((c.mode & kFmod3D) != 0U) && ((c.mode & kFmod3DHeadRelative) == 0U);
+        // Never fire haptics for unpositioned 3D sounds (wait until Channel::set3DAttributes provides position).
+        if (is_3d && !c.has_3d_pos) {
+            return {};
+        }
         float dist = 0.0F;
-        if (is_3d && c.has_3d_pos) {
+        if (is_3d) {
             const wse::core::WseVec4 d = c.position - listener_.position;
             dist = d.length() * distance_factor_;
         }
@@ -998,35 +1148,37 @@ private:
         return pulse;
     }
 
-    void evict_if_full_locked(std::int32_t new_priority) {
-        std::size_t active = 0U;
-        std::uint64_t worst_handle = 0U;
+    Channel* find_eviction_victim_locked(std::int32_t new_priority) noexcept {
+        Channel* worst = nullptr;
         std::int32_t worst_prio = -1;
         std::uint64_t worst_gen = UINT64_MAX;
-        for (const auto& kv : channels_) {
-            if (!kv.second.playing) continue;
-            ++active;
-            if (kv.second.priority > worst_prio ||
-                (kv.second.priority == worst_prio && kv.second.generation < worst_gen)) {
-                worst_prio = kv.second.priority;
-                worst_gen = kv.second.generation;
-                worst_handle = kv.first;
+        for (auto& c : channels_) {
+            if (!c.playing) return &c;
+            if (c.priority > worst_prio || (c.priority == worst_prio && c.generation < worst_gen)) {
+                worst_prio = c.priority;
+                worst_gen = c.generation;
+                worst = &c;
             }
         }
-        if (active >= static_cast<std::size_t>(max_channels_) && worst_handle != 0U && new_priority <= worst_prio) {
-            stop_channel_locked(worst_handle, channels_[worst_handle], true);
+        if (worst != nullptr && new_priority <= worst_prio) {
+            return worst;
         }
+        return nullptr;
     }
 
-    void stop_channel_locked(std::uint64_t handle, Channel& c, bool fire_callback) {
+    void stop_channel_locked(Channel& c, bool fire_callback) {
         const bool was_playing = c.playing;
+        const std::uint64_t cb_va = c.callback_va;
+        const std::uint64_t handle = c.handle;
         c.playing = false;
+        c.sound.reset();
+        c.sound_handle = 0U;
         c.stream.reset();
         c.stream_buf.clear();
         c.stream_buf_frames = 0U;
         c.stream_buf_cursor = 0.0;
-        if (was_playing && fire_callback && c.callback_va != 0) {
-            pending_end_callbacks_.push_back(PendingCallback{handle, c.callback_va});
+        if (was_playing && fire_callback && cb_va != 0) {
+            pending_end_callbacks_.push_back(PendingCallback{handle, cb_va});
         }
     }
 
@@ -1100,7 +1252,7 @@ private:
             pan = std::clamp(dir.dot(listener_.right), -1.0F, 1.0F);
         }
         const float angle = (pan + 1.0F) * 0.25F * 3.14159265358979323846F;
-        const float g = base_gain * atten;
+        const float g = base_gain * atten * 1.41421356F;
         out_l = g * std::cos(angle);
         out_r = g * std::sin(angle);
     }
@@ -1109,9 +1261,7 @@ private:
         const double out_sr = static_cast<double>(std::max<std::uint32_t>(8000U, output_sample_rate_));
         const float inv_n = 1.0F / static_cast<float>(frame_count);
 
-        for (auto& kv : channels_) {
-            const std::uint64_t ch_handle = kv.first;
-            Channel& c = kv.second;
+        for (auto& c : channels_) {
             if (!c.playing || c.paused || !c.sound) {
                 continue;
             }
@@ -1130,13 +1280,13 @@ private:
             const double step = static_cast<double>(std::max(100.0F, c.frequency)) / out_sr;
 
             if (c.sound->is_stream) {
-                mix_stream_channel_locked(ch_handle, c, frame_count, out, start_l, start_r,
+                mix_stream_channel_locked(c, frame_count, out, start_l, start_r,
                                           target_l - start_l, target_r - start_r, inv_n, step, loop);
             } else if (c.sound->pcm != nullptr && c.sound->pcm->valid()) {
-                mix_pcm_channel_locked(ch_handle, c, frame_count, out, start_l, start_r,
+                mix_pcm_channel_locked(c, frame_count, out, start_l, start_r,
                                        target_l - start_l, target_r - start_r, inv_n, step, loop);
             } else {
-                stop_channel_locked(ch_handle, c, true);
+                stop_channel_locked(c, true);
             }
         }
 
@@ -1146,7 +1296,7 @@ private:
         }
     }
 
-    void mix_pcm_channel_locked(std::uint64_t ch_handle, Channel& c, std::size_t frame_count, float* out,
+    void mix_pcm_channel_locked(Channel& c, std::size_t frame_count, float* out,
                                 float start_l, float start_r, float dl, float dr, float inv_n,
                                 double step, bool loop) {
         const auto& pcm = *c.sound->pcm;
@@ -1159,7 +1309,7 @@ private:
                 if (loop) {
                     c.cursor_frame = std::fmod(c.cursor_frame, static_cast<double>(total));
                 } else {
-                    stop_channel_locked(ch_handle, c, true);
+                    stop_channel_locked(c, true);
                     break;
                 }
             }
@@ -1184,37 +1334,62 @@ private:
     bool refill_stream_locked(Channel& c, bool loop) {
         if (!c.stream) return false;
         constexpr std::size_t kChunk = 2048U;
-        std::size_t got = c.stream->read_frames(kChunk, c.stream_buf);
+        const std::size_t stride = (c.stream->channels() >= 2U) ? 2U : 1U;
+        const bool had_prev = (c.stream_buf_frames > 0U && c.stream_buf.size() >= c.stream_buf_frames * stride);
+        float prev0 = 0.0F;
+        float prev1 = 0.0F;
+        if (had_prev) {
+            const std::size_t last = (c.stream_buf_frames - 1U) * stride;
+            prev0 = c.stream_buf[last];
+            if (stride == 2U) prev1 = c.stream_buf[last + 1U];
+        }
+
+        std::size_t got = c.stream->read_frames(kChunk, c.stream_scratch);
         if (got == 0U && loop) {
             if (c.stream->seek_start()) {
                 c.cursor_frame = 0.0;
-                got = c.stream->read_frames(kChunk, c.stream_buf);
+                got = c.stream->read_frames(kChunk, c.stream_scratch);
             }
         }
-        c.stream_buf_frames = got;
-        c.stream_buf_cursor = 0.0;
-        c.stream_eof = (got == 0U);
-        return got > 0U;
+        if (got == 0U) {
+            c.stream_buf_frames = 0U;
+            c.stream_buf_cursor = 0.0;
+            c.stream_eof = true;
+            return false;
+        }
+        if (had_prev) {
+            c.stream_buf.resize((got + 1U) * stride);
+            c.stream_buf[0] = prev0;
+            if (stride == 2U) c.stream_buf[1] = prev1;
+            std::memcpy(c.stream_buf.data() + stride, c.stream_scratch.data(), got * stride * sizeof(float));
+            c.stream_buf_frames = got + 1U;
+        } else {
+            c.stream_buf.swap(c.stream_scratch);
+            c.stream_buf_frames = got;
+        }
+        c.stream_eof = false;
+        return true;
     }
 
-    void mix_stream_channel_locked(std::uint64_t ch_handle, Channel& c, std::size_t frame_count, float* out,
+    void mix_stream_channel_locked(Channel& c, std::size_t frame_count, float* out,
                                    float start_l, float start_r, float dl, float dr, float inv_n,
                                    double step, bool loop) {
         if (!c.stream) {
-            stop_channel_locked(ch_handle, c, true);
+            stop_channel_locked(c, true);
             return;
         }
         const bool stereo = (c.stream->channels() >= 2U);
         for (std::size_t f = 0; f < frame_count; ++f) {
-            while (c.stream_buf_cursor >= static_cast<double>(c.stream_buf_frames)) {
-                const double carry = (c.stream_buf_frames > 0U)
-                                         ? (c.stream_buf_cursor - static_cast<double>(c.stream_buf_frames))
-                                         : 0.0;
+            while (c.stream_buf_frames == 0U ||
+                   c.stream_buf_cursor >= static_cast<double>(c.stream_buf_frames - 1U)) {
+                const bool had_prev = (c.stream_buf_frames > 0U);
+                const double carry = had_prev ? (c.stream_buf_cursor - static_cast<double>(c.stream_buf_frames - 1U))
+                                              : 0.0;
                 if (!refill_stream_locked(c, loop)) {
-                    stop_channel_locked(ch_handle, c, true);
+                    stop_channel_locked(c, true);
                     return;
                 }
-                c.stream_buf_cursor = std::min(carry, static_cast<double>(c.stream_buf_frames - 1U));
+                c.stream_buf_cursor = std::clamp(carry, 0.0, static_cast<double>(c.stream_buf_frames - 1U));
             }
             const auto i0 = static_cast<std::size_t>(c.stream_buf_cursor);
             const std::size_t i1 = (i0 + 1U < c.stream_buf_frames) ? (i0 + 1U) : i0;
@@ -1236,9 +1411,39 @@ private:
         }
     }
 
+    // Advances channel cursors when no open output device is available (or during route recovery)
+    // so `Channel::isPlaying()` and end callbacks never freeze.
+    void advance_silent_locked(std::size_t frame_count) {
+        if (frame_count == 0U || app_paused_) return;
+        const double out_sr = static_cast<double>(std::max<std::uint32_t>(8000U, output_sample_rate_));
+        for (auto& c : channels_) {
+            if (!c.playing || c.paused || !c.sound) continue;
+            const bool loop = ((c.mode & (kFmodLoopNormal | kFmodLoopBidi)) != 0U) &&
+                              ((c.mode & kFmodLoopOff) == 0U);
+            const double delta = (static_cast<double>(std::max(100.0F, c.frequency)) / out_sr) *
+                                 static_cast<double>(frame_count);
+            c.cursor_frame += delta;
+            const std::size_t total = c.sound->total_frames;
+            if (total > 0U && c.cursor_frame >= static_cast<double>(total)) {
+                if (loop) {
+                    c.cursor_frame = std::fmod(c.cursor_frame, static_cast<double>(total));
+                } else {
+                    stop_channel_locked(c, true);
+                }
+            }
+        }
+    }
+
     std::size_t pump_locked(std::size_t target_queued_frames, std::size_t max_block_frames) {
-        if (app_paused_ || audio_device_ == nullptr || !audio_device_->is_open() || max_block_frames == 0U) {
+        if (app_paused_ || max_block_frames == 0U) {
             return 0U;
+        }
+        if (audio_device_ == nullptr || !audio_device_->is_open()) {
+            if (on_device_recover && on_device_recover() && audio_device_ != nullptr && audio_device_->is_open()) {
+                output_sample_rate_ = std::max<std::uint32_t>(8000U, audio_device_->spec().sample_rate);
+            } else {
+                return 0U;
+            }
         }
         output_sample_rate_ = std::max<std::uint32_t>(8000U, audio_device_->spec().sample_rate);
         const std::size_t queued = audio_device_->queued_frames();
@@ -1252,6 +1457,14 @@ private:
             pump_buf_.assign(block * 2U, 0.0F);
             mix_locked(block, pump_buf_.data());
             if (!audio_device_->submit_frames(pump_buf_)) {
+                if (on_device_recover && on_device_recover() && audio_device_->is_open()) {
+                    output_sample_rate_ = std::max<std::uint32_t>(8000U, audio_device_->spec().sample_rate);
+                    if (audio_device_->submit_frames(pump_buf_)) {
+                        submitted += block;
+                        remaining -= block;
+                        continue;
+                    }
+                }
                 break;
             }
             submitted += block;
@@ -1262,8 +1475,20 @@ private:
 
     void worker_loop() {
         std::unique_lock<std::mutex> lock(m_);
+        auto last_tick = std::chrono::steady_clock::now();
         while (!stop_worker_) {
-            (void)pump_locked(2048U, 512U);
+            const auto now = std::chrono::steady_clock::now();
+            const std::size_t pumped = pump_locked(2048U, 512U);
+            if (pumped == 0U && !app_paused_ && (audio_device_ == nullptr || !audio_device_->is_open())) {
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_tick).count();
+                if (us > 0) {
+                    const auto frames = static_cast<std::size_t>(
+                        (static_cast<std::uint64_t>(us) * static_cast<std::uint64_t>(output_sample_rate_)) /
+                        1000000ULL);
+                    advance_silent_locked(std::min<std::size_t>(frames, 4096U));
+                }
+            }
+            last_tick = now;
             worker_cv_.wait_for(lock, std::chrono::microseconds{4000}, [this] { return stop_worker_; });
         }
     }
@@ -1294,12 +1519,11 @@ private:
     wse::platform::AudioListener listener_{};
     CombatHapticsClassifier haptics_{};
     std::map<std::uint64_t, std::shared_ptr<Sound>> sounds_;
-    std::map<std::uint64_t, Channel> channels_;
+    std::vector<Channel> channels_;
     std::vector<PendingCallback> pending_end_callbacks_;
     std::vector<float> pump_buf_;
     std::uint64_t next_handle_ = 0x7F000000U;
     std::uint64_t generation_ = 0U;
-    std::int32_t next_channel_index_ = 0;
     std::atomic<std::size_t> sounds_created_{0U};
 };
 

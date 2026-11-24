@@ -121,7 +121,10 @@ object R4Native {
     )
 
     @JvmStatic
-    external fun nativeGyroSample(radPerSecX: Float, radPerSecY: Float, dtSec: Float)
+    external fun nativeGyroSample(radPerSecX: Float, radPerSecY: Float, dtSec: Float, rotated270: Boolean)
+
+    @JvmStatic
+    external fun nativeSetSurfaceSize(width: Int, height: Int)
 
     @JvmStatic
     external fun nativeSetSafeArea(left: Float, top: Float, right: Float, bottom: Float)

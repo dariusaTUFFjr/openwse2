@@ -10,6 +10,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.input.InputManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -46,17 +47,17 @@ import kotlin.math.roundToInt
 // Phase 5 R5a/R6 live Vulkan presentation & input window (`docs/RECOMP_PLAN.md` "R5", "R6").
 // Runs in its own isolated `:recomp` process so translated fixed-address game mappings and
 // experimental GPU drivers never affect the launcher process.
-class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListener {
+class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListener,
+    InputManager.InputDeviceListener {
 
     private lateinit var surfaceView: SurfaceView
     private lateinit var hudPill: TextView
-    private lateinit var exitButton: TextView
 
     private val started = AtomicBoolean(false)
     private val finishing = AtomicBoolean(false)
     private var hudDimmed = false
 
-    // Live R6 controls & sound preferences (plain player words in the quick drawer).
+    // Live R6 controls & sound preferences (persisted in SharedPreferences; plain player words).
     private var touchOpacity = 0.55f
     private var buttonScale = 1.0f
     private var lookSensitivity = 1.0f
@@ -69,8 +70,9 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
     private var hapticWhenDealing = true
     private var hapticStrength = 60
 
-    // Gamepad state snapshot for XInput 1.3.
-    private var padButtons = 0
+    // Gamepad state snapshot for XInput 1.3 (D-pad keys and analog hat tracked separately).
+    private var padKeyButtons = 0
+    private var padHatButtons = 0
     private var padLt = 0
     private var padRt = 0
     private var padLx = 0
@@ -78,6 +80,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
     private var padRx = 0
     private var padRy = 0
     private var padConnected = false
+    private var inputManager: InputManager? = null
 
     // Optional gyroscope aiming sensor.
     private var sensorManager: SensorManager? = null
@@ -86,11 +89,20 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        loadPrefs()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         window.decorView.setBackgroundColor(Color.BLACK)
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         gyroSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        inputManager = getSystemService(Context.INPUT_SERVICE) as? InputManager
+        inputManager?.registerInputDeviceListener(this, null)
 
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -116,19 +128,30 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             )
         )
 
-        root.setOnApplyWindowInsetsListener { v, insets ->
-            val w = v.width.coerceAtLeast(1).toFloat()
-            val h = v.height.coerceAtLeast(1).toFloat()
-            val cutout = insets.displayCutout
-            if (cutout != null && R4Native.loadError == null) {
+        var lastInsets: WindowInsets? = null
+        fun updateSafeArea(v: View, insets: WindowInsets?) {
+            if (v.width <= 0 || v.height <= 0 || R4Native.loadError != null) return
+            val w = v.width.toFloat()
+            val h = v.height.toFloat()
+            val cutout = insets?.displayCutout
+            if (cutout != null) {
                 R4Native.nativeSetSafeArea(
                     cutout.safeInsetLeft / w,
                     cutout.safeInsetTop / h,
                     cutout.safeInsetRight / w,
                     cutout.safeInsetBottom / h
                 )
+            } else {
+                R4Native.nativeSetSafeArea(0f, 0f, 0f, 0f)
             }
+        }
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            lastInsets = insets
+            updateSafeArea(v, insets)
             insets
+        }
+        root.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            updateSafeArea(v, lastInsets)
         }
 
         val padH = dp(12)
@@ -146,6 +169,10 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                 hudDimmed = !hudDimmed
                 alpha = if (hudDimmed) 0.25f else 1.0f
             }
+            setOnLongClickListener {
+                showQuickDrawer()
+                true
+            }
         }
         root.addView(
             hudPill,
@@ -153,26 +180,6 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply {
-                setMargins(margin, margin, margin, margin)
-            }
-        )
-
-        exitButton = TextView(this).apply {
-            text = "Menu"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(padH, padV, padH, padV)
-            background = pillDrawable(0xCC28221A.toInt())
-            setOnClickListener { showQuickDrawer() }
-        }
-        root.addView(
-            exitButton,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.END
             ).apply {
                 setMargins(margin, margin, margin, margin)
             }
@@ -227,8 +234,11 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        if (started.get() && R4Native.loadError == null) {
-            R4Native.nativeSetSurface(holder.surface)
+        if (R4Native.loadError == null && width > 0 && height > 0) {
+            R4Native.nativeSetSurfaceSize(width, height)
+            if (started.get()) {
+                R4Native.nativeSetSurface(holder.surface)
+            }
         }
     }
 
@@ -238,8 +248,27 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         }
     }
 
+    override fun onInputDeviceAdded(deviceId: Int) {}
+    override fun onInputDeviceChanged(deviceId: Int) {}
+    override fun onInputDeviceRemoved(deviceId: Int) {
+        if (!padConnected || R4Native.loadError != null) return
+        val hasAnyGamepad = InputDevice.getDeviceIds().any { id ->
+            val d = InputDevice.getDevice(id)
+            d != null && ((d.sources and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+                (d.sources and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)
+        }
+        if (!hasAnyGamepad) {
+            padConnected = false
+            padKeyButtons = 0
+            padHatButtons = 0
+            padLt = 0; padRt = 0; padLx = 0; padLy = 0; padRx = 0; padRy = 0
+            pushGamepadState()
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        inputManager?.unregisterInputDeviceListener(this)
         unregisterGyro()
         if (R4Native.loadError == null) {
             try {
@@ -351,7 +380,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             padRt = (rt * 255f).roundToInt().coerceIn(0, 255)
             val hx = event.getAxisValue(MotionEvent.AXIS_HAT_X)
             val hy = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
-            padButtons = (padButtons and 0x000F.inv()) or
+            padHatButtons =
                 (if (hy < -0.5f) 0x0001 else 0) or
                 (if (hy > 0.5f) 0x0002 else 0) or
                 (if (hx < -0.5f) 0x0004 else 0) or
@@ -379,28 +408,45 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) {
             return super.dispatchKeyEvent(event)
         }
-        val padBit = mapGamepadButton(event.keyCode)
-        if (padBit != 0 && ((event.source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
-                (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)
-        ) {
+        val fromGamepad = (event.source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+            (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+        val padBit = if (fromGamepad && event.keyCode == KeyEvent.KEYCODE_BACK) {
+            0x0020 // XINPUT_GAMEPAD_BACK
+        } else {
+            mapGamepadButton(event.keyCode)
+        }
+        if (padBit != 0 && fromGamepad) {
             padConnected = true
-            padButtons = if (down) (padButtons or padBit) else (padButtons and padBit.inv())
+            padKeyButtons = if (down) (padKeyButtons or padBit) else (padKeyButtons and padBit.inv())
             pushGamepadState()
             return true
         }
         val dik = mapAndroidKeyToDik(event.keyCode)
-        if (dik != 0) {
-            R4Native.nativeKeyEvent(dik, event.keyCode, down)
-            if (down && event.unicodeChar != 0 && !event.isCtrlPressed) {
-                R4Native.nativeTextInput(event.unicodeChar.toChar().toString())
+        val vk = mapAndroidKeyToVk(event.keyCode)
+        if (dik != 0 || vk != 0) {
+            R4Native.nativeKeyEvent(dik, vk, down)
+            if (down && !event.isCtrlPressed) {
+                if (event.keyCode == KeyEvent.KEYCODE_DEL) {
+                    R4Native.nativeTextInput("\b")
+                } else if (event.keyCode == KeyEvent.KEYCODE_ENTER || event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER) {
+                    R4Native.nativeTextInput("\n")
+                } else if (event.unicodeChar != 0) {
+                    R4Native.nativeTextInput(event.unicodeChar.toChar().toString())
+                }
             }
+            return true
+        }
+        if (down && event.unicodeChar != 0 && !event.isCtrlPressed) {
+            R4Native.nativeTextInput(event.unicodeChar.toChar().toString())
             return true
         }
         return super.dispatchKeyEvent(event)
     }
 
     private fun pushGamepadState() {
-        R4Native.nativeGamepadState(0, padConnected, padButtons, padLt, padRt, padLx, padLy, padRx, padRy)
+        R4Native.nativeGamepadState(
+            0, padConnected, padKeyButtons or padHatButtons, padLt, padRt, padLx, padLy, padRx, padRy
+        )
     }
 
     private fun mapMouseButton(btn: Int): Int = when (btn) {
@@ -432,22 +478,59 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         KeyEvent.KEYCODE_1 -> 0x02; KeyEvent.KEYCODE_2 -> 0x03; KeyEvent.KEYCODE_3 -> 0x04
         KeyEvent.KEYCODE_4 -> 0x05; KeyEvent.KEYCODE_5 -> 0x06; KeyEvent.KEYCODE_6 -> 0x07
         KeyEvent.KEYCODE_7 -> 0x08; KeyEvent.KEYCODE_8 -> 0x09; KeyEvent.KEYCODE_9 -> 0x0A
-        KeyEvent.KEYCODE_0 -> 0x0B; KeyEvent.KEYCODE_DEL -> 0x0E; KeyEvent.KEYCODE_TAB -> 0x0F
+        KeyEvent.KEYCODE_0 -> 0x0B; KeyEvent.KEYCODE_MINUS -> 0x0C; KeyEvent.KEYCODE_EQUALS -> 0x0D
+        KeyEvent.KEYCODE_DEL -> 0x0E; KeyEvent.KEYCODE_TAB -> 0x0F
         KeyEvent.KEYCODE_Q -> 0x10; KeyEvent.KEYCODE_W -> 0x11; KeyEvent.KEYCODE_E -> 0x12
         KeyEvent.KEYCODE_R -> 0x13; KeyEvent.KEYCODE_T -> 0x14; KeyEvent.KEYCODE_Y -> 0x15
         KeyEvent.KEYCODE_U -> 0x16; KeyEvent.KEYCODE_I -> 0x17; KeyEvent.KEYCODE_O -> 0x18
-        KeyEvent.KEYCODE_P -> 0x19; KeyEvent.KEYCODE_ENTER -> 0x1C
-        KeyEvent.KEYCODE_CTRL_LEFT -> 0x1D; KeyEvent.KEYCODE_A -> 0x1E; KeyEvent.KEYCODE_S -> 0x1F
+        KeyEvent.KEYCODE_P -> 0x19; KeyEvent.KEYCODE_LEFT_BRACKET -> 0x1A; KeyEvent.KEYCODE_RIGHT_BRACKET -> 0x1B
+        KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> 0x1C
+        KeyEvent.KEYCODE_CTRL_LEFT -> 0x1D; KeyEvent.KEYCODE_CTRL_RIGHT -> 0x9D
+        KeyEvent.KEYCODE_A -> 0x1E; KeyEvent.KEYCODE_S -> 0x1F
         KeyEvent.KEYCODE_D -> 0x20; KeyEvent.KEYCODE_F -> 0x21; KeyEvent.KEYCODE_G -> 0x22
         KeyEvent.KEYCODE_H -> 0x23; KeyEvent.KEYCODE_J -> 0x24; KeyEvent.KEYCODE_K -> 0x25
-        KeyEvent.KEYCODE_L -> 0x26; KeyEvent.KEYCODE_SHIFT_LEFT -> 0x2A
+        KeyEvent.KEYCODE_L -> 0x26; KeyEvent.KEYCODE_SEMICOLON -> 0x27; KeyEvent.KEYCODE_APOSTROPHE -> 0x28
+        KeyEvent.KEYCODE_GRAVE -> 0x29; KeyEvent.KEYCODE_SHIFT_LEFT -> 0x2A; KeyEvent.KEYCODE_BACKSLASH -> 0x2B
         KeyEvent.KEYCODE_Z -> 0x2C; KeyEvent.KEYCODE_X -> 0x2D; KeyEvent.KEYCODE_C -> 0x2E
         KeyEvent.KEYCODE_V -> 0x2F; KeyEvent.KEYCODE_B -> 0x30; KeyEvent.KEYCODE_N -> 0x31
-        KeyEvent.KEYCODE_M -> 0x32; KeyEvent.KEYCODE_SPACE -> 0x39
+        KeyEvent.KEYCODE_M -> 0x32; KeyEvent.KEYCODE_COMMA -> 0x33; KeyEvent.KEYCODE_PERIOD -> 0x34
+        KeyEvent.KEYCODE_SLASH -> 0x35; KeyEvent.KEYCODE_SHIFT_RIGHT -> 0x36
+        KeyEvent.KEYCODE_ALT_LEFT -> 0x38; KeyEvent.KEYCODE_ALT_RIGHT -> 0xB8
+        KeyEvent.KEYCODE_SPACE -> 0x39
         KeyEvent.KEYCODE_F1 -> 0x3B; KeyEvent.KEYCODE_F2 -> 0x3C; KeyEvent.KEYCODE_F3 -> 0x3D
-        KeyEvent.KEYCODE_F4 -> 0x3E; KeyEvent.KEYCODE_F5 -> 0x3F; KeyEvent.KEYCODE_F12 -> 0x58
-        KeyEvent.KEYCODE_DPAD_UP -> 0xC8; KeyEvent.KEYCODE_DPAD_LEFT -> 0xCB
-        KeyEvent.KEYCODE_DPAD_RIGHT -> 0xCD; KeyEvent.KEYCODE_DPAD_DOWN -> 0xD0
+        KeyEvent.KEYCODE_F4 -> 0x3E; KeyEvent.KEYCODE_F5 -> 0x3F; KeyEvent.KEYCODE_F6 -> 0x40
+        KeyEvent.KEYCODE_F7 -> 0x41; KeyEvent.KEYCODE_F8 -> 0x42; KeyEvent.KEYCODE_F9 -> 0x43
+        KeyEvent.KEYCODE_F10 -> 0x44; KeyEvent.KEYCODE_F11 -> 0x57; KeyEvent.KEYCODE_F12 -> 0x58
+        KeyEvent.KEYCODE_MOVE_HOME -> 0xC7; KeyEvent.KEYCODE_DPAD_UP -> 0xC8; KeyEvent.KEYCODE_PAGE_UP -> 0xC9
+        KeyEvent.KEYCODE_DPAD_LEFT -> 0xCB; KeyEvent.KEYCODE_DPAD_RIGHT -> 0xCD
+        KeyEvent.KEYCODE_MOVE_END -> 0xCF; KeyEvent.KEYCODE_DPAD_DOWN -> 0xD0; KeyEvent.KEYCODE_PAGE_DOWN -> 0xD1
+        KeyEvent.KEYCODE_FORWARD_DEL -> 0xD3
+        else -> 0
+    }
+
+    private fun mapAndroidKeyToVk(keyCode: Int): Int = when (keyCode) {
+        KeyEvent.KEYCODE_DEL -> 0x08          // VK_BACK
+        KeyEvent.KEYCODE_TAB -> 0x09          // VK_TAB
+        KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> 0x0D // VK_RETURN
+        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT -> 0x10 // VK_SHIFT
+        KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT -> 0x11   // VK_CONTROL
+        KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT -> 0x12     // VK_MENU
+        KeyEvent.KEYCODE_ESCAPE -> 0x1B       // VK_ESCAPE
+        KeyEvent.KEYCODE_SPACE -> 0x20        // VK_SPACE
+        KeyEvent.KEYCODE_PAGE_UP -> 0x21; KeyEvent.KEYCODE_PAGE_DOWN -> 0x22
+        KeyEvent.KEYCODE_MOVE_END -> 0x23; KeyEvent.KEYCODE_MOVE_HOME -> 0x24
+        KeyEvent.KEYCODE_DPAD_LEFT -> 0x25; KeyEvent.KEYCODE_DPAD_UP -> 0x26
+        KeyEvent.KEYCODE_DPAD_RIGHT -> 0x27; KeyEvent.KEYCODE_DPAD_DOWN -> 0x28
+        KeyEvent.KEYCODE_FORWARD_DEL -> 0x2E  // VK_DELETE
+        in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> 0x30 + (keyCode - KeyEvent.KEYCODE_0)
+        in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z -> 0x41 + (keyCode - KeyEvent.KEYCODE_A)
+        in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12 -> 0x70 + (keyCode - KeyEvent.KEYCODE_F1)
+        KeyEvent.KEYCODE_SEMICOLON -> 0xBA; KeyEvent.KEYCODE_EQUALS -> 0xBB
+        KeyEvent.KEYCODE_COMMA -> 0xBC; KeyEvent.KEYCODE_MINUS -> 0xBD
+        KeyEvent.KEYCODE_PERIOD -> 0xBE; KeyEvent.KEYCODE_SLASH -> 0xBF
+        KeyEvent.KEYCODE_GRAVE -> 0xC0; KeyEvent.KEYCODE_LEFT_BRACKET -> 0xDB
+        KeyEvent.KEYCODE_BACKSLASH -> 0xDC; KeyEvent.KEYCODE_RIGHT_BRACKET -> 0xDD
+        KeyEvent.KEYCODE_APOSTROPHE -> 0xDE
         else -> 0
     }
 
@@ -467,13 +550,19 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         lastGyroNs = 0L
     }
 
+    @Suppress("DEPRECATION")
     override fun onSensorChanged(event: SensorEvent) {
         if (!gyroEnabled || !started.get() || R4Native.loadError != null) return
         if (event.sensor.type != Sensor.TYPE_GYROSCOPE) return
         val nowNs = event.timestamp
         if (lastGyroNs != 0L && nowNs > lastGyroNs) {
             val dt = (nowNs - lastGyroNs) * 1e-9f
-            R4Native.nativeGyroSample(event.values[0], event.values[1], dt)
+            val rot = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                display?.rotation ?: Surface.ROTATION_90
+            } else {
+                windowManager.defaultDisplay?.rotation ?: Surface.ROTATION_90
+            }
+            R4Native.nativeGyroSample(event.values[0], event.values[1], dt, rot == Surface.ROTATION_270)
         }
         lastGyroNs = nowNs
     }
@@ -513,8 +602,18 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                 .setView(input)
                 .setPositiveButton("Send") { _, _ ->
                     val txt = input.text?.toString().orEmpty()
-                    if (txt.isNotEmpty() && R4Native.loadError == null) {
-                        R4Native.nativeTextInput(txt)
+                    if (R4Native.loadError == null) {
+                        if (txt.isNotEmpty()) {
+                            R4Native.nativeTextInput(txt)
+                        } else {
+                            R4Native.nativeTextInput("\n")
+                        }
+                    }
+                    applyImmersiveFullscreen()
+                }
+                .setNeutralButton("Backspace") { _, _ ->
+                    if (R4Native.loadError == null) {
+                        R4Native.nativeTextInput("\b")
                     }
                     applyImmersiveFullscreen()
                 }
@@ -548,16 +647,18 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                 })
             }
 
-            fun addSlider(label: String, max: Int, value: Int, onChange: (Int) -> Unit) {
-                val tv = TextView(this).apply { text = "$label: $value%" }
+            fun addSlider(label: String, min: Int, max: Int, value: Int, onChange: (Int) -> Unit) {
+                val cur = value.coerceIn(min, max)
+                val tv = TextView(this).apply { text = "$label: $cur%" }
                 container.addView(tv)
                 container.addView(SeekBar(this).apply {
-                    this.max = max
-                    progress = value.coerceIn(0, max)
+                    this.max = (max - min).coerceAtLeast(1)
+                    progress = (cur - min).coerceIn(0, this.max)
                     setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                         override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                            tv.text = "$label: $p%"
-                            onChange(p)
+                            val actual = min + p
+                            tv.text = "$label: $actual%"
+                            onChange(actual)
                             pushLiveConfig()
                         }
                         override fun onStartTrackingTouch(sb: SeekBar?) {}
@@ -572,19 +673,19 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                 gyroEnabled = it
                 if (it) registerGyroIfEnabled() else unregisterGyro()
             }
-            addSlider("Touch opacity", 100, (touchOpacity * 100f).roundToInt()) {
+            addSlider("Touch opacity", 20, 100, (touchOpacity * 100f).roundToInt()) {
                 touchOpacity = (it / 100f).coerceIn(0.2f, 1.0f)
             }
-            addSlider("Look speed", 200, (lookSensitivity * 100f).roundToInt()) {
+            addSlider("Look speed", 25, 200, (lookSensitivity * 100f).roundToInt()) {
                 lookSensitivity = (it / 100f).coerceIn(0.25f, 2.0f)
             }
-            addSlider("Sound volume", 100, (soundVolume * 100f).roundToInt()) {
+            addSlider("Sound volume", 0, 100, (soundVolume * 100f).roundToInt()) {
                 soundVolume = (it / 100f).coerceIn(0.0f, 1.0f)
             }
             addCheck("Vibrate on hits", hapticsEnabled) { hapticsEnabled = it }
             addCheck("Vibrate when you are hit", hapticWhenHit) { hapticWhenHit = it }
             addCheck("Vibrate when you land a hit", hapticWhenDealing) { hapticWhenDealing = it }
-            addSlider("Vibration strength", 100, hapticStrength) {
+            addSlider("Vibration strength", 10, 100, hapticStrength) {
                 hapticStrength = it.coerceIn(10, 100)
             }
 
@@ -600,7 +701,39 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         }
     }
 
+    private fun loadPrefs() {
+        val sp = getSharedPreferences("wse2_r6_prefs", Context.MODE_PRIVATE)
+        touchOpacity = sp.getFloat("touchOpacity", 0.55f).coerceIn(0.2f, 1.0f)
+        buttonScale = sp.getFloat("buttonScale", 1.0f).coerceIn(0.7f, 1.45f)
+        lookSensitivity = sp.getFloat("lookSensitivity", 1.0f).coerceIn(0.25f, 2.0f)
+        aimHold = sp.getBoolean("aimHold", true)
+        gyroEnabled = sp.getBoolean("gyroEnabled", false)
+        showTouchControls = sp.getBoolean("showTouchControls", true)
+        soundVolume = sp.getFloat("soundVolume", 1.0f).coerceIn(0.0f, 1.0f)
+        hapticsEnabled = sp.getBoolean("hapticsEnabled", true)
+        hapticWhenHit = sp.getBoolean("hapticWhenHit", true)
+        hapticWhenDealing = sp.getBoolean("hapticWhenDealing", true)
+        hapticStrength = sp.getInt("hapticStrength", 60).coerceIn(10, 100)
+    }
+
+    private fun savePrefs() {
+        getSharedPreferences("wse2_r6_prefs", Context.MODE_PRIVATE).edit()
+            .putFloat("touchOpacity", touchOpacity)
+            .putFloat("buttonScale", buttonScale)
+            .putFloat("lookSensitivity", lookSensitivity)
+            .putBoolean("aimHold", aimHold)
+            .putBoolean("gyroEnabled", gyroEnabled)
+            .putBoolean("showTouchControls", showTouchControls)
+            .putFloat("soundVolume", soundVolume)
+            .putBoolean("hapticsEnabled", hapticsEnabled)
+            .putBoolean("hapticWhenHit", hapticWhenHit)
+            .putBoolean("hapticWhenDealing", hapticWhenDealing)
+            .putInt("hapticStrength", hapticStrength)
+            .apply()
+    }
+
     private fun pushLiveConfig() {
+        savePrefs()
         if (R4Native.loadError != null) return
         R4Native.nativeSetTouchConfig(
             touchOpacity, buttonScale, lookSensitivity, aimHold, gyroEnabled, showTouchControls
@@ -613,7 +746,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
     private fun startGameThread(initialSurface: Surface) {
         val loadErr = R4Native.loadError
         if (loadErr != null) {
-            updateHud("libwse_r0.so load failed: $loadErr")
+            updateHud("Could not start the game engine.")
             exitAndFinish()
             return
         }
@@ -681,7 +814,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                 1
             }
             runOnUiThread {
-                updateHud("The game stopped (code $rc)")
+                updateHud(if (rc == 0) "Game closed." else "The game stopped unexpectedly.")
                 exitAndFinish()
             }
         }, "wse-r5a-vulkan").start()

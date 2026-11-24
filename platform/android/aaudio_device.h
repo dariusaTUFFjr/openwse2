@@ -34,46 +34,38 @@ public:
         if (requested.sample_rate == 0U || requested.channels != 2U) {
             return false;
         }
-        AAudioStreamBuilder* builder = nullptr;
-        if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK || builder == nullptr) {
+        requested_spec_ = requested;
+        needs_reopen_.store(false, std::memory_order_release);
+        return open_stream_internal(requested, /*preserve_paused=*/false);
+    }
+
+    // Reopens the AAudio stream on the worker thread after a headphone/Bluetooth route change or
+    // audio-server disconnect (`AAUDIO_ERROR_DISCONNECTED`). Safe to call periodically.
+    bool recover_if_needed() {
+        bool need = needs_reopen_.exchange(false, std::memory_order_acq_rel);
+        if (!need && stream_ != nullptr) {
+            const aaudio_stream_state_t st = AAudioStream_getState(stream_);
+            if (st == AAUDIO_STREAM_STATE_DISCONNECTED || st == AAUDIO_STREAM_STATE_CLOSED) {
+                need = true;
+            }
+        }
+        if (!need) {
+            return is_open();
+        }
+        const bool was_paused = paused_.load(std::memory_order_acquire);
+        close();
+        if (requested_spec_.sample_rate == 0U || requested_spec_.channels != 2U) {
             return false;
         }
-        AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
-        AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
-        AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-        AAudioStreamBuilder_setChannelCount(builder, 2);
-        AAudioStreamBuilder_setSampleRate(builder, static_cast<int32_t>(requested.sample_rate));
-        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
-        AAudioStreamBuilder_setDataCallback(builder, &AAudioDevice::data_callback, this);
-
-        AAudioStream* stream = nullptr;
-        const aaudio_result_t open_res = AAudioStreamBuilder_openStream(builder, &stream);
-        AAudioStreamBuilder_delete(builder);
-        if (open_res != AAUDIO_OK || stream == nullptr) {
-            return false;
+        const bool ok = open_stream_internal(requested_spec_, /*preserve_paused=*/true);
+        if (ok && was_paused) {
+            set_paused(true);
         }
+        return ok;
+    }
 
-        const int32_t actual_sr = AAudioStream_getSampleRate(stream);
-        spec_.sample_rate = actual_sr > 0 ? static_cast<std::uint32_t>(actual_sr) : requested.sample_rate;
-        spec_.channels = 2U;
-
-        // Power-of-two ring buffer holding ~340 ms of stereo float audio at 48 kHz (16384 frames).
-        ring_frames_ = 16384U;
-        ring_mask_ = ring_frames_ - 1U;
-        ring_.assign(ring_frames_ * 2U, 0.0F);
-        read_pos_.store(0U, std::memory_order_relaxed);
-        write_pos_.store(0U, std::memory_order_relaxed);
-        paused_.store(false, std::memory_order_relaxed);
-        stream_ = stream;
-
-        if (AAudioStream_requestStart(stream_) != AAUDIO_OK) {
-            AAudioStream_close(stream_);
-            stream_ = nullptr;
-            return false;
-        }
-        open_ = true;
-        return true;
+    [[nodiscard]] bool needs_recovery() const noexcept {
+        return needs_reopen_.load(std::memory_order_acquire);
     }
 
     void close() override {
@@ -91,7 +83,7 @@ public:
     [[nodiscard]] AudioDeviceSpec spec() const noexcept override { return spec_; }
 
     bool submit_frames(std::span<const float> interleaved_stereo) override {
-        if (!is_open() || (interleaved_stereo.size() & 1U) != 0U) {
+        if (!is_open() || needs_reopen_.load(std::memory_order_acquire) || (interleaved_stereo.size() & 1U) != 0U) {
             return false;
         }
         const std::size_t frames = interleaved_stereo.size() / 2U;
@@ -117,6 +109,9 @@ public:
     }
 
     [[nodiscard]] std::size_t queued_frames() const noexcept override {
+        if (needs_reopen_.load(std::memory_order_acquire)) {
+            return 0U;
+        }
         const std::size_t r = read_pos_.load(std::memory_order_acquire);
         const std::size_t w = write_pos_.load(std::memory_order_acquire);
         return (w >= r) ? (w - r) : 0U;
@@ -172,7 +167,61 @@ private:
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
 
+    static void error_callback(AAudioStream*, void* user_data, aaudio_result_t) {
+        auto* self = static_cast<AAudioDevice*>(user_data);
+        if (self != nullptr) {
+            self->needs_reopen_.store(true, std::memory_order_release);
+        }
+    }
+
+    bool open_stream_internal(const AudioDeviceSpec& requested, bool preserve_paused) {
+        AAudioStreamBuilder* builder = nullptr;
+        if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK || builder == nullptr) {
+            return false;
+        }
+        AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+        AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+        AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+        AAudioStreamBuilder_setChannelCount(builder, 2);
+        AAudioStreamBuilder_setSampleRate(builder, static_cast<int32_t>(requested.sample_rate));
+        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
+        AAudioStreamBuilder_setDataCallback(builder, &AAudioDevice::data_callback, this);
+        AAudioStreamBuilder_setErrorCallback(builder, &AAudioDevice::error_callback, this);
+
+        AAudioStream* stream = nullptr;
+        const aaudio_result_t open_res = AAudioStreamBuilder_openStream(builder, &stream);
+        AAudioStreamBuilder_delete(builder);
+        if (open_res != AAUDIO_OK || stream == nullptr) {
+            return false;
+        }
+
+        const int32_t actual_sr = AAudioStream_getSampleRate(stream);
+        spec_.sample_rate = actual_sr > 0 ? static_cast<std::uint32_t>(actual_sr) : requested.sample_rate;
+        spec_.channels = 2U;
+
+        // Power-of-two ring buffer holding ~340 ms of stereo float audio at 48 kHz (16384 frames).
+        ring_frames_ = 16384U;
+        ring_mask_ = ring_frames_ - 1U;
+        ring_.assign(ring_frames_ * 2U, 0.0F);
+        read_pos_.store(0U, std::memory_order_relaxed);
+        write_pos_.store(0U, std::memory_order_relaxed);
+        if (!preserve_paused) {
+            paused_.store(false, std::memory_order_relaxed);
+        }
+        stream_ = stream;
+
+        if (AAudioStream_requestStart(stream_) != AAUDIO_OK) {
+            AAudioStream_close(stream_);
+            stream_ = nullptr;
+            return false;
+        }
+        open_ = true;
+        return true;
+    }
+
     AAudioStream* stream_ = nullptr;
+    AudioDeviceSpec requested_spec_{};
     AudioDeviceSpec spec_{};
     bool open_ = false;
     std::size_t ring_frames_ = 0U;
@@ -181,6 +230,7 @@ private:
     std::atomic<std::size_t> read_pos_{0U};
     std::atomic<std::size_t> write_pos_{0U};
     std::atomic<bool> paused_{false};
+    std::atomic<bool> needs_reopen_{false};
 };
 
 }  // namespace wse::platform

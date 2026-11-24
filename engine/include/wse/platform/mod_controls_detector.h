@@ -14,6 +14,7 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -143,14 +144,17 @@ inline void scan_mission_template_keys(std::string_view text, std::array<bool, 2
         }
         const std::string_view tok = text.substr(start, i - start);
         bool all_digits = !tok.empty();
-        std::int64_t val = 0;
+        std::uint64_t val = 0U;
+        bool overflow = false;
         for (char c : tok) {
             if (c < '0' || c > '9') {
                 all_digits = false;
                 break;
             }
-            if (val < 1000000000LL) {
-                val = val * 10LL + static_cast<std::int64_t>(c - '0');
+            if (val <= 1800000000000000000ULL) {
+                val = val * 10ULL + static_cast<std::uint64_t>(c - '0');
+            } else {
+                overflow = true;
             }
         }
         if (!all_digits) {
@@ -158,13 +162,14 @@ inline void scan_mission_template_keys(std::string_view text, std::array<bool, 2
             prev1 = -1;
             continue;
         }
-        // Check for `(70|71) 1 <key_code>` or negated `(2147483718|2147483719) 1 <key_code>`.
-        const std::int64_t op = prev2 & 0xFFFFLL;
-        if ((op == 70 || op == 71) && prev1 == 1 && val > 0 && val < 256) {
+        // Check for `(70|71) 1 <key_code>` or negated `(0x80000000 | (70|71)) 1 <key_code>`.
+        // Ignore 64-bit global-variable / register IDs (>= 256) and unrelated opcodes.
+        const std::uint64_t op_u = (prev2 >= 0) ? (static_cast<std::uint64_t>(prev2) & ~0x80000000ULL) : 0ULL;
+        if (!overflow && (op_u == 70ULL || op_u == 71ULL) && prev1 == 1 && val > 0U && val < 256U) {
             keys_used[static_cast<std::size_t>(val)] = true;
         }
         prev2 = prev1;
-        prev1 = val;
+        prev1 = overflow ? -1 : static_cast<std::int64_t>(val);
     }
 }
 
@@ -248,9 +253,12 @@ inline bool contains_any(std::string_view haystack, std::initializer_list<std::s
         out.buttons.push_back(std::move(btn));
     };
 
+    // Many popular mods (PBOD, Phantasy, Warsword, Viking Conquest) store configurable hotkeys
+    // in global variables (`71 1 144115188075856xxx`), so immediate DIK literals are optional
+    // when a module's scripts/strings/presentations already confirm the mechanic.
     const bool has_mt_keys = std::any_of(mt_keys.begin(), mt_keys.end(), [](bool v) { return v; });
-    const auto key_active = [&](std::uint8_t dik) noexcept {
-        return !has_mt_keys || mt_keys[dik];
+    const auto key_active = [&](std::uint8_t dik, bool confirmed_by_corpus = true) noexcept {
+        return confirmed_by_corpus || !has_mt_keys || mt_keys[dik];
     };
 
     // 1. Arcane Magic / Spells (Phantasy Calradia, Warsword Conquest, etc.)
@@ -524,8 +532,10 @@ inline bool contains_any(std::string_view haystack, std::initializer_list<std::s
         out.crouch_supported = true;
     }
 
-    // 15. Tactical Battle Map (`Backspace`) when battle-map / PBOD presentation is detected
-    if (mod_detect_detail::contains_any(corpus, {"battle_map", "tactical_map", "prsnt_battle"}) &&
+    // 15. Tactical Battle Map (`Backspace`) when a mod battle-map / PBOD presentation is detected
+    // (avoid matching vanilla Native's `prsnt_battle` so Native stays clean).
+    if (mod_detect_detail::contains_any(corpus, {"prsnt_pbod_battle", "tactical_map", "pbod_minimap",
+                                                 "battle_minimap", "world_of_vasnar", "108_heroes"}) &&
         key_active(mod_detect_detail::kDikBackspace)) {
         add_unique(DetectedModButton{
             "mod_tactical_map",

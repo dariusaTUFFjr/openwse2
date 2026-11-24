@@ -85,6 +85,7 @@ inline constexpr std::uint8_t kUp = 0xC8U;
 inline constexpr std::uint8_t kLeft = 0xCBU;
 inline constexpr std::uint8_t kRight = 0xCDU;
 inline constexpr std::uint8_t kDown = 0xD0U;
+inline constexpr std::uint8_t kHome = 0xC7U;
 }  // namespace dik
 
 enum class TouchScene : std::uint8_t {
@@ -269,8 +270,74 @@ public:
         const std::lock_guard<std::mutex> lock(m_);
         screen_w_ = std::max(1, width);
         screen_h_ = std::max(1, height);
+        if (surface_w_ <= 0 || surface_h_ <= 0) {
+            surface_w_ = screen_w_;
+            surface_h_ = screen_h_;
+        }
         cursor_x_ = std::clamp(cursor_x_, 0, screen_w_ - 1);
         cursor_y_ = std::clamp(cursor_y_, 0, screen_h_ - 1);
+    }
+
+    // Tracks the live Android SurfaceView / DeX / external display pixel size so touch and mouse
+    // coordinates are inverse-mapped through the same letterbox rect used by Vulkan Present.
+    void set_surface_size(int width, int height) {
+        const std::lock_guard<std::mutex> lock(m_);
+        surface_w_ = std::max(1, width);
+        surface_h_ = std::max(1, height);
+    }
+
+    // Releases all held touches, stick keys, mouse buttons, and modifiers (called on app pause).
+    void release_all() {
+        PostWindowMsgFn sink;
+        int cx = 0;
+        int cy = 0;
+        bool release_lmb = false;
+        bool release_rmb = false;
+        {
+            const std::lock_guard<std::mutex> lock(m_);
+            sink = post_msg_;
+            cx = cursor_x_;
+            cy = cursor_y_;
+            touches_.clear();
+            stick_pointer_ = -1;
+            update_stick_keys_locked(0.0F, 0.0F);
+            attack_slide_active_ = false;
+            zoom_active_ = false;
+            dismount_frames_ = 0;
+            if (pulse_release_dik_ != 0U) {
+                set_key_locked(pulse_release_dik_, false);
+                pulse_release_dik_ = 0U;
+            }
+            pulse_release_ctrl_ = false;
+            pulse_release_shift_ = false;
+            pulse_release_alt_ = false;
+            phys_ctrl_ = false;
+            phys_shift_ = false;
+            phys_alt_ = false;
+            pad_ctrl_ = false;
+            pad_shift_ = false;
+            for (auto& b : buttons_) {
+                if (b.pressed) {
+                    b.pressed = false;
+                    if (b.dik_code != 0U) set_key_locked(b.dik_code, false);
+                }
+            }
+            if (mouse_buttons_[0] != 0U) {
+                set_mouse_button_locked(0, false);
+                release_lmb = true;
+            }
+            if (mouse_buttons_[1] != 0U) {
+                set_mouse_button_locked(1, false);
+                release_rmb = true;
+            }
+            tap_phase_ = TapPhase::idle;
+            tap_release_queued_ = false;
+            recompute_modifiers_locked();
+        }
+        if (sink) {
+            if (release_lmb) sink(0x0202U, 0U, pack_lparam(cx, cy));
+            if (release_rmb) sink(0x0205U, 0U, pack_lparam(cx, cy));
+        }
     }
 
     void set_safe_area(const wse::platform::SafeAreaInsets& insets) {
@@ -335,6 +402,7 @@ public:
         const std::lock_guard<std::mutex> lock(m_);
         cursor_visible_ = visible;
         if (!manual_scene_override_) {
+            const TouchScene prev = scene_;
             if (!visible) {
                 if (scene_ != TouchScene::orders) {
                     scene_ = TouchScene::battle;
@@ -342,6 +410,9 @@ public:
                 reset_menu_zoom_locked();
             } else if (scene_ == TouchScene::battle || scene_ == TouchScene::orders) {
                 scene_ = inferred_ui_scene_;
+            }
+            if (scene_ != prev) {
+                on_scene_changed_locked(prev, scene_);
             }
         }
     }
@@ -357,9 +428,13 @@ public:
             inferred_ui_scene_ = s;
         }
         if (!manual_scene_override_) {
+            const TouchScene prev = scene_;
             scene_ = s;
             if (s == TouchScene::battle || s == TouchScene::orders) {
                 reset_menu_zoom_locked();
+            }
+            if (scene_ != prev) {
+                on_scene_changed_locked(prev, scene_);
             }
         }
     }
@@ -390,7 +465,18 @@ public:
         {
             const std::lock_guard<std::mutex> lock(m_);
             input_mode_ = ActiveInputMode::keyboard_mouse;
-            set_key_locked(dik_code, down);
+            if (dik_code == dik::kLCtrl) {
+                phys_ctrl_ = down;
+                recompute_modifiers_locked();
+            } else if (dik_code == dik::kLShift) {
+                phys_shift_ = down;
+                recompute_modifiers_locked();
+            } else if (dik_code == dik::kLAlt) {
+                phys_alt_ = down;
+                recompute_modifiers_locked();
+            } else {
+                set_key_locked(dik_code, down);
+            }
             sink = post_msg_;
         }
         if (sink && vk_code != 0U) {
@@ -445,10 +531,12 @@ public:
         {
             const std::lock_guard<std::mutex> lock(m_);
             input_mode_ = ActiveInputMode::keyboard_mouse;
-            const int nx = std::clamp(x, 0, screen_w_ - 1);
-            const int ny = std::clamp(y, 0, screen_h_ - 1);
-            mouse_dx_ += (nx - cursor_x_);
-            mouse_dy_ += (ny - cursor_y_);
+            float bbx = static_cast<float>(x);
+            float bby = static_cast<float>(y);
+            map_surface_to_backbuffer_locked(bbx, bby);
+            const int nx = std::clamp(static_cast<int>(std::lround(bbx)), 0, screen_w_ - 1);
+            const int ny = std::clamp(static_cast<int>(std::lround(bby)), 0, screen_h_ - 1);
+            add_mouse_delta_float_locked(static_cast<float>(nx - cursor_x_), static_cast<float>(ny - cursor_y_));
             cursor_x_ = nx;
             cursor_y_ = ny;
             cx = cursor_x_;
@@ -525,31 +613,44 @@ public:
         }
 
         // Player 0 gamepad -> v4.3-style Warband QoL shortcuts when connected.
-        if (user_index == 0U && state.connected) {
-            constexpr std::uint16_t kBtnLb = 0x0100U;
-            // L1 (LB) on Campaign Map -> Fast Travel (Ctrl+Space)
-            if (scene_ == TouchScene::campaign_map) {
-                const bool lb_now = (state.buttons & kBtnLb) != 0U;
-                const bool lb_prev = (prev.buttons & kBtnLb) != 0U;
-                if (lb_now != lb_prev) {
-                    set_key_locked(dik::kLCtrl, lb_now);
-                    set_key_locked(dik::kSpace, lb_now);
+        if (user_index == 0U) {
+            if (!state.connected) {
+                if (pad_ctrl_ || pad_shift_) {
+                    pad_ctrl_ = false;
+                    pad_shift_ = false;
+                    recompute_modifiers_locked();
                 }
-            }
-            // L2 / R2 on Party screen -> Move Stack (Ctrl) / Move 10 (Shift)
-            if (scene_ == TouchScene::party) {
-                const bool lt_now = state.left_trigger > 80U;
-                const bool lt_prev = prev.left_trigger > 80U;
-                const bool rt_now = state.right_trigger > 80U;
-                const bool rt_prev = prev.right_trigger > 80U;
-                if (lt_now != lt_prev) set_key_locked(dik::kLCtrl, lt_now);
-                if (rt_now != rt_prev) set_key_locked(dik::kLShift, rt_now);
+            } else {
+                constexpr std::uint16_t kBtnLb = 0x0100U;
+                bool want_ctrl = false;
+                bool want_shift = false;
+                // L1 (LB) on Campaign Map -> Fast Travel (Ctrl+Space)
+                if (scene_ == TouchScene::campaign_map) {
+                    const bool lb_now = (state.buttons & kBtnLb) != 0U;
+                    const bool lb_prev = (prev.buttons & kBtnLb) != 0U;
+                    want_ctrl = lb_now;
+                    if (lb_now != lb_prev) {
+                        set_key_locked(dik::kSpace, lb_now);
+                    }
+                }
+                // L2 / R2 on Party screen -> Move Stack (Ctrl) / Move 10 (Shift)
+                if (scene_ == TouchScene::party) {
+                    want_ctrl = state.left_trigger > 80U;
+                    want_shift = state.right_trigger > 80U;
+                }
+                if (want_ctrl != pad_ctrl_ || want_shift != pad_shift_) {
+                    pad_ctrl_ = want_ctrl;
+                    pad_shift_ = want_shift;
+                    recompute_modifiers_locked();
+                }
             }
         }
     }
 
     // ---- Opt-in Gyro Aiming (active only while zooming/aiming when enabled) ----
-    void on_gyro_sample(float rad_per_sec_x, float rad_per_sec_y, float dt_sec) {
+    // Android TYPE_GYROSCOPE in landscape (ROTATION_90): values[0] (device X, vertical) = yaw,
+    // values[1] (device Y, horizontal) = pitch. Under ROTATION_270 both axes flip sign.
+    void on_gyro_sample(float rad_per_sec_x, float rad_per_sec_y, float dt_sec, bool rotated_270 = false) {
         const std::lock_guard<std::mutex> lock(m_);
         if (!cfg_.gyro_enabled || !zoom_active_ || scene_ != TouchScene::battle) {
             return;
@@ -560,12 +661,12 @@ public:
         // Low-pass filter (alpha = 0.35) + small deadzone to suppress hand tremor.
         gyro_lp_x_ = gyro_lp_x_ * 0.65F + rad_per_sec_x * 0.35F;
         gyro_lp_y_ = gyro_lp_y_ * 0.65F + rad_per_sec_y * 0.35F;
-        const float gx = (std::fabs(gyro_lp_x_) < 0.025F) ? 0.0F : gyro_lp_x_;
-        const float gy = (std::fabs(gyro_lp_y_) < 0.025F) ? 0.0F : gyro_lp_y_;
+        const float yaw_rate = (std::fabs(gyro_lp_x_) < 0.025F) ? 0.0F : gyro_lp_x_;
+        const float pitch_rate = (std::fabs(gyro_lp_y_) < 0.025F) ? 0.0F : gyro_lp_y_;
         const float scale = 320.0F * cfg_.gyro_sensitivity * cfg_.aim_sensitivity * dt_sec;
+        const float rot_sign = rotated_270 ? -1.0F : 1.0F;
         const float sy = cfg_.gyro_invert_y ? -1.0F : 1.0F;
-        mouse_dx_ += static_cast<int>(std::lround(-gy * scale));
-        mouse_dy_ += static_cast<int>(std::lround(-gx * scale * sy));
+        add_mouse_delta_float_locked(-yaw_rate * scale * rot_sign, -pitch_rate * scale * rot_sign * sy);
     }
 
     // ---- Android Multi-Touch Input (`action`: 0=DOWN, 1=UP, 2=MOVE, 3=CANCEL) ----
@@ -579,15 +680,18 @@ public:
         {
             const std::lock_guard<std::mutex> lock(m_);
             input_mode_ = ActiveInputMode::touch;
-            const float nx = std::clamp(x_px / static_cast<float>(screen_w_), 0.0F, 1.0F);
-            const float ny = std::clamp(y_px / static_cast<float>(screen_h_), 0.0F, 1.0F);
+            float bx = x_px;
+            float by = y_px;
+            map_surface_to_backbuffer_locked(bx, by);
+            const float nx = std::clamp(bx / static_cast<float>(screen_w_), 0.0F, 1.0F);
+            const float ny = std::clamp(by / static_cast<float>(screen_h_), 0.0F, 1.0F);
 
             if (action == 0) {  // DOWN
-                handle_pointer_down_locked(pointer_id, x_px, y_px, nx, ny, triggered_ui_action, move_cx, move_cy);
+                handle_pointer_down_locked(pointer_id, bx, by, nx, ny, triggered_ui_action, move_cx, move_cy);
             } else if (action == 2) {  // MOVE
-                handle_pointer_move_locked(pointer_id, x_px, y_px, nx, ny, move_cx, move_cy);
+                handle_pointer_move_locked(pointer_id, bx, by, nx, ny, move_cx, move_cy);
             } else {  // UP or CANCEL
-                handle_pointer_up_locked(pointer_id, x_px, y_px, move_cx, move_cy);
+                handle_pointer_up_locked(pointer_id, bx, by, move_cx, move_cy);
             }
             msg_sink = post_msg_;
             ui_sink = on_ui_action_;
@@ -625,7 +729,7 @@ public:
             // Easy-dismount sequence: pitch down briefly, press F, release F.
             if (dismount_frames_ > 0) {
                 if (dismount_frames_ > 2) {
-                    mouse_dy_ += 110;
+                    add_mouse_delta_float_locked(0.0F, 110.0F);
                 } else if (dismount_frames_ == 2) {
                     set_key_locked(dik::kF, true);
                 } else if (dismount_frames_ == 1) {
@@ -637,13 +741,11 @@ public:
             // One-frame pulse release for discrete UI & cheat chord actions.
             if (pulse_release_dik_ != 0U) {
                 set_key_locked(pulse_release_dik_, false);
-                if (pulse_release_ctrl_) set_key_locked(dik::kLCtrl, false);
-                if (pulse_release_shift_) set_key_locked(dik::kLShift, false);
-                if (pulse_release_alt_) set_key_locked(dik::kLAlt, false);
                 pulse_release_dik_ = 0U;
                 pulse_release_ctrl_ = false;
                 pulse_release_shift_ = false;
                 pulse_release_alt_ = false;
+                recompute_modifiers_locked();
             }
         }
         if (sink) {
@@ -729,8 +831,15 @@ public:
     bool get_xinput_state(std::uint32_t user_index, XInputPadState& out) const {
         if (user_index >= 4U) return false;
         const std::lock_guard<std::mutex> lock(m_);
-        if (!xinput_enabled_ || !pads_[user_index].connected) {
+        if (!pads_[user_index].connected) {
             return false;
+        }
+        if (!xinput_enabled_) {
+            // Per XInput 1.3 spec, XInputEnable(FALSE) returns ERROR_SUCCESS with neutral state.
+            out = XInputPadState{};
+            out.connected = true;
+            out.packet_number = pads_[user_index].packet_number;
+            return true;
         }
         out = pads_[user_index];
         return true;
@@ -811,7 +920,11 @@ public:
 
             const bool hi = btn.pressed || btn.latched;
             const bool gold_cheat = btn.is_cheat || btn.id == "cheat_menu";
-            const float alpha = !btn.enabled ? (idle_a * 0.32F) : (hi ? press_a : idle_a);
+            const bool dialog_dimmed =
+                (scene_ == TouchScene::dialog && (btn.id == "dialog_up" || btn.id == "dialog_down") &&
+                 !battle_ctx_.test_or_default(BattleContextFlags::kDialogChoices, true));
+            const bool eff_enabled = btn.enabled && !dialog_dimmed;
+            const float alpha = !eff_enabled ? (idle_a * 0.32F) : (hi ? press_a : idle_a);
             const float fill_r = hi ? 0.24F : (gold_cheat ? 0.19F : 0.10F);
             const float fill_g = hi ? 0.19F : (gold_cheat ? 0.14F : 0.11F);
             const float fill_b = hi ? 0.11F : (gold_cheat ? 0.08F : 0.13F);
@@ -877,6 +990,7 @@ private:
         bool is_stick = false;
         bool is_look = false;
         bool is_cursor = false;
+        bool defer_tap = false;
         bool dragged = false;
         float scroll_accum = 0.0F;
     };
@@ -1123,12 +1237,24 @@ private:
             return;
         }
 
-        // Two-phase menu tap: move cursor immediately on frame N; press LMB on frame N+1!
+        // Two-phase menu tap:
+        // In scrollable list scenes (`dialog`, `screens`), defer LMB press until finger-up so
+        // dragging to scroll never accidentally clicks and commits a dialog/list choice!
+        // Also flush any pending LMB release before starting a rapid second tap.
+        if (tap_phase_ == TapPhase::hold_then_up || mouse_buttons_[0] != 0U) {
+            set_mouse_button_locked(0, false);
+            tap_phase_ = TapPhase::idle;
+            tap_release_queued_ = false;
+        }
         map_screen_to_game_locked(x_px, y_px, cursor_x_, cursor_y_);
         out_move_cx = cursor_x_;
         out_move_cy = cursor_y_;
-        tap_phase_ = TapPhase::hover_then_down;
-        tap_release_queued_ = false;
+        if (scene_ == TouchScene::dialog || scene_ == TouchScene::screens) {
+            touches_.back().defer_tap = true;
+        } else {
+            tap_phase_ = TapPhase::hover_then_down;
+            tap_release_queued_ = false;
+        }
     }
 
     void handle_pointer_move_locked(int pointer_id, float x_px, float y_px, float, float,
@@ -1169,16 +1295,14 @@ private:
                     attack_slide_angle_ = std::atan2(total_dy, total_dx);
                 }
                 const float sens = 0.65F * cfg_.look_sensitivity * (zoom_active_ ? cfg_.aim_sensitivity : 1.0F);
-                mouse_dx_ += static_cast<int>(std::lround(dx * sens));
-                mouse_dy_ += static_cast<int>(std::lround(dy * sens));
+                add_mouse_delta_float_locked(dx * sens, dy * sens);
             }
             return;
         }
 
         if (t->is_look) {
             const float sens = 0.85F * cfg_.look_sensitivity * (zoom_active_ ? cfg_.aim_sensitivity : 1.0F);
-            mouse_dx_ += static_cast<int>(std::lround(dx * sens));
-            mouse_dy_ += static_cast<int>(std::lround(dy * sens));
+            add_mouse_delta_float_locked(dx * sens, dy * sens);
             return;
         }
 
@@ -1188,8 +1312,7 @@ private:
                 return;
             }
             if (scene_ == TouchScene::campaign_map && map_look_mode_) {
-                mouse_dx_ += static_cast<int>(std::lround(dx * 0.8F));
-                mouse_dy_ += static_cast<int>(std::lround(dy * 0.8F));
+                add_mouse_delta_float_locked(dx * 0.8F, dy * 0.8F);
                 return;
             }
             // In Dialog / Screens, vertical drag > 18 px smoothly scrolls lists via mouse wheel.
@@ -1244,7 +1367,13 @@ private:
                 map_screen_to_game_locked(x_px, y_px, cursor_x_, cursor_y_);
                 out_move_cx = cursor_x_;
                 out_move_cy = cursor_y_;
-                if (tap_phase_ == TapPhase::hover_then_down) {
+                if (t.defer_tap) {
+                    // Only click if the user tapped without scrolling the list!
+                    if (!t.dragged) {
+                        tap_phase_ = TapPhase::hover_then_down;
+                        tap_release_queued_ = true;
+                    }
+                } else if (tap_phase_ == TapPhase::hover_then_down) {
                     // Quick tap: ensure press happens on next frame and release on the following frame.
                     tap_release_queued_ = true;
                 } else if (tap_phase_ == TapPhase::holding) {
@@ -1258,15 +1387,15 @@ private:
     void activate_button_down_locked(TouchButtonSpec& b, std::string& out_ui_action) {
         switch (b.action) {
         case OverlayActionKind::key_hold:
-            if (b.need_ctrl) set_key_locked(dik::kLCtrl, true);
-            if (b.need_shift) set_key_locked(dik::kLShift, true);
             set_key_locked(b.dik_code, true);
+            recompute_modifiers_locked();
             break;
         case OverlayActionKind::key_toggle:
             b.latched = !b.latched;
-            if (b.need_ctrl) set_key_locked(dik::kLCtrl, b.latched);
-            if (b.need_shift) set_key_locked(dik::kLShift, b.latched);
-            set_key_locked(b.dik_code, b.latched);
+            if (b.dik_code != dik::kLCtrl && b.dik_code != dik::kLShift && b.dik_code != dik::kLAlt) {
+                set_key_locked(b.dik_code, b.latched);
+            }
+            recompute_modifiers_locked();
             break;
         case OverlayActionKind::mouse_button:
             set_mouse_button_locked(b.mouse_btn, true);
@@ -1292,19 +1421,24 @@ private:
             if (cfg_.aim_hold) {
                 zoom_active_ = true;
                 b.latched = true;
-                set_key_locked(dik::kLShift, true);
             } else {
                 zoom_active_ = !zoom_active_;
                 b.latched = zoom_active_;
-                set_key_locked(dik::kLShift, zoom_active_);
             }
+            recompute_modifiers_locked();
             break;
-        case OverlayActionKind::orders_open:
+        case OverlayActionKind::orders_open: {
+            const TouchScene prev = scene_;
             scene_ = TouchScene::orders;
+            on_scene_changed_locked(prev, scene_);
             break;
-        case OverlayActionKind::orders_close:
+        }
+        case OverlayActionKind::orders_close: {
+            const TouchScene prev = scene_;
             scene_ = TouchScene::battle;
+            on_scene_changed_locked(prev, scene_);
             break;
+        }
         case OverlayActionKind::map_look_toggle:
             map_look_mode_ = !map_look_mode_;
             b.latched = map_look_mode_;
@@ -1316,30 +1450,42 @@ private:
                     if (ob.id == "map_look") ob.latched = false;
                 }
             }
-            // Space / home follow pulse.
-            set_key_locked(dik::kSpace, true);
-            pulse_release_dik_ = dik::kSpace;
+            // Home recenters/snaps camera on the player party (Space is reserved for Rest/Pause).
+            set_key_locked(dik::kHome, true);
+            pulse_release_dik_ = dik::kHome;
             break;
         case OverlayActionKind::map_stop_rest:
             set_key_locked(dik::kSpace, true);
             break;
         case OverlayActionKind::trade_take_all:
-            set_key_locked(dik::kLCtrl, true);
+            pulse_release_ctrl_ = true;
+            recompute_modifiers_locked();
             set_key_locked(dik::kA, true);
             pulse_release_dik_ = dik::kA;
-            pulse_release_ctrl_ = true;
             break;
         case OverlayActionKind::trade_give_all:
-            set_key_locked(dik::kLCtrl, true);
+            pulse_release_ctrl_ = true;
+            recompute_modifiers_locked();
             set_key_locked(dik::kD, true);
             pulse_release_dik_ = dik::kD;
-            pulse_release_ctrl_ = true;
             break;
         case OverlayActionKind::scene_cycle: {
-            manual_scene_override_ = true;
-            const auto next_val = (static_cast<std::uint8_t>(scene_) + 1U) % 8U;
-            scene_ = static_cast<TouchScene>(next_val);
-            if (scene_ == TouchScene::orders) scene_ = TouchScene::campaign_map;
+            const TouchScene prev = scene_;
+            if (manual_scene_override_ && scene_ == TouchScene::screens) {
+                // Final slot returns to automatic PDB/cursor scene detection.
+                manual_scene_override_ = false;
+                b.latched = false;
+                scene_ = cursor_visible_ ? inferred_ui_scene_ : TouchScene::battle;
+            } else {
+                manual_scene_override_ = true;
+                b.latched = true;
+                const auto next_val = (static_cast<std::uint8_t>(scene_) + 1U) % 8U;
+                scene_ = static_cast<TouchScene>(next_val);
+                if (scene_ == TouchScene::orders) scene_ = TouchScene::campaign_map;
+            }
+            if (scene_ != prev) {
+                on_scene_changed_locked(prev, scene_);
+            }
             break;
         }
         case OverlayActionKind::pause_drawer:
@@ -1353,14 +1499,12 @@ private:
             b.latched = cheats_expanded_;
             break;
         case OverlayActionKind::cheat_chord_pulse:
-            if (b.need_ctrl) set_key_locked(dik::kLCtrl, true);
-            if (b.need_shift) set_key_locked(dik::kLShift, true);
-            if (b.need_alt) set_key_locked(dik::kLAlt, true);
-            set_key_locked(b.dik_code, true);
-            pulse_release_dik_ = b.dik_code;
             pulse_release_ctrl_ = b.need_ctrl;
             pulse_release_shift_ = b.need_shift;
             pulse_release_alt_ = b.need_alt;
+            recompute_modifiers_locked();
+            set_key_locked(b.dik_code, true);
+            pulse_release_dik_ = b.dik_code;
             break;
         case OverlayActionKind::none:
         default:
@@ -1372,8 +1516,7 @@ private:
         switch (b.action) {
         case OverlayActionKind::key_hold:
             set_key_locked(b.dik_code, false);
-            if (b.need_ctrl) set_key_locked(dik::kLCtrl, false);
-            if (b.need_shift) set_key_locked(dik::kLShift, false);
+            recompute_modifiers_locked();
             break;
         case OverlayActionKind::mouse_button:
             set_mouse_button_locked(b.mouse_btn, false);
@@ -1389,7 +1532,7 @@ private:
             if (cfg_.aim_hold) {
                 zoom_active_ = false;
                 b.latched = false;
-                set_key_locked(dik::kLShift, false);
+                recompute_modifiers_locked();
             }
             break;
         case OverlayActionKind::map_stop_rest:
@@ -1398,6 +1541,100 @@ private:
         default:
             break;
         }
+    }
+
+    void on_scene_changed_locked(TouchScene prev, TouchScene next) {
+        if (prev == next) return;
+        for (auto& b : buttons_) {
+            if (b.action == OverlayActionKind::key_toggle && b.latched &&
+                b.scene != next && b.id != "scene_mode" && b.id != "cheat_menu") {
+                b.latched = false;
+                if (b.dik_code != 0U && b.dik_code != dik::kLCtrl && b.dik_code != dik::kLShift &&
+                    b.dik_code != dik::kLAlt) {
+                    set_key_locked(b.dik_code, false);
+                }
+            }
+        }
+        if (next != TouchScene::battle) {
+            zoom_active_ = false;
+            for (auto& b : buttons_) {
+                if (b.action == OverlayActionKind::zoom_hold) b.latched = false;
+            }
+        }
+        if (next != TouchScene::campaign_map) {
+            map_look_mode_ = false;
+            for (auto& b : buttons_) {
+                if (b.action == OverlayActionKind::map_look_toggle) b.latched = false;
+            }
+        }
+        recompute_modifiers_locked();
+    }
+
+    void recompute_modifiers_locked() {
+        bool ctrl = phys_ctrl_ || pulse_release_ctrl_ || pad_ctrl_;
+        bool shift = phys_shift_ || pulse_release_shift_ || pad_shift_ || zoom_active_;
+        bool alt = phys_alt_ || pulse_release_alt_;
+        for (const auto& b : buttons_) {
+            if (b.pressed) {
+                if (b.need_ctrl || b.dik_code == dik::kLCtrl) ctrl = true;
+                if (b.need_shift || b.dik_code == dik::kLShift) shift = true;
+                if (b.need_alt || b.dik_code == dik::kLAlt) alt = true;
+            }
+            if (b.action == OverlayActionKind::key_toggle && b.latched && is_button_visible_locked(b)) {
+                if (b.need_ctrl || b.dik_code == dik::kLCtrl) ctrl = true;
+                if (b.need_shift || b.dik_code == dik::kLShift) shift = true;
+                if (b.need_alt || b.dik_code == dik::kLAlt) alt = true;
+            }
+        }
+        set_key_locked(dik::kLCtrl, ctrl);
+        set_key_locked(dik::kLShift, shift);
+        set_key_locked(dik::kLAlt, alt);
+    }
+
+    void add_mouse_delta_float_locked(float fdx, float fdy) {
+        if (!std::isfinite(fdx)) fdx = 0.0F;
+        if (!std::isfinite(fdy)) fdy = 0.0F;
+        mouse_rem_x_ += fdx;
+        mouse_rem_y_ += fdy;
+        const int ix = static_cast<int>(std::trunc(mouse_rem_x_));
+        const int iy = static_cast<int>(std::trunc(mouse_rem_y_));
+        if (ix != 0) {
+            mouse_rem_x_ -= static_cast<float>(ix);
+            mouse_dx_ += ix;
+            push_mouse_event_locked(0U, static_cast<std::uint32_t>(ix));
+        }
+        if (iy != 0) {
+            mouse_rem_y_ -= static_cast<float>(iy);
+            mouse_dy_ += iy;
+            push_mouse_event_locked(4U, static_cast<std::uint32_t>(iy));
+        }
+    }
+
+    // Inverse-maps live SurfaceView/DeX pixel coordinates through Vulkan's letterbox rect into
+    // D3D9 backbuffer pixels [0..screen_w_) x [0..screen_h_).
+    void map_surface_to_backbuffer_locked(float& x_px, float& y_px) const noexcept {
+        if (surface_w_ <= 0 || surface_h_ <= 0 || (surface_w_ == screen_w_ && surface_h_ == screen_h_)) {
+            return;
+        }
+        const std::int64_t lhs = static_cast<std::int64_t>(surface_w_) * screen_h_;
+        const std::int64_t rhs = static_cast<std::int64_t>(surface_h_) * screen_w_;
+        float rx = 0.0F;
+        float ry = 0.0F;
+        float rw = static_cast<float>(surface_w_);
+        float rh = static_cast<float>(surface_h_);
+        if (lhs > rhs) {
+            rh = static_cast<float>(surface_h_);
+            rw = std::max(1.0F, static_cast<float>(rhs) / static_cast<float>(screen_h_));
+            rx = (static_cast<float>(surface_w_) - rw) * 0.5F;
+            ry = 0.0F;
+        } else {
+            rw = static_cast<float>(surface_w_);
+            rh = std::max(1.0F, static_cast<float>(lhs) / static_cast<float>(screen_w_));
+            rx = 0.0F;
+            ry = (static_cast<float>(surface_h_) - rh) * 0.5F;
+        }
+        x_px = std::clamp((x_px - rx) / rw, 0.0F, 1.0F) * static_cast<float>(screen_w_);
+        y_px = std::clamp((y_px - ry) / rh, 0.0F, 1.0F) * static_cast<float>(screen_h_);
     }
 
     ActiveTouch* find_touch_locked(int pointer_id) noexcept {
@@ -1694,8 +1931,17 @@ private:
     wse::platform::SafeAreaInsets safe_area_{};
     int screen_w_ = 1920;
     int screen_h_ = 1080;
+    int surface_w_ = 0;
+    int surface_h_ = 0;
     int cursor_x_ = 960;
     int cursor_y_ = 540;
+    float mouse_rem_x_ = 0.0F;
+    float mouse_rem_y_ = 0.0F;
+    bool phys_ctrl_ = false;
+    bool phys_shift_ = false;
+    bool phys_alt_ = false;
+    bool pad_ctrl_ = false;
+    bool pad_shift_ = false;
     bool cursor_visible_ = true;
     bool manual_scene_override_ = false;
     TouchScene scene_ = TouchScene::main_menu;

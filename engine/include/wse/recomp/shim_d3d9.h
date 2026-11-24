@@ -2217,6 +2217,11 @@ inline void D3d9::build_vtables() {
                  const std::uint64_t rgdod = win64_arg(s, 2);
                  const std::uint64_t pdw_in_out = win64_arg(s, 3);
                  const auto flags = static_cast<std::uint32_t>(win64_arg(s, 4));
+                 if (rgdod != 0 && stride != 24U && stride != 16U) {
+                     if (pdw_in_out != 0) crt_detail::put<std::uint32_t>(pdw_in_out, 0U);
+                     ret(s, 0x80070057U);  // E_INVALIDARG / DIERR_INVALIDPARAM
+                     return;
+                 }
                  if (pdw_in_out != 0) {
                      if (input_hub != nullptr) {
                          const auto max_n = crt_detail::get<std::uint32_t>(pdw_in_out);

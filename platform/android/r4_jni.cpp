@@ -47,6 +47,8 @@
 #include "wse/platform/saf_vfs.h"
 #include "wse/platform/vfs.h"
 #include "wse/recomp/input_hub.h"
+#include "wse/recomp/pdb_reader.h"
+#include "wse/recomp/pe_image.h"
 #include "wse/recomp/screen.h"
 #include "wse/recomp/shim_d3d9.h"
 #include "wse/recomp/shim_fmod_steam.h"
@@ -84,6 +86,17 @@ public:
         mid_open_fd_ = env->GetMethodID(cls, "openDocumentFd", "(Ljava/lang/String;)I");
         if (clear_if_exception(env)) mid_open_fd_ = nullptr;  // older bridge: read through Java
         env->DeleteLocalRef(cls);
+    }
+    ThreadJniSafBackend(const ThreadJniSafBackend&) = delete;
+    ThreadJniSafBackend& operator=(const ThreadJniSafBackend&) = delete;
+    ~ThreadJniSafBackend() override {
+        if (vm_ != nullptr && bridge_ != nullptr) {
+            JNIEnv* env = this_env();
+            if (env != nullptr) {
+                env->DeleteGlobalRef(bridge_);
+            }
+            bridge_ = nullptr;
+        }
     }
     [[nodiscard]] bool valid() const noexcept {
         return bridge_ != nullptr && mid_root_ != nullptr && mid_list_ != nullptr && mid_read_ != nullptr;
@@ -268,6 +281,18 @@ public:
         env->DeleteLocalRef(cls);
     }
 
+    HudNotifier(const HudNotifier&) = delete;
+    HudNotifier& operator=(const HudNotifier&) = delete;
+    ~HudNotifier() {
+        if (vm_ != nullptr && listener_ != nullptr) {
+            JNIEnv* env = attach_env();
+            if (env != nullptr) {
+                env->DeleteGlobalRef(listener_);
+            }
+            listener_ = nullptr;
+        }
+    }
+
     void update(std::string_view text) const {
         if (vm_ == nullptr || listener_ == nullptr || mid_update_ == nullptr) return;
         JNIEnv* env = attach_env();
@@ -320,6 +345,70 @@ private:
 std::mutex g_report_m;
 std::FILE* g_report = nullptr;
 std::string g_progress_path;
+std::atomic<std::uint64_t> g_va_game_screen{0U};
+std::atomic<std::uint64_t> g_va_cheat_mode{0U};
+
+// Safely polls Warband's live `g_gameScreen->m_windowStack` and `rglConfig::General::bCheatMode`
+// from fixed-address guest memory (resolved from the user's PDB at startup) to drive automatic
+// per-scene touch layouts and live cheat-menu visibility.
+void poll_guest_scene_and_cheats() noexcept {
+    const std::uint64_t cheat_va = g_va_cheat_mode.load(std::memory_order_acquire);
+    if (cheat_va >= 0x10000000ULL) {
+        const auto* p_cheat = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(cheat_va));
+        const bool live_cheat = (*p_cheat != 0U);
+        auto& hub = wse::recomp::shim::RecompInputHub::shared();
+        if (hub.cheats_enabled() != live_cheat) {
+            hub.set_cheats_enabled(live_cheat);
+        }
+    }
+
+    const std::uint64_t gs_va = g_va_game_screen.load(std::memory_order_acquire);
+    if (gs_va < 0x10000000ULL) return;
+    // `g_gameScreen->m_windowStack` sits at offset +0x0 (24 B vector: either {ptr, size, cap} or {begin, end, cap}).
+    const auto* words = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(gs_va));
+    const std::uint64_t w0 = words[0];
+    const std::uint64_t w1 = words[1];
+    if (w0 < 0x10000ULL) return;
+    std::size_t count = 0U;
+    if (w1 > 0U && w1 <= 64U) {
+        count = static_cast<std::size_t>(w1);
+    } else if (w1 > w0 && (w1 - w0) <= 64U * sizeof(std::int32_t) && ((w1 - w0) % sizeof(std::int32_t)) == 0U) {
+        count = static_cast<std::size_t>((w1 - w0) / sizeof(std::int32_t));
+    } else {
+        return;
+    }
+    const auto* stack = reinterpret_cast<const std::int32_t*>(static_cast<std::uintptr_t>(w0));
+    const std::int32_t top_id = stack[count - 1U];
+    if (top_id < 0 || top_id > 64) return;
+
+    using wse::recomp::shim::TouchScene;
+    TouchScene scene = TouchScene::screens;
+    switch (top_id) {
+    case 0:   // mbInitialWindow
+    case 3:   // mbLoadingWindow
+        scene = TouchScene::main_menu;
+        break;
+    case 6:   // mbMapWindow
+        scene = TouchScene::campaign_map;
+        break;
+    case 7:   // mbPartyWindow
+        scene = TouchScene::party;
+        break;
+    case 9:   // mbInventoryWindow (Inventory, Trade & Looting)
+        scene = TouchScene::trade;
+        break;
+    case 10:  // mbTacticalWindow
+        scene = TouchScene::battle;
+        break;
+    case 12:  // mbConversationWindow
+        scene = TouchScene::dialog;
+        break;
+    default:
+        scene = TouchScene::screens;
+        break;
+    }
+    wse::recomp::shim::RecompInputHub::shared().set_inferred_scene(scene);
+}
 
 void report(const std::string& text) {
     const std::lock_guard<std::mutex> lock(g_report_m);
@@ -484,18 +573,28 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     }
     wse::recomp::shim::RecompInputHub::shared().apply_detected_mod_controls(detected_mods);
 
-    // Auto-enable the Cheats overlay menu in every scene when `cheat_mode = 1` in rgl_config.txt.
+    // Auto-enable the Cheats overlay menu in every scene when cheats are enabled in WSE2's
+    // `rgl_config.ini` (`bCheatMode=true`) or legacy `rgl_config.txt` (`cheat_mode = 1`).
     {
-        std::string rgl_cfg;
         bool cheats_on = false;
-        if (user.read_text("Documents/Mount&Blade Warband/rgl_config.txt", rgl_cfg) ||
-            user.read_text("Documents/Mount&Blade Warband WSE2/rgl_config.txt", rgl_cfg)) {
-            const std::string low = wse::platform::mod_detect_detail::to_lower_ascii(rgl_cfg);
-            (void)wse::platform::mod_detect_detail::parse_ini_bool(low, "cheat_mode", cheats_on);
-        }
+        std::string rgl_cfg;
+        auto check_cfg = [&](std::string_view rel_path, std::string_view key) {
+            if (cheats_on) return;
+            rgl_cfg.clear();
+            if (user.read_text(std::string(rel_path), rgl_cfg)) {
+                const std::string low = wse::platform::mod_detect_detail::to_lower_ascii(rgl_cfg);
+                bool flag = false;
+                if (wse::platform::mod_detect_detail::parse_ini_bool(low, key, flag) && flag) {
+                    cheats_on = true;
+                }
+            }
+        };
+        check_cfg("Documents/Mount&Blade Warband WSE2/rgl_config.ini", "bcheatmode");
+        check_cfg("Documents/Mount&Blade Warband WSE2/rgl_config.txt", "cheat_mode");
+        check_cfg("Documents/Mount&Blade Warband/rgl_config.txt", "cheat_mode");
         wse::recomp::shim::RecompInputHub::shared().set_cheats_enabled(cheats_on);
         if (cheats_on) {
-            report("cheats-menu: enabled (cheat_mode = 1 in rgl_config.txt)\n");
+            report("cheats-menu: enabled (cheat mode active in config)\n");
         }
     }
 
@@ -508,6 +607,25 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
                "RESULT setup-error\n");
         if (hud) hud->update("WSE2 isn't installed in this Warband folder.");
         return wse::recomp::kStartupSetupError;
+    }
+
+    // Resolve live PDB globals (`g_gameScreen` and `rglConfig::General::bCheatMode`) for automatic
+    // per-scene touch layout switching and live cheat-menu detection (without touching r4_startup.cpp).
+    {
+        wse::recomp::PeImage pe{};
+        std::vector<wse::recomp::PdbPublic> publics;
+        std::string pdb_err;
+        if (wse::recomp::parse_pe_image(o.exe.data(), o.exe.size(), pe, &pdb_err) &&
+            wse::recomp::parse_pdb_publics(o.pdb.data(), o.pdb.size(), publics, nullptr, &pdb_err)) {
+            if (auto va = wse::recomp::pdb_public_va(publics, "?g_gameScreen@@3VmbGameScreen@@A",
+                                                     pe.sections, pe.image_base)) {
+                g_va_game_screen.store(*va, std::memory_order_release);
+            }
+            if (auto va = wse::recomp::pdb_public_va(publics, "?bCheatMode@General@rglConfig@@2_NA",
+                                                     pe.sections, pe.image_base)) {
+                g_va_cheat_mode.store(*va, std::memory_order_release);
+            }
+        }
     }
     o.install = game_install;
     o.user = &user;
@@ -820,9 +938,9 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
             }
             report(line);
         }
+        poll_guest_scene_and_cheats();
         if (should_hud && hud) {
-            std::string pill = drv_label + " · " + format_fixed1(inst_fps) + " fps · f" +
-                               std::to_string(frame) + " · " + std::string(short_present_path(present_path));
+            std::string pill = format_fixed1(inst_fps) + " FPS";
             if (bk && bk->current_render_scale() < 0.995F) {
                 pill += " · " + std::to_string(static_cast<int>(std::lround(bk->current_render_scale() * 100.0F))) + "%";
             }
@@ -853,6 +971,13 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
         g_pending_window = nullptr;
     }
     if (late_win != nullptr) {
+        const int lw = ANativeWindow_getWidth(late_win);
+        const int lh = ANativeWindow_getHeight(late_win);
+        if (lw > 0 && lh > 0) {
+            wse::recomp::shim::set_screen_size(lw, lh);
+            wse::recomp::shim::RecompInputHub::shared().set_screen_size(lw, lh);
+            wse::recomp::shim::RecompInputHub::shared().set_surface_size(lw, lh);
+        }
         {
             const std::lock_guard<std::mutex> lock(g_pause_m);
             g_has_surface = true;
@@ -860,6 +985,17 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
         g_pause_cv.notify_all();
         vk_backend->set_native_window(late_win);
         ANativeWindow_release(late_win);
+    }
+
+    // Wire XInput controller rumble into Android haptics when available.
+    if (hud) {
+        wse::recomp::shim::RecompInputHub::shared().set_rumble_sink(
+            [hud](std::uint16_t left_motor, std::uint16_t right_motor) {
+                const std::uint32_t peak = std::max<std::uint32_t>(left_motor, right_motor);
+                if (peak < 2048U) return;
+                const auto amp = static_cast<std::uint8_t>(std::clamp<std::uint32_t>(peak >> 8U, 1U, 255U));
+                hud->haptic_pulse(30U, amp);
+            });
     }
 
     // Hook into the R4/R5/R6 shims without modifying `r4_startup.cpp` (preserves translator_fingerprint).
@@ -903,11 +1039,24 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
             }
         };
         g_aaudio_dev = std::make_unique<wse::platform::AAudioDevice>();
+        fmod.on_device_recover = []() -> bool {
+            return g_aaudio_dev && g_aaudio_dev->recover_if_needed();
+        };
+        bool initially_paused = false;
+        {
+            const std::lock_guard<std::mutex> plock(g_pause_m);
+            initially_paused = g_activity_paused;
+        }
         if (g_aaudio_dev->open(wse::platform::AudioDeviceSpec{48000U, 2U})) {
             fmod.set_audio_device(g_aaudio_dev.get(), true);
             report("audio: Android AAudio opened at " + std::to_string(g_aaudio_dev->spec().sample_rate) + " Hz stereo\n");
         } else {
+            // Start silent clock worker so FMOD channels & end callbacks still advance cleanly.
+            fmod.start_worker();
             report("audio: AAudio open failed (continuing silent)\n");
+        }
+        if (initially_paused) {
+            fmod.set_app_paused(true);
         }
     };
 
@@ -945,6 +1094,9 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetPaused(JNIEnv*, jclass,
                                                                                           jboolean paused) {
     const bool is_paused = (paused == JNI_TRUE);
+    if (is_paused) {
+        wse::recomp::shim::RecompInputHub::shared().release_all();
+    }
     {
         const std::lock_guard<std::mutex> lock(g_pause_m);
         g_activity_paused = is_paused;
@@ -968,6 +1120,8 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
     {
         const std::lock_guard<std::mutex> lock(g_audio_m);
         if (g_active_fmod != nullptr) {
+            g_active_fmod->on_device_recover = nullptr;
+            g_active_fmod->set_audio_device(nullptr, false);
             g_active_fmod->stop_worker();
             g_active_fmod = nullptr;
         }
@@ -1108,9 +1262,16 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
 }
 
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeGyroSample(
-    JNIEnv*, jclass, jfloat rx, jfloat ry, jfloat dt_sec) {
+    JNIEnv*, jclass, jfloat rx, jfloat ry, jfloat dt_sec, jboolean rotated_270) {
     wse::recomp::shim::RecompInputHub::shared().on_gyro_sample(
-        static_cast<float>(rx), static_cast<float>(ry), static_cast<float>(dt_sec));
+        static_cast<float>(rx), static_cast<float>(ry), static_cast<float>(dt_sec), rotated_270 == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetSurfaceSize(
+    JNIEnv*, jclass, jint width, jint height) {
+    if (width > 0 && height > 0) {
+        wse::recomp::shim::RecompInputHub::shared().set_surface_size(static_cast<int>(width), static_cast<int>(height));
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetSafeArea(
