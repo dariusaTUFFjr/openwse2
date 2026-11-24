@@ -46,6 +46,7 @@
 #include "wse/platform/rhi.h"
 #include "wse/platform/saf_vfs.h"
 #include "wse/platform/vfs.h"
+#include "wse/recomp/host_stack.h"
 #include "wse/recomp/input_hub.h"
 #include "wse/recomp/pdb_reader.h"
 #include "wse/recomp/pe_image.h"
@@ -649,6 +650,9 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
         wse::recomp::set_code_target(wse::recomp::portable_android_target());
     }
     if (hud) hud->update("Loading Warband (" + o.module + ")…");
+    // This thread runs the game: it was started with R4Native.GAME_STACK_BYTES; record its bounds
+    // and give it an alternate signal stack (wse/recomp/host_stack.h).
+    wse::recomp::prepare_current_host_thread();
     return wse::recomp::run_startup(o);  // returns only when nothing could be started
 }
 
