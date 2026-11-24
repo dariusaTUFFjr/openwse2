@@ -469,13 +469,6 @@ std::string_view driver_label(wse::platform::DriverMode mode) noexcept {
     }
 }
 
-std::string_view short_present_path(std::string_view p) noexcept {
-    if (p.find("swapchain") != std::string_view::npos) return "swapchain";
-    if (p.find("ahb+ASurfaceControl") != std::string_view::npos) return "ahb+ASurfaceControl";
-    if (p.find("ANativeWindow_lock") != std::string_view::npos) return "ANativeWindow_lock";
-    return p;
-}
-
 // Live Vulkan R5a state shared across the render thread and UI `SurfaceHolder.Callback`.
 std::mutex g_vk_m;
 std::shared_ptr<wse::platform::VulkanD3d9Backend> g_vk_backend;
