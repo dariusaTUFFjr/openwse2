@@ -615,8 +615,8 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
         wse::recomp::PeImage pe{};
         std::vector<wse::recomp::PdbPublic> publics;
         std::string pdb_err;
-        if (wse::recomp::parse_pe_image(o.exe.data(), o.exe.size(), pe, &pdb_err) &&
-            wse::recomp::parse_pdb_publics(o.pdb.data(), o.pdb.size(), publics, nullptr, &pdb_err)) {
+        if (wse::recomp::parse_pe(o.exe.data(), o.exe.size(), pe, &pdb_err) &&
+            wse::recomp::read_pdb_publics(o.pdb.data(), o.pdb.size(), publics, nullptr, &pdb_err)) {
             if (auto va = wse::recomp::pdb_public_va(publics, "?g_gameScreen@@3VmbGameScreen@@A",
                                                      pe.sections, pe.image_base)) {
                 g_va_game_screen.store(*va, std::memory_order_release);
