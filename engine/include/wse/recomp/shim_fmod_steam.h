@@ -38,6 +38,7 @@
 #include "wse/platform/audio.h"
 #include "wse/recomp/combat_haptics.h"
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/host_stack.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/shim_crt.h"
 
@@ -164,7 +165,7 @@ public:
             const std::lock_guard<std::mutex> lock(m_);
             stop_worker_ = false;
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        worker_ = HostThread([this] { worker_loop(); });
     }
 
     void stop_worker() {
@@ -1506,7 +1507,7 @@ private:
     Runtime& rt_;
     mutable std::mutex m_;
     std::condition_variable worker_cv_;
-    std::thread worker_;
+    HostThread worker_;
     bool stop_worker_ = false;
     bool app_paused_ = false;
     wse::platform::AudioDevice* audio_device_ = nullptr;

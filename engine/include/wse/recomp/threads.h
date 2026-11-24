@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/host_stack.h"
 #include "wse/recomp/kernel.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/teb.h"
@@ -128,7 +129,7 @@ private:
             }
         }
         auto done = std::make_shared<std::atomic<bool>>(false);
-        hosts_.push_back(Host{std::thread([this, obj, start, param, top, done] {
+        hosts_.push_back(Host{HostThread([this, obj, start, param, top, done] {
                                   run(obj, start, param, top);
                                   *done = true;
                               }),
@@ -301,7 +302,7 @@ private:
     teb::Process& process_;
     kernel::Kernel& kernel_;
     struct Host {
-        std::thread thread;
+        HostThread thread;
         std::shared_ptr<std::atomic<bool>> done;
     };
     std::mutex hosts_m_;

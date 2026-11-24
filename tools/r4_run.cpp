@@ -52,6 +52,7 @@
 #include "wse/asset/etc2.h"
 #include "wse/asset/texture_cache.h"
 #include "wse/platform/vfs.h"
+#include "wse/recomp/host_stack.h"
 
 namespace fs = std::filesystem;
 
@@ -222,7 +223,10 @@ int main(int argc, char** argv) {
     static wse::platform::HostVfs user_vfs(work / "user");
     o.install = &install_vfs;
     o.user = &user_vfs;
-    const int rc = wse::recomp::run_startup(o);
+    // On a host thread with the same stack as the phone's game thread (wse/recomp/host_stack.h).
+    int rc = 0;
+    wse::recomp::HostThread game([&] { rc = wse::recomp::run_startup(o); });
+    game.join();
     if (!for_phone.empty() && rc == 0) {
         // Converted textures go in a subfolder; the phone puts them in its texture cache.
         (void)convert_textures_for_phone(install, o.module, for_phone / "texcache", std::max(1U, o.jobs));

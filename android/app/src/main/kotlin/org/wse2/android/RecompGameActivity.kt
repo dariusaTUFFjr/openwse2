@@ -782,7 +782,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             }
         }
 
-        Thread({
+        Thread(null, {
             raisePriority()
             val bridge = if (copyDir.isEmpty() && treeUri.isNotEmpty()) {
                 WseSafBridge(applicationContext, Uri.parse(treeUri))
@@ -817,7 +817,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                 updateHud(if (rc == 0) "Game closed." else "The game stopped unexpectedly.")
                 exitAndFinish()
             }
-        }, "wse-r5a-vulkan").start()
+        }, "wse-r5a-vulkan", R4Native.GAME_STACK_BYTES).start()
     }
 
     private fun exitAndFinish() {

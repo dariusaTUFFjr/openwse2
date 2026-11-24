@@ -29,6 +29,7 @@
 #include "wse/recomp/combat_haptics.h"
 #include "wse/recomp/d3d9_capture.h"
 #include "wse/recomp/fx_effect.h"
+#include "wse/recomp/host_stack.h"
 #include "wse/recomp/input_hub.h"
 #include "wse/recomp/pdb_reader.h"
 #include "wse/recomp/pe_image.h"
@@ -5608,6 +5609,42 @@ void test_d3d9_capture() {
     expect(same && !cut && partial.size() == calls.size() - 1, "capture: a file reads back the same calls; a cut-short file keeps whole records");
 }
 
+// Host stacks for translated code (wse/recomp/host_stack.h): APK bbf4531 overflowed the ~1 MiB
+// default stack at startup. A HostThread gets kHostStackBytes, survives 8 MiB of nested frames
+// (more than any default thread stack here), knows its bounds, and names an address just below
+// its stack as an overflow but not one in its middle.
+std::size_t deep_frames(int depth) {
+    volatile char frame[1 << 20];
+    frame[0] = static_cast<char>(depth);
+    frame[sizeof(frame) - 1] = static_cast<char>(depth);
+    const std::size_t below = depth > 1 ? deep_frames(depth - 1) : 0;
+    return below + static_cast<unsigned char>(frame[0]) + static_cast<unsigned char>(frame[sizeof(frame) - 1]);
+}
+
+void test_host_stack() {
+    std::size_t stack = 0;
+    std::size_t sum = 0;
+    bool overflow_below = false;
+    bool overflow_middle = true;
+    wse::recomp::HostThread t([&] {
+        stack = wse::recomp::current_host_stack_bytes();
+        sum = deep_frames(8);
+        volatile char here = 0;
+        const auto mid = reinterpret_cast<std::uintptr_t>(&here);
+        overflow_middle = wse::recomp::is_host_stack_overflow(mid);
+        // `here` sits a few KiB below the top, so one stack size further down is just below the
+        // bottom, inside the guard window.
+        overflow_below = wse::recomp::is_host_stack_overflow(mid - stack);
+    });
+    t.join();
+    expect(!t.joinable(), "host stack: a joined HostThread is not joinable");
+    expect(stack + (std::size_t{1} << 20) >= wse::recomp::kHostStackBytes, "host stack: a HostThread has about kHostStackBytes (a guard page may be carved out)");
+    expect(sum == 2 * (1 + 2 + 3 + 4 + 5 + 6 + 7 + 8), "host stack: 8 MiB of nested frames run on a HostThread");
+    expect(!overflow_middle, "host stack: an address in use is not an overflow");
+    expect(overflow_below, "host stack: an address below the stack is an overflow");
+    expect(!wse::recomp::is_host_stack_overflow(0x1000), "host stack: an address far from any stack is not an overflow");
+}
+
 // R5a step 1: the fx_2_0 effect parser (wse/recomp/fx_effect.h) on a synthetic effect built here,
 // then, when the user's install is present, on its seven effect files.
 void test_fx_effects() {
@@ -6708,6 +6745,7 @@ int run_recomp_suite(const char* fixture_path) {
     test_d3d9();
     test_fmod_steam();
     test_r4_shim_edge_cases();
+    test_host_stack();
     test_fx_effects();
     test_d3d9_capture();
     test_d3d9_backend_and_preshader();

@@ -39,6 +39,7 @@
 #include "lift_r1.h"
 #include "recomp_llvm.h"
 #include "wse/platform/vfs.h"
+#include "wse/recomp/host_stack.h"
 #include "wse/recomp/kernel.h"
 #include "wse/recomp/pdb_reader.h"
 #include "wse/recomp/pe_image.h"
@@ -610,6 +611,9 @@ void on_signal(int sig, siginfo_t* info, void* uctx) {
             dl.dli_fname != nullptr ? dl.dli_fname : "?");
     }
     out("\n");
+    if (is_host_stack_overflow(reinterpret_cast<std::uintptr_t>(info->si_addr))) {
+        out("host stack overflow: this thread used up its %zu KiB stack\n", current_host_stack_bytes() >> 10);
+    }
     print_recent();
     out("RESULT host-signal\n");
     std::_Exit(kStartupHostSignal);
@@ -985,10 +989,14 @@ int run_startup(const StartupOptions& o) {
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) {
         struct sigaction sa {};
         sa.sa_sigaction = &on_signal;
-        sa.sa_flags = SA_SIGINFO;
+        // SA_ONSTACK: a host stack overflow is reported on the thread's alternate signal stack
+        // (host_stack.h), instead of faulting again while the handler's frame is pushed.
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
         sigaction(sig, &sa, nullptr);
     }
+    // The game's main thread: started with kHostStackBytes by the app (Kotlin) or r4_run.
+    prepare_current_host_thread();
     static GuestStack stack(8 * 1024 * 1024);
     static CpuState s;
     stack.prepare(s);

@@ -31,10 +31,10 @@ class R4StartupService : Service() {
             // Translation takes minutes and the run never returns: keep it off the main thread. The
             // translation workers and guest threads are created from this thread and inherit its
             // priority, so raise it as far as Android lets an app.
-            Thread({
+            Thread(null, {
                 raisePriority()
                 reply(replyTo, run(args))
-            }, "wse-r4-startup").start()
+            }, "wse-r4-startup", R4Native.GAME_STACK_BYTES).start()
         }
     })
 

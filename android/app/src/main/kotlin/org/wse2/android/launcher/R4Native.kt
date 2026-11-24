@@ -8,6 +8,11 @@ import org.wse2.android.WseSafBridge
 // (`R4StartupService` or `RecompGameActivity`): the run maps the game at fixed addresses and ends
 // the process when it is done.
 object R4Native {
+    // Stack of the thread that calls nativeRun / nativeRunVulkan: translated game code nests on the
+    // host stack, and the default ~1 MiB ran out at startup (wse/recomp/host_stack.h,
+    // kHostStackBytes). Address space only; pages are used as the stack grows.
+    const val GAME_STACK_BYTES = 64L shl 20
+
     interface HudListener {
         fun onHudUpdate(text: String)
         fun onHapticPulse(durationMs: Int, amplitude: Int) {}

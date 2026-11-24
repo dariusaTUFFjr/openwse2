@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "wse/recomp/cpu_state.h"
+#include "wse/recomp/host_stack.h"
 #include "wse/recomp/kernel.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/teb.h"
@@ -169,7 +170,7 @@ private:
             }
         }
         teb::GuestThread* g = &guest;
-        hosts_.push_back(Host{std::thread([this, item, g, top, done] {
+        hosts_.push_back(Host{HostThread([this, item, g, top, done] {
                                   worker(item, *g, top);
                                   *done = true;
                               }),
@@ -432,7 +433,7 @@ private:
     }
 
     struct Host {
-        std::thread thread;
+        HostThread thread;
         std::shared_ptr<std::atomic<bool>> done;
     };
     Runtime& rt_;
