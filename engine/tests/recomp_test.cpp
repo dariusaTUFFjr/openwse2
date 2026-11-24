@@ -5629,11 +5629,11 @@ void test_host_stack() {
     wse::recomp::HostThread t([&] {
         stack = wse::recomp::current_host_stack_bytes();
         sum = deep_frames(8);
-        volatile char here = 0;
-        const auto mid = reinterpret_cast<std::uintptr_t>(&here);
+        // The frame address, not a local's: under ASan locals live on a heap "fake stack".
+        const auto mid = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
         overflow_middle = wse::recomp::is_host_stack_overflow(mid);
-        // `here` sits a few KiB below the top, so one stack size further down is just below the
-        // bottom, inside the guard window.
+        // This frame sits a few KiB below the top, so one stack size further down is just below
+        // the bottom, inside the guard window.
         overflow_below = wse::recomp::is_host_stack_overflow(mid - stack);
     });
     t.join();
