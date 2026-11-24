@@ -32,8 +32,11 @@ function Wsl-Run([string]$script) {
     $tmp = Join-Path $env:TEMP "wse2_prepare_step.sh"
     [System.IO.File]::WriteAllText($tmp, ($script -replace "`r", ""))
     $wslTmp = (& wsl.exe -u root -e wslpath -a "$tmp").Trim()
-    & wsl.exe -u root -e bash "$wslTmp"
-    return $LASTEXITCODE
+    # Started as its own process so its output (progress bars included) goes straight to this
+    # window: a native command's output inside a function becomes part of the function's
+    # result, and a step that printed anything read as failed.
+    $p = Start-Process -FilePath "wsl.exe" -ArgumentList @("-u", "root", "-e", "bash", "`"$wslTmp`"") -NoNewWindow -Wait -PassThru
+    return $p.ExitCode
 }
 
 Say "Preparing Warband (WSE2) for your phone"
