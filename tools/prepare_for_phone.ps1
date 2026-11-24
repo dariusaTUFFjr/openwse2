@@ -117,8 +117,22 @@ fi
 echo "Using `$J threads."
 mkdir -p /root/wse/phone-parts /root/wse/phone-work
 /root/wse/build-phone/r4_run "$wslGame" --work /root/wse/phone-work --for-phone /root/wse/phone-parts --jobs "`$J" --quiet 2>&1 \
-  | grep --line-buffered -E "batches|batch [0-9]+ done|RESULT|error|cannot|PDB" \
-  | sed -u -E 's/^ *(exe|lua5164) batch [0-9]+ done \(([0-9]+)\/([0-9]+), ([0-9]+) s\)/  \1: \2 of \3 parts done (\4 s)/'
+  | grep --line-buffered -E "batches|batch [0-9]+ done|textures:|RESULT|error|cannot|PDB" \
+  | awk '
+      # A progress bar per module: parts already done by an earlier run are kept and count as done.
+      /batch [0-9]+ done \(/ {
+        m = (`$1 == "exe") ? "game" : "Lua"
+        split(`$0, a, /[(\/,]/); d = a[2] + 0; t = a[3] + 0; sec = a[4] + 0
+        w = 30; f = (t > 0) ? int(w * d / t) : w
+        bar = ""; for (i = 0; i < w; i++) bar = bar (i < f ? "#" : "-")
+        printf "\r  %-4s [%s] %d of %d parts (%d min)   ", m, bar, d, t, sec / 60
+        if (d == t) printf "\n"
+        fflush(); next
+      }
+      /to translate on/ { n = `$0; sub(/.*batches[^,]*, /, "", n); sub(/ to translate.*/, "", n); print "  " (`$1 == "exe:" ? "game" : "Lua") ": " n " parts left to prepare"; fflush(); next }
+      /costliest batches/ { next }
+      /textures:/ { print "  " `$0; fflush(); next }
+      { print; fflush() }'
 "@
 if ($code -ne 0) { Fail "Preparing the game did not finish (details above). Run this again: finished parts are kept." }
 
