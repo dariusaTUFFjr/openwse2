@@ -92,6 +92,12 @@ if [ -n "`$need" ]; then
   apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq `$need >/dev/null
 fi
 OUT=/root/wse/build-phone
+# A build folder made from another copy of the project (moved or deleted since) cannot be
+# reused: start it again. Only the build is redone; prepared parts live in phone-parts.
+if [ -f "`$OUT/CMakeCache.txt" ] && ! grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$wslRepo" "`$OUT/CMakeCache.txt"; then
+  echo "The project folder changed: setting the translator build up again."
+  rm -rf "`$OUT"
+fi
 mkdir -p "`$OUT"
 if [ ! -f "`$OUT/CMakeCache.txt" ]; then
   CC=clang-18 CXX=clang++-18 cmake -S "$wslRepo" -B "`$OUT" -DWSE_ENABLE_LLVM=ON -DCMAKE_BUILD_TYPE=Release \
