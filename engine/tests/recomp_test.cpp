@@ -5645,6 +5645,44 @@ void test_host_stack() {
     expect(!wse::recomp::is_host_stack_overflow(0x1000), "host stack: an address far from any stack is not an overflow");
 }
 
+// The automatic touch layout reads `g_gameScreen->m_openWindows` (+0x130, {begin, end, cap}) and
+// maps the top window slot (mbGameScreen::createWindows 0x1400ef870) to a layout. A fake
+// 328-byte mbGameScreen stands in for the game's.
+void test_game_screen_scene() {
+    using wse::recomp::shim::TouchScene;
+    using wse::recomp::shim::scene_for_open_window;
+    using wse::recomp::shim::top_open_window;
+    alignas(8) std::array<std::uint8_t, 328> screen{};
+    std::array<std::int32_t, 4> stack{4, 6, 7, 0};
+    // m_windows (+0x0) holds 38 window pointers; fill it with pointer-like junk, as in the game.
+    for (std::size_t i = 0; i < 38; ++i) {
+        const std::uint64_t p = 0x7a0000001000ULL + i * 0x400ULL;
+        std::memcpy(screen.data() + i * 8U, &p, 8U);
+    }
+    auto set_stack = [&](std::size_t n) {
+        const auto begin = reinterpret_cast<std::uint64_t>(stack.data());
+        const std::uint64_t end = begin + n * sizeof(std::int32_t);
+        std::memcpy(screen.data() + 0x130U, &begin, 8U);
+        std::memcpy(screen.data() + 0x138U, &end, 8U);
+        std::memcpy(screen.data() + 0x140U, &end, 8U);
+    };
+    set_stack(2);
+    expect(top_open_window(screen.data()) == 6 && scene_for_open_window(6) == TouchScene::campaign_map,
+           "scene: the top of m_openWindows (+0x130) is read; map window 6 is the campaign map");
+    set_stack(3);
+    expect(scene_for_open_window(top_open_window(screen.data())) == TouchScene::trade,
+           "scene: window 7 (mbInventoryWindow) is the trade layout");
+    set_stack(0);
+    expect(top_open_window(screen.data()) == -1, "scene: an empty window stack reads as none");
+    const std::uint64_t junk = 3;
+    std::memcpy(screen.data() + 0x138U, &junk, 8U);
+    expect(top_open_window(screen.data()) == -1, "scene: an end below begin reads as none");
+    expect(scene_for_open_window(4) == TouchScene::main_menu && scene_for_open_window(8) == TouchScene::party &&
+               scene_for_open_window(10) == TouchScene::battle && scene_for_open_window(12) == TouchScene::dialog &&
+               scene_for_open_window(0) == TouchScene::screens && scene_for_open_window(18) == TouchScene::screens,
+           "scene: window slots 4 menu, 8 party, 10 battle, 12 dialog; yes/no (0) and game menus (18) are screens");
+}
+
 // R5a step 1: the fx_2_0 effect parser (wse/recomp/fx_effect.h) on a synthetic effect built here,
 // then, when the user's install is present, on its seven effect files.
 void test_fx_effects() {
@@ -6360,6 +6398,29 @@ void test_r6_fmod_audio_and_haptics() {
     expect(!dev.paused() && fmod.pump_once(1024U, 512U) == 1024U && dev.rms_left() > 0.05,
            "R6 FMOD: resume restores streaming music cleanly");
 
+    // Route change (headphones, Bluetooth): the output closes; the next pump reopens it through
+    // on_device_recover WITHOUT the mixer lock held, so the game thread's FMOD calls (here
+    // active_channel_count from another thread) do not wait for the reopen.
+    {
+        const wse::platform::AudioDeviceSpec spec = dev.spec();
+        dev.close();
+        std::atomic<bool> lock_free_during_recover{false};
+        fmod.set_device_recover([&]() -> bool {
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            std::thread([&fmod, done] {
+                (void)fmod.active_channel_count();
+                done->store(true);
+            }).detach();
+            for (int i = 0; i < 200 && !done->load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            lock_free_during_recover.store(done->load());
+            return dev.open(spec);
+        });
+        expect(fmod.pump_once(1024U, 512U) == 1024U && dev.is_open() && fmod.device_recoveries() == 1U,
+               "R6 FMOD: a closed output is reopened and filled by the next pump");
+        expect(lock_free_during_recover.load(), "R6 FMOD: the reopen runs without the mixer lock");
+        fmod.set_device_recover(nullptr);
+    }
+
     expect(call("?stop@Channel@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", {ch_3d}) == 0U, "R6 FMOD: stop channel");
     expect(call("?update@System@FMOD@@QEAA?AW4FMOD_RESULT@@XZ", {sys}) == 0U, "R6 FMOD: System::update");
 
@@ -6746,6 +6807,7 @@ int run_recomp_suite(const char* fixture_path) {
     test_fmod_steam();
     test_r4_shim_edge_cases();
     test_host_stack();
+    test_game_screen_scene();
     test_fx_effects();
     test_d3d9_capture();
     test_d3d9_backend_and_preshader();

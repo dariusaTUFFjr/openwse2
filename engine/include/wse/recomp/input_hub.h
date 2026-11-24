@@ -99,6 +99,61 @@ enum class TouchScene : std::uint8_t {
     screens = 7,
 };
 
+// The game's open-window stack, read for the automatic touch layout. Evidence (v1.1.5.6):
+// `g_gameScreen` (`0x14069b590`, `mbGameScreen`, PDB TPI `0xae09`, 328 B) holds
+// `m_windows : mbGameWindow*[38]` at +0x0 and `m_openWindows : rglVector<int>` at +0x130.
+// `mbGameScreen::isWindowOpen` (`0x1400f0db0`) compares the int before `end` (+0x138) with
+// `begin` (+0x130) as the guard, so the vector is {begin, end, capacity} and the top window is
+// `end[-1]`.
+inline constexpr std::size_t kGameScreenOpenWindowsBegin = 0x130U;
+inline constexpr std::size_t kGameScreenOpenWindowsEnd = 0x138U;
+inline constexpr std::int32_t kGameScreenWindowCount = 38;
+
+// The window open on top, or -1 when the stack is empty or does not look like one (read while
+// the game thread may be changing it: a torn read yields -1 or a stale id, never a wild pointer
+// beyond `end[-1]`).
+inline std::int32_t top_open_window(const std::uint8_t* game_screen) noexcept {
+    if (game_screen == nullptr) return -1;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::memcpy(&begin, game_screen + kGameScreenOpenWindowsBegin, sizeof(begin));
+    std::memcpy(&end, game_screen + kGameScreenOpenWindowsEnd, sizeof(end));
+    if (begin < 0x10000U || end <= begin || ((end - begin) % sizeof(std::int32_t)) != 0U ||
+        (end - begin) > 256U * sizeof(std::int32_t)) {
+        return -1;
+    }
+    std::int32_t top = -1;
+    std::memcpy(&top, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(end - sizeof(std::int32_t))), sizeof(top));
+    return (top >= 0 && top < kGameScreenWindowCount) ? top : -1;
+}
+
+// `m_windows` slot -> touch layout. Slots from `mbGameScreen::createWindows` (`0x1400ef870`),
+// each named by its constructor or vtable in the PDB: 0 mbYesNoWindow, 1 mbSelectionWindow,
+// 2 mbStartingWindow, 3 mbLoadingWindow, 4 mbInitialWindow, 5 mbEscapeWindow, 6 mbMapWindow,
+// 7 mbInventoryWindow, 8 mbPartyWindow, 9 mbDummyWindow, 10 mbTacticalWindow,
+// 11 mbCharacterWindow, 12 mbConversationWindow, 18 mbMenuWindow, 21 mbNotesWindow,
+// 22 mbPresentationWindow (the rest are options, save/load, stats and multiplayer screens).
+inline TouchScene scene_for_open_window(std::int32_t slot) noexcept {
+    switch (slot) {
+    case 2:   // mbStartingWindow
+    case 3:   // mbLoadingWindow
+    case 4:   // mbInitialWindow (the main menu)
+        return TouchScene::main_menu;
+    case 6:   // mbMapWindow
+        return TouchScene::campaign_map;
+    case 7:   // mbInventoryWindow (inventory, trade and loot)
+        return TouchScene::trade;
+    case 8:   // mbPartyWindow
+        return TouchScene::party;
+    case 10:  // mbTacticalWindow (scenes and battles)
+        return TouchScene::battle;
+    case 12:  // mbConversationWindow
+        return TouchScene::dialog;
+    default:
+        return TouchScene::screens;
+    }
+}
+
 enum class ActiveInputMode : std::uint8_t {
     touch = 0,
     gamepad = 1,

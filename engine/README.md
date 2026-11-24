@@ -1050,6 +1050,16 @@ Phase 5 R0 recompiler (`wse/recomp/`, `src/recomp/`):
   channel callbacks are stored and never called. Steam behaves as on a PC where it is not
   running: `SteamAPI_Init` returns false, interface lookups return NULL, and
   `SteamInternal_ContextInit` returns its context without calling the initializer.
+- **R6 FMOD output device (`shim_fmod_steam.h`):** the mixer thread tops the device up to 2,048
+  queued frames every 10 ms. When the device closes or refuses frames (a route change), the mixer
+  reopens it through `on_device_recover` with the mixer lock released, so game-thread FMOD calls
+  never wait for the reopen; calls that reach the device itself (pause, driver name, software
+  format) take `dev_m_` and do wait. A failed reopen is retried every 500 ms. Replace the hook with
+  `set_device_recover`, and stop the worker first when tearing down.
+- **R6 automatic touch layout (`input_hub.h` `top_open_window` / `scene_for_open_window`):** reads
+  `g_gameScreen->m_openWindows` (`+0x130`) while the game thread may change it; a torn read gives
+  -1 (ignored) or a stale window id for one poll. Window slots outside the mapped set use the
+  general "screens" layout.
 - **R4 code-relative offset tables (`discover.cpp` `find_offset_table_entries`):** a table is
   recognised only from code that loads a 16-bit value from it and adds a register holding a
   `.pdata` function's start within 8 instructions (tracked in address order through each

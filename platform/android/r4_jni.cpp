@@ -349,7 +349,7 @@ std::string g_progress_path;
 std::atomic<std::uint64_t> g_va_game_screen{0U};
 std::atomic<std::uint64_t> g_va_cheat_mode{0U};
 
-// Safely polls Warband's live `g_gameScreen->m_windowStack` and `rglConfig::General::bCheatMode`
+// Polls Warband's live `g_gameScreen->m_openWindows` and `rglConfig::General::bCheatMode`
 // from fixed-address guest memory (resolved from the user's PDB at startup) to drive automatic
 // per-scene touch layouts and live cheat-menu visibility.
 void poll_guest_scene_and_cheats() noexcept {
@@ -365,50 +365,11 @@ void poll_guest_scene_and_cheats() noexcept {
 
     const std::uint64_t gs_va = g_va_game_screen.load(std::memory_order_acquire);
     if (gs_va < 0x10000000ULL) return;
-    // `g_gameScreen->m_windowStack` sits at offset +0x0 (24 B vector: either {ptr, size, cap} or {begin, end, cap}).
-    const auto* words = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(gs_va));
-    const std::uint64_t w0 = words[0];
-    const std::uint64_t w1 = words[1];
-    if (w0 < 0x10000ULL) return;
-    std::size_t count = 0U;
-    if (w1 > 0U && w1 <= 64U) {
-        count = static_cast<std::size_t>(w1);
-    } else if (w1 > w0 && (w1 - w0) <= 64U * sizeof(std::int32_t) && ((w1 - w0) % sizeof(std::int32_t)) == 0U) {
-        count = static_cast<std::size_t>((w1 - w0) / sizeof(std::int32_t));
-    } else {
-        return;
-    }
-    const auto* stack = reinterpret_cast<const std::int32_t*>(static_cast<std::uintptr_t>(w0));
-    const std::int32_t top_id = stack[count - 1U];
-    if (top_id < 0 || top_id > 64) return;
-
-    using wse::recomp::shim::TouchScene;
-    TouchScene scene = TouchScene::screens;
-    switch (top_id) {
-    case 0:   // mbInitialWindow
-    case 3:   // mbLoadingWindow
-        scene = TouchScene::main_menu;
-        break;
-    case 6:   // mbMapWindow
-        scene = TouchScene::campaign_map;
-        break;
-    case 7:   // mbPartyWindow
-        scene = TouchScene::party;
-        break;
-    case 9:   // mbInventoryWindow (Inventory, Trade & Looting)
-        scene = TouchScene::trade;
-        break;
-    case 10:  // mbTacticalWindow
-        scene = TouchScene::battle;
-        break;
-    case 12:  // mbConversationWindow
-        scene = TouchScene::dialog;
-        break;
-    default:
-        scene = TouchScene::screens;
-        break;
-    }
-    wse::recomp::shim::RecompInputHub::shared().set_inferred_scene(scene);
+    // `g_gameScreen->m_openWindows` (+0x130) and the window slots: input_hub.h, with the evidence.
+    const std::int32_t top = wse::recomp::shim::top_open_window(
+        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(gs_va)));
+    if (top < 0) return;
+    wse::recomp::shim::RecompInputHub::shared().set_inferred_scene(wse::recomp::shim::scene_for_open_window(top));
 }
 
 void report(const std::string& text) {
@@ -1117,9 +1078,10 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
     {
         const std::lock_guard<std::mutex> lock(g_audio_m);
         if (g_active_fmod != nullptr) {
-            g_active_fmod->on_device_recover = nullptr;
-            g_active_fmod->set_audio_device(nullptr, false);
+            // The mixer thread stops first: it may be running `on_device_recover` right now.
             g_active_fmod->stop_worker();
+            g_active_fmod->set_device_recover(nullptr);
+            g_active_fmod->set_audio_device(nullptr, false);
             g_active_fmod = nullptr;
         }
         if (g_aaudio_dev) {

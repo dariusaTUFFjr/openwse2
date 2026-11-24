@@ -102,7 +102,16 @@ public:
     // Embedder hooks (safe to configure from `created_hook()` or before `install()`).
     ReadFileFn read_file;
     HapticFn on_haptic;
+    // Reopens the output after a route change (headphones, Bluetooth). Runs on the mixer thread
+    // WITHOUT the mixer lock, so game-thread FMOD calls never wait for a reopen; only the few
+    // calls that reach the device itself wait (`dev_m_`). Change it later with
+    // `set_device_recover`, never by assignment while the worker runs.
     std::function<bool()> on_device_recover;
+
+    void set_device_recover(std::function<bool()> fn) {
+        const std::lock_guard<std::mutex> lock(m_);
+        on_device_recover = std::move(fn);
+    }
 
     void set_codec_backend(std::shared_ptr<wse::asset::AudioCodecBackend> backend) {
         const std::lock_guard<std::mutex> lock(m_);
@@ -146,6 +155,7 @@ public:
                 return;
             }
             app_paused_ = paused;
+            const std::lock_guard<std::mutex> dev_lock(dev_m_);
             if (audio_device_ != nullptr && audio_device_->is_open()) {
                 audio_device_->set_paused(paused);
             }
@@ -196,9 +206,16 @@ public:
     // Pumps audio into the attached `AudioDevice` up to `target_queued_frames` (one synchronous
     // step for tests or non-threaded hosts).
     std::size_t pump_once(std::size_t target_queued_frames = 2048U, std::size_t max_block_frames = 512U) {
-        const std::lock_guard<std::mutex> lock(m_);
-        return pump_locked(target_queued_frames, max_block_frames);
+        std::unique_lock<std::mutex> lock(m_);
+        std::size_t n = pump_locked(target_queued_frames, max_block_frames);
+        if (recover_wanted_ && recover_device(lock)) {
+            n += pump_locked(target_queued_frames, max_block_frames);
+        }
+        return n;
     }
+
+    // Times the output was reopened (route changes); for tests and the report.
+    [[nodiscard]] std::size_t device_recoveries() const noexcept { return device_recoveries_.load(std::memory_order_relaxed); }
 
     [[nodiscard]] std::size_t sounds_created() const noexcept { return sounds_created_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::size_t active_channel_count() const {
@@ -265,6 +282,7 @@ public:
                  const auto sr = static_cast<std::int32_t>(win64_arg(s, 1));
                  if (sr >= 8000 && sr <= static_cast<std::int32_t>(wse::asset::kMaxAudioSampleRate)) {
                      const std::lock_guard<std::mutex> lock(m_);
+                     const std::lock_guard<std::mutex> dev_lock(dev_m_);
                      if (audio_device_ == nullptr || !audio_device_->is_open()) {
                          output_sample_rate_ = static_cast<std::uint32_t>(sr);
                      }
@@ -386,6 +404,7 @@ public:
             const char* label = "WSE2 Audio Mixer";
             {
                 const std::lock_guard<std::mutex> lock(m_);
+                const std::lock_guard<std::mutex> dev_lock(dev_m_);
                 if (audio_device_ != nullptr && audio_device_->is_open()) {
                     label = audio_device_->backend_name();
                 }
@@ -1440,11 +1459,9 @@ private:
             return 0U;
         }
         if (audio_device_ == nullptr || !audio_device_->is_open()) {
-            if (on_device_recover && on_device_recover() && audio_device_ != nullptr && audio_device_->is_open()) {
-                output_sample_rate_ = std::max<std::uint32_t>(8000U, audio_device_->spec().sample_rate);
-            } else {
-                return 0U;
-            }
+            // Reopened by the caller with the lock released (`recover_device`).
+            if (audio_device_ != nullptr && on_device_recover) recover_wanted_ = true;
+            return 0U;
         }
         output_sample_rate_ = std::max<std::uint32_t>(8000U, audio_device_->spec().sample_rate);
         const std::size_t queued = audio_device_->queued_frames();
@@ -1458,14 +1475,7 @@ private:
             pump_buf_.assign(block * 2U, 0.0F);
             mix_locked(block, pump_buf_.data());
             if (!audio_device_->submit_frames(pump_buf_)) {
-                if (on_device_recover && on_device_recover() && audio_device_->is_open()) {
-                    output_sample_rate_ = std::max<std::uint32_t>(8000U, audio_device_->spec().sample_rate);
-                    if (audio_device_->submit_frames(pump_buf_)) {
-                        submitted += block;
-                        remaining -= block;
-                        continue;
-                    }
-                }
+                if (on_device_recover) recover_wanted_ = true;
                 break;
             }
             submitted += block;
@@ -1474,12 +1484,46 @@ private:
         return submitted;
     }
 
+    // Reopens the output through `on_device_recover` with `lock` (on `m_`) released, so the game
+    // thread's FMOD calls never wait for it; `dev_m_` keeps the few calls that reach the device
+    // itself (pause, driver name) out until it is done. Returns true when the device is open again.
+    bool recover_device(std::unique_lock<std::mutex>& lock) {
+        recover_wanted_ = false;
+        std::function<bool()> fn = on_device_recover;
+        if (!fn) return false;
+        lock.unlock();
+        bool ok = false;
+        {
+            const std::lock_guard<std::mutex> dev_lock(dev_m_);
+            ok = fn();
+        }
+        lock.lock();
+        if (ok && audio_device_ != nullptr && audio_device_->is_open()) {
+            output_sample_rate_ = std::max<std::uint32_t>(8000U, audio_device_->spec().sample_rate);
+            device_recoveries_.fetch_add(1U, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+
+    // The mixer wakes every 10 ms and keeps 2,048 frames (about 43 ms at 48 kHz) queued, so each
+    // wake tops up about 480 frames with a wide margin before the device runs dry.
+    static constexpr std::chrono::milliseconds kWorkerTick{10};
+
     void worker_loop() {
         std::unique_lock<std::mutex> lock(m_);
         auto last_tick = std::chrono::steady_clock::now();
         while (!stop_worker_) {
             const auto now = std::chrono::steady_clock::now();
-            const std::size_t pumped = pump_locked(2048U, 512U);
+            std::size_t pumped = pump_locked(2048U, 512U);
+            // A failed reopen (no audio route yet) is retried every 500 ms, not every tick.
+            if (recover_wanted_ && !stop_worker_ && !app_paused_ && now >= next_recover_at_) {
+                if (recover_device(lock)) {
+                    pumped += pump_locked(2048U, 512U);
+                } else {
+                    next_recover_at_ = now + std::chrono::milliseconds{500};
+                }
+            }
             if (pumped == 0U && !app_paused_ && (audio_device_ == nullptr || !audio_device_->is_open())) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_tick).count();
                 if (us > 0) {
@@ -1490,7 +1534,7 @@ private:
                 }
             }
             last_tick = now;
-            worker_cv_.wait_for(lock, std::chrono::microseconds{4000}, [this] { return stop_worker_; });
+            worker_cv_.wait_for(lock, kWorkerTick, [this] { return stop_worker_; });
         }
     }
 
@@ -1506,6 +1550,12 @@ private:
 
     Runtime& rt_;
     mutable std::mutex m_;
+    // Held around calls into `audio_device_` from outside the mixer thread, and by the mixer while it
+    // reopens the device without `m_`. Lock order: `m_` before `dev_m_`.
+    mutable std::mutex dev_m_;
+    bool recover_wanted_ = false;
+    std::chrono::steady_clock::time_point next_recover_at_{};
+    std::atomic<std::size_t> device_recoveries_{0U};
     std::condition_variable worker_cv_;
     HostThread worker_;
     bool stop_worker_ = false;
