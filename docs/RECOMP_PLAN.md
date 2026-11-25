@@ -1079,10 +1079,27 @@ own, and none blocks another.
 - **Goal:** Debug full gameplay (main menu → campaign map → town/tavern scene → battle → save/load)
   on x86-64 under `gdb` in WSL Ubuntu before fighting mobile GPU/thermal variables, and prove
   byte-compatible savegames against retail Windows Warband.
-- **Design:** Resolves the earlier "on Windows" statement in `Slices`: R7 runs in **WSL Ubuntu
-  x86-64** (reusing R4's `tools/r4_run.cpp` LLVM 18 toolchain) with our shims only (R5 Vulkan + R6
-  SDL3 audio/input). Interactive play uses WSLg Vulkan/SDL3 where available, with Mesa Lavapipe
-  software Vulkan + frame-dump / scripted-input verification as the deterministic fallback.
+- **Design (decided with the user, 2026-11-25):**
+  - Resolves the earlier "on Windows" statement in `Slices`: R7 runs in **WSL Ubuntu x86-64**
+    (reusing R4's `tools/r4_run.cpp` LLVM 18 toolchain) with our shims only (R5 Vulkan + R6
+    audio/input).
+  - **Route & soak:** Full `Native` route (Main Menu → New Game → Character Creation → Merchant Alley
+    intro fight & tavern/town scene with a 2+ minute soak → Campaign Map → 1 bandit field battle with
+    a 2+ minute soak → Save → Reload), with zero faults and zero missing imports.
+  - **Input driving:** Both a repeatable scripted-input runner (`scripted_input.h`) feeding
+    `RecompInputHub` deterministically AND an interactive live window (WSLg + SDL3) for interactive play.
+  - **Graphics:** Try WSLg Vulkan first for the live window, with Mesa Lavapipe software Vulkan
+    (`lvp_icd.json`) + saved frames compared against Windows reference frames (`r5_replay_d3d9` or
+    `r5_replay_vulkan --driver system` on Intel HD 520 when `D3D9` HAL is unavailable) for the
+    repeatable check.
+  - **Sound:** `CaptureAudioDevice` in scripted runs (verifying non-silent stereo audio mixing without
+    speakers) + optional SDL3 speaker output in live window mode.
+  - **Savegame oracle:** Bidirectional (`WSL -> Windows` and `Windows -> WSL`), verified both
+    structurally via Phase 2A `savegame.h` (`wse_savecheck`) and in-game (campaign map opens with
+    matching party, gold, day, and position).
+  - **Debugging:** Keep `r4_startup.cpp`'s existing crash report (translator fingerprint
+    `2549b3c3c81f0ec5` after the `discover.cpp` jump-table fixes) plus a lightweight `tools/r7_gdb.sh`
+    launch helper and import-miss logger.
 - **Depends on:** R5a/R5b, R6.
 - **Done when:**
   - Translated `Native` runs in WSL from main menu → new character creation → campaign map → entering

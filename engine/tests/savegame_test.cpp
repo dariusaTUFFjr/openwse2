@@ -831,6 +831,7 @@ void test_savegame_troop_merge_and_inventory() {
     WseWorldState d = make_small_world();
     d.troops[1] = w.troops[1];
     d.troops[1].level = 1;
+    d.troops[1].class_no = 0;
     SavegameRuntimeContext rc{};
     rc.world = &d;
     rc.dont_load_regular_troop_inventories = true;

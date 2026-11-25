@@ -36,6 +36,7 @@
 #include "wse/recomp/r0_inputs.h"
 #include "wse/recomp/r2_rig.h"
 #include "wse/recomp/runtime.h"
+#include "wse/recomp/scripted_input.h"
 #include "wse/recomp/shim_advapi.h"
 #include "wse/recomp/shim_crt.h"
 #include "wse/recomp/shim_d3d9.h"
@@ -3595,6 +3596,87 @@ void test_time_crt_sysinfo() {
     }
     expect(rtl, "sysinfo: RtlGetVersion 10.0.19045 for any size, EX fields only at 284 (as on Windows)");
 
+    // ConcRT Win7/Win8 APIs: SetThreadGroupAffinity, GetThreadGroupAffinity,
+    // GetCurrentProcessorNumberEx, GetLogicalProcessorInformationEx(RelationAll), UMS stubs, Ro*.
+    {
+        auto call_shim = [&](const char* dll, const char* name, std::initializer_list<std::uint64_t> args) {
+            const Runtime::ImportShim* shim = rt.named_shim(dll, name);
+            if (shim == nullptr) {
+                return std::uint64_t{0xBADBADBAD};
+            }
+            constexpr std::uint64_t kRet = 0x140031000ULL;
+            const std::uint64_t rsp0 = s.gpr[4];
+            s.gpr[4] = (rsp0 - 0x80) & ~std::uint64_t{15};
+            static constexpr int kArgReg[4] = {1, 2, 8, 9};
+            std::size_t idx = 0;
+            for (const std::uint64_t a : args) {
+                if (idx < 4) s.gpr[kArgReg[idx]] = a;
+                ++idx;
+            }
+            s.gpr[4] -= 8;
+            std::memcpy(reinterpret_cast<void*>(s.gpr[4]), &kRet, 8);
+            s.gpr[0] = 0xBADBADBAD;
+            (*shim)(s);
+            s.gpr[4] = rsp0;
+            return s.gpr[0];
+        };
+        auto k32_ex = [&](const char* name, std::initializer_list<std::uint64_t> args) {
+            return call_shim("KERNEL32.dll", name, args);
+        };
+        alignas(8) std::uint8_t aff[16] = {};
+        alignas(8) std::uint8_t prev[16] = {};
+        std::memset(prev, 0xCC, sizeof prev);
+        const bool gga = k32_ex("GetThreadGroupAffinity", {teb::kCurrentThread, va(aff)}) == 1 &&
+                         u32_at(aff, 0) == 0xF && u32_at(aff, 8) == 0;
+        const bool sga = k32_ex("SetThreadGroupAffinity", {teb::kCurrentThread, va(aff), va(prev)}) == 1 &&
+                         u32_at(prev, 0) == 0xF && u32_at(prev, 8) == 0;
+        alignas(8) std::uint32_t pn = 0xDEADBEEFU;
+        const bool cpn = k32_ex("GetCurrentProcessorNumberEx", {va(&pn)}) == 0 && pn == 0;
+
+        alignas(8) std::uint32_t ex_len = 0;
+        const std::uint32_t want_len = 4U * 48U + 176U;  // 4 cores + numa + package + group
+        const bool ex_probe = k32_ex("GetLogicalProcessorInformationEx", {0xFFFFU, 0, va(&ex_len)}) == 0 &&
+                              call(s, "GetLastError", {}) == sh::kErrorInsufficientBuffer && ex_len == want_len;
+        std::vector<std::uint8_t> ex_buf(want_len, 0U);
+        const bool ex_ok =
+            k32_ex("GetLogicalProcessorInformationEx", {0xFFFFU, va(ex_buf.data()), va(&ex_len)}) == 1 &&
+            ex_len == want_len;
+        bool saw_pkg = false, saw_numa = false, saw_grp = false;
+        for (std::size_t off = 0; off + 8 <= ex_buf.size();) {
+            const std::uint32_t rel = u32_at(ex_buf.data(), off);
+            const std::uint32_t sz = u32_at(ex_buf.data(), off + 4);
+            if (sz == 0 || off + sz > ex_buf.size()) break;
+            if (rel == 1 && sz >= 48) saw_numa = u32_at(ex_buf.data(), off + 32) == 0xF;
+            if (rel == 3 && sz >= 48) {
+                std::uint16_t gc = 0;
+                std::memcpy(&gc, ex_buf.data() + off + 30, 2);
+                saw_pkg = gc == 1 && u32_at(ex_buf.data(), off + 32) == 0xF;
+            }
+            if (rel == 4 && sz >= 80) saw_grp = ex_buf[off + 32] == 4 && u32_at(ex_buf.data(), off + 72) == 0xF;
+            off += sz;
+        }
+
+        sh::Modules mods(rt);
+        mods.install();
+        const char k32_s[] = "kernel32.dll";
+        const char combase_s[] = "combase.dll";
+        const char ro_init_s[] = "RoInitialize";
+        const char ro_uninit_s[] = "RoUninitialize";
+        const char ums_s[] = "CreateUmsCompletionList";
+        const std::uint64_t h_k32 = k32_ex("GetModuleHandleA", {va(k32_s)});
+        const std::uint64_t h_cb = k32_ex("LoadLibraryExA", {va(combase_s), 0, 0x800});
+        const bool procs = h_k32 != 0 && h_cb != 0 &&
+                           k32_ex("GetProcAddress", {h_k32, va(ums_s)}) != 0 &&
+                           k32_ex("GetProcAddress", {h_cb, va(ro_init_s)}) != 0 &&
+                           k32_ex("GetProcAddress", {h_cb, va(ro_uninit_s)}) != 0 &&
+                           k32_ex("CreateUmsCompletionList", {0}) == 0 &&
+                           call(s, "GetLastError", {}) == 50 &&
+                           call_shim("combase.dll", "RoInitialize", {0}) == 0 &&
+                           call_shim("combase.dll", "RoUninitialize", {}) == 0;
+        expect(gga && sga && cpn && ex_probe && ex_ok && saw_numa && saw_pkg && saw_grp && procs,
+               "sysinfo: ConcRT Win7/Win8 affinity, GetLogicalProcessorInformationEx, UMS stubs, combase Ro*");
+    }
+
     // Timer queues: a one-shot timer, then a periodic one deleted with INVALID_HANDLE_VALUE.
     const std::uint64_t q = call(s, "CreateTimerQueue", {});
     alignas(8) std::uint64_t t = 0;
@@ -4369,6 +4451,14 @@ void test_advapi() {
         for (int i = 0; i < 18; ++i) nonzero += rnd[i] != 0;
         expect(filled && nonzero >= 8 && rnd[18] == 0,
                "advapi: SystemFunction036 (RtlGenRandom) fills exactly the buffer and returns TRUE (LuaJIT's PRNG seed)");
+        std::uint64_t trace_reg = 0;
+        expect(call(rt, s, "RegisterTraceGuidsW", {0, 0, 0, 0, 0, 0, 0, va(&trace_reg)}) == 0 && trace_reg == 1 &&
+                   call(rt, s, "GetTraceLoggerHandle", {0}) == 0 &&
+                   call(rt, s, "GetTraceEnableLevel", {0}) == 0 &&
+                   call(rt, s, "GetTraceEnableFlags", {0}) == 0 &&
+                   call(rt, s, "TraceEvent", {0, 0}) == 0 &&
+                   call(rt, s, "UnregisterTraceGuids", {trace_reg}) == 0,
+               "advapi: ConcRT ETW tracing stubs return success and RegisterTraceGuidsW writes handle");
         const char text[] = "hello";
         const std::uint32_t dword = 0x12345678;
         expect(call(rt, s, "RegSetValueExA", {key, va("Greeting"), 0, sh::kRegSz, va(text), sizeof(text)}) == 0 &&
@@ -6762,6 +6852,215 @@ void test_r6_mod_controls_detector_and_icons() {
     expect(static_cast<int>(TouchIconId::count_) >= 60, "R6 Icons: full core + mod + extra icon catalog present");
 }
 
+void test_r7_scripted_input_and_d3d9_hooks() {
+    using namespace wse::recomp;
+    using namespace wse::recomp::shim;
+
+    // 1. ScriptedInputPlayer parsing, window waits, dump_frame tags, and stop.
+    {
+        ScriptedInputPlayer bad;
+        std::string bad_err;
+        expect(!bad.load_text("key_tap UNKNOWN_KEY_NAME\n", &bad_err) && !bad_err.empty(),
+               "R7 ScriptedInput: invalid key name fails with error");
+
+        ScriptedInputPlayer timeout_p;
+        expect(timeout_p.load_text("wait_window 6 2\n") && !timeout_p.empty(),
+               "R7 ScriptedInput: parses wait_window timeout");
+        RecompInputHub hub;
+        std::string log_line;
+        bool stop_now = false;
+        for (int i = 0; i < 5 && !stop_now; ++i) {
+            timeout_p.step_frame(hub, 4, log_line, stop_now);
+        }
+        expect(stop_now && timeout_p.timed_out() && timeout_p.timed_out_window() == 6,
+               "R7 ScriptedInput: wait_window times out when window slot differs");
+
+        ScriptedInputPlayer p;
+        std::string err;
+        const bool loaded = p.load_text(
+            "# R7 test route\n"
+            "wait_window 4 10\n"
+            "move 100 200\n"
+            "click 150 250\n"
+            "drag 10 20 50 60 4\n"
+            "key_tap K 1\n"
+            "text Hero\\n\n"
+            "mouse_delta 3 -2 2\n"
+            "wheel 120\n"
+            "dump_frame menu\n"
+            "log ok\n"
+            "stop\n",
+            &err);
+        expect(loaded && err.empty() && p.step_count() == 11U,
+               "R7 ScriptedInput: parses full route script");
+
+        std::vector<std::uint32_t> seen_msgs;
+        hub.set_window_msg_sink([&](std::uint32_t msg, std::uint64_t, std::uint64_t) {
+            seen_msgs.push_back(msg);
+        });
+        std::string saw_log;
+        std::string saw_dump;
+        stop_now = false;
+        for (int f = 0; f < 40 && !stop_now; ++f) {
+            p.step_frame(hub, 4, log_line, stop_now);
+            if (!log_line.empty()) saw_log += log_line;
+            if (p.has_pending_dump()) saw_dump = p.take_pending_dump_tag();
+        }
+        expect(stop_now && !p.timed_out() && saw_dump == "menu" && saw_log == "ok" && !seen_msgs.empty(),
+               "R7 ScriptedInput: executes clicks, keys, text, dump_frame, log, and stop");
+    }
+
+    // 2. D3d9 R7 Present readback + on_after_present hooks preserve legacy on_present.
+    {
+        struct R7MockBackend final : D3d9Backend {
+            D3d9DriverReport rep{};
+            std::uint32_t w = 16U, h = 12U;
+            std::size_t no_rb = 0U, with_rb = 0U;
+            bool init(std::uint32_t iw, std::uint32_t ih, std::uint32_t, std::uint32_t, std::string*) override {
+                w = iw;
+                h = ih;
+                rep.ok = true;
+                return true;
+            }
+            bool reset(std::uint32_t iw, std::uint32_t ih, std::uint32_t, std::uint32_t, std::string*) override {
+                w = iw;
+                h = ih;
+                return true;
+            }
+            const D3d9DriverReport& report() const noexcept override { return rep; }
+            void create_buffer(std::uint64_t, bool, std::uint32_t, bool, std::uint32_t) override {}
+            void update_buffer(std::uint64_t, std::uint32_t, std::span<const std::uint8_t>, std::uint32_t) override {}
+            void destroy_buffer(std::uint64_t) override {}
+            void create_texture(std::uint64_t, int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) override {}
+            void upload_texture_level(std::uint64_t, std::uint32_t, std::uint32_t, std::span<const std::uint8_t>, std::uint32_t) override {}
+            void upload_texture_dds(std::uint64_t, std::span<const std::uint8_t>) override {}
+            void destroy_texture(std::uint64_t) override {}
+            void create_surface(std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint64_t, std::uint32_t, std::uint32_t) override {}
+            void destroy_surface(std::uint64_t) override {}
+            void create_vertex_decl(std::uint64_t, std::span<const D3d9VertexElement>) override {}
+            void destroy_vertex_decl(std::uint64_t) override {}
+            void create_shader(std::uint64_t, bool, std::span<const std::uint8_t>) override {}
+            void destroy_shader(std::uint64_t) override {}
+            void clear(const D3d9DrawState&, std::uint32_t, std::uint32_t, float, std::uint32_t, std::span<const D3d9Rect>) override {}
+            void draw_indexed(const D3d9DrawState&, std::uint32_t, std::int32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) override {}
+            void draw_primitive(const D3d9DrawState&, std::uint32_t, std::uint32_t, std::uint32_t) override {}
+            bool present(std::vector<std::uint8_t>* out, std::uint32_t* ow, std::uint32_t* oh) override {
+                if (out == nullptr) {
+                    ++no_rb;
+                    return true;
+                }
+                ++with_rb;
+                if (ow != nullptr) *ow = w;
+                if (oh != nullptr) *oh = h;
+                out->assign(static_cast<std::size_t>(w) * h * 4U, 0xABU);
+                return true;
+            }
+        };
+
+        namespace comi = wse::recomp::com;
+        using d3d_test::com;
+        using u32_test::call;
+        Runtime rt;
+        D3d9 d3d(rt);
+        R7MockBackend mock;
+        d3d.backend = &mock;
+        std::vector<std::uint64_t> rb_frames, after_frames, legacy_frames;
+        std::size_t rb_bytes = 0U;
+        std::uint8_t rb_first = 0U;
+        d3d.should_readback = [](std::uint64_t frame) { return frame == 2U; };
+        d3d.on_present_rgba = [&](std::uint64_t frame, std::span<const std::uint8_t> rgba,
+                                  std::uint32_t rw, std::uint32_t rh) {
+            rb_frames.push_back(frame);
+            if (rw == 16U && rh == 12U && !rgba.empty()) {
+                rb_bytes = rgba.size();
+                rb_first = rgba[0];
+            }
+        };
+        d3d.on_after_present = [&](std::uint64_t frames) { after_frames.push_back(frames); };
+        d3d.on_present = [&](std::uint64_t frames) { legacy_frames.push_back(frames); };
+        (void)d3d.install();
+
+        GuestStack stack(256 * 1024);
+        CpuState s;
+        stack.prepare(s);
+        rt.attach(s);
+        auto va = [](const void* p) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p)); };
+        const std::uint64_t d9 = call(rt, s, "d3d9.dll", "Direct3DCreate9", {32});
+        alignas(8) std::uint8_t pp[64] = {};
+        const std::uint32_t w = 16U, h = 12U, one = 1U, d24 = kD3dFmtD24S8;
+        std::memcpy(pp, &w, 4);
+        std::memcpy(pp + 4, &h, 4);
+        std::memcpy(pp + 44, &one, 4);
+        std::memcpy(pp + 48, &d24, 4);
+        std::uint64_t dev = 0U;
+        (void)com(s, d9, comi::kIDirect3D9, "CreateDevice", {0, 1, 0, 0x40, va(pp), va(&dev)});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "Present", {0, 0, 0, 0});
+        (void)com(s, dev, comi::kIDirect3DDevice9, "Present", {0, 0, 0, 0});
+
+        expect(mock.no_rb == 1U && mock.with_rb == 1U &&
+                   rb_frames.size() == 1U && rb_frames[0] == 2U &&
+                   rb_bytes == 16U * 12U * 4U && rb_first == 0xABU &&
+                   after_frames.size() == 2U && after_frames[0] == 1U && after_frames[1] == 2U &&
+                   legacy_frames.size() == 2U && legacy_frames[0] == 1U && legacy_frames[1] == 2U,
+               "R7 D3d9 hooks: selective should_readback, on_present_rgba, on_after_present, and on_present all fire in order");
+    }
+
+    // 3. User32 GetCursorPos/SetCursorPos offset by main window origin when coupled to InputHub.
+    {
+        Runtime rt;
+        const FnRow rows[] = {{u32_test::kProcVa, &u32_test::wndproc}};
+        rt.add_table(rows, 1);
+        RecompInputHub hub;
+        hub.set_screen_size(1280, 720);
+        hub.set_surface_size(1280, 720);
+        User32 u32(rt, DisplayConfig{1280, 720});
+        u32.input_hub = &hub;
+        (void)u32.install();
+
+        GuestStack stack(256 * 1024);
+        CpuState s{};
+        stack.prepare(s);
+        rt.attach(s);
+        alignas(16) static std::uint8_t cur_teb[0x2000]{};
+        s.teb = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(cur_teb));
+        auto va = [](const void* p) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p)); };
+        auto U = [&](const char* name, std::initializer_list<std::uint64_t> args) {
+            return u32_test::call(rt, s, "USER32.dll", name, args);
+        };
+
+        alignas(8) std::uint8_t wc[80] = {};
+        const std::uint32_t wc_size = 80;
+        std::memcpy(wc, &wc_size, 4);
+        std::memcpy(wc + 8, &u32_test::kProcVa, 8);
+        const std::uint64_t cname = va(u"R7CursorWin");
+        std::memcpy(wc + 64, &cname, 8);
+        (void)U("RegisterClassExW", {va(wc)});
+        const std::uint64_t hwnd = U("CreateWindowExW", {
+            0, va(u"R7CursorWin"), va(u"WSE2"), 0x10CF0000U,
+            static_cast<std::uint64_t>(static_cast<std::uint32_t>(128)),
+            static_cast<std::uint64_t>(static_cast<std::uint32_t>(-24)),
+            1024, 768, 0, 0, 0, 0});
+        expect(hwnd != 0, "R7 Cursor: offset window created");
+
+        hub.inject_mouse_move_abs(185, 290);
+        std::int32_t pt[2] = {};
+        expect(U("GetCursorPos", {va(pt)}) == 1 && pt[0] == 313 && pt[1] == 266,
+               "R7 Cursor: GetCursorPos adds window origin (128, -24)");
+        expect(U("ScreenToClient", {hwnd, va(pt)}) == 1 && pt[0] == 185 && pt[1] == 290,
+               "R7 Cursor: GetCursorPos + ScreenToClient recovers exact client (185, 290)");
+
+        std::int32_t c2s[2] = {640, 10};
+        expect(U("ClientToScreen", {hwnd, va(c2s)}) == 1 && c2s[0] == 768 && c2s[1] == -14 &&
+                   U("SetCursorPos", {static_cast<std::uint64_t>(static_cast<std::uint32_t>(c2s[0])),
+                                      static_cast<std::uint64_t>(static_cast<std::uint32_t>(c2s[1]))}) == 1,
+               "R7 Cursor: SetCursorPos accepts negative Y screen origin without clamping");
+        int hx = 0, hy = 0;
+        hub.get_cursor_pos(hx, hy);
+        expect(hx == 640 && hy == 10,
+               "R7 Cursor: SetCursorPos round-trips back to exact client (640, 10)");
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -6815,6 +7114,7 @@ int run_recomp_suite(const char* fixture_path) {
     test_r6_fmod_audio_and_haptics();
     test_r6_input_shims_and_adaptive_touch();
     test_r6_mod_controls_detector_and_icons();
+    test_r7_scripted_input_and_d3d9_hooks();
     {
         GuestStack gs(64 * 1024);
         expect(gs.data() != nullptr && gs.usable_size() >= 64 * 1024 + 64,

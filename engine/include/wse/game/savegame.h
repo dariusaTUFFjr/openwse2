@@ -922,8 +922,11 @@ inline void write_world_body_sections(
                 w.write_string(tr.name);
                 w.write_string(tr.plural_name);
             }
-            w.write_i32(tr.class_no);
         }
+        // `mbTroop::m_classNo` (+0x19c) is serialized unconditionally outside the
+        // `is_hero() || !bDontLoadRegularTroopInventories` guard (`mbGame::saveTroops`
+        // `0x1400caa4c -> 0x1400cab40`).
+        w.write_i32(tr.class_no);
     }
     for (std::int32_t s = 0; s < kMaxSkills; ++s) {
         w.write_i32(world.skills[static_cast<std::size_t>(s)].max_level);
@@ -1339,11 +1342,13 @@ inline void write_world_body_sections(
                         return SavegameContainerResult::truncated;
                     }
                 }
-                if (!r.read_i32(tmp.class_no)) return SavegameContainerResult::truncated;
             }
+            // `mbTroop::m_classNo` (+0x19c) is serialized unconditionally (`mbGame::loadTroops`
+            // `0x1400c998f -> 0x1400c9a98`).
+            if (!r.read_i32(tmp.class_no)) return SavegameContainerResult::truncated;
 
             // Merge only what the file carried. Replacing the whole troop reset every
-            // regular troop's gold / xp / hit points / faction / inventory / face / class
+            // regular troop's gold / xp / hit points / faction / inventory / face
             // to `WseTroop{}` defaults whenever `bDontLoadRegularTroopInventories` skipped
             // that block, and dropped module-only fields such as upgrade paths.
             if (static_cast<std::size_t>(i) < world.troops.size()) {
@@ -1363,6 +1368,7 @@ inline void write_world_body_sections(
                 dst.attribute_points = tmp.attribute_points;
                 dst.proficiency_points = tmp.proficiency_points;
                 dst.level = tmp.level;
+                dst.class_no = tmp.class_no;
                 if (has_inventory_block) {
                     dst.gold = tmp.gold;
                     dst.xp = tmp.xp;
@@ -1375,7 +1381,6 @@ inline void write_world_body_sections(
                         dst.name = std::move(tmp.name);
                         dst.plural_name = std::move(tmp.plural_name);
                     }
-                    dst.class_no = tmp.class_no;
                 }
             }
         }

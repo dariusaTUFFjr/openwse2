@@ -714,6 +714,74 @@ void test_corpus(const char* path) {
     dlclose(tx.handle);
 }
 
+void test_discover_alias_jump_table_over_256() {
+    // Regression check for MSVC switches where index_reg == target (e.g. `mbStatement::execute`
+    // at 0x1401c6563..0x1401c6583): `movsxd rax, esi; lea rsi, [image_base]; mov eax, [rsi+rax*4+tbl];
+    // add rax, rsi; jmp rax`. Must resolve all 301 cases instead of falling back to the 256-entry cap.
+    constexpr std::uint64_t kImgBase = 0x100000ULL;
+    constexpr std::size_t kImgSize = 0x4000U;
+    std::vector<std::uint8_t> img(kImgSize, 0xCCU);
+    const std::uint8_t code[] = {
+        0x81, 0xFE, 0x2C, 0x01, 0x00, 0x00,        // 0x1000: cmp esi, 300
+        0x0F, 0x87, 0x1A, 0x00, 0x00, 0x00,        // 0x1006: ja 0x1026
+        0x48, 0x63, 0xC6,                          // 0x100c: movsxd rax, esi
+        0x48, 0x8D, 0x35, 0xEA, 0xEF, 0xFF, 0xFF,  // 0x100f: lea rsi, [rip - 0x1016] -> image_base
+        0x8B, 0x84, 0x86, 0x00, 0x20, 0x00, 0x00,  // 0x1016: mov eax, [rsi + rax*4 + 0x2000]
+        0x48, 0x03, 0xC6,                          // 0x101d: add rax, rsi
+        0xFF, 0xE0,                                // 0x1020: jmp rax
+        0x90, 0x90, 0x90, 0x90,                    // 0x1022: nop padding
+        0xC3,                                      // 0x1026: ret (default)
+    };
+    std::memcpy(img.data() + 0x1000U, code, sizeof(code));
+    constexpr std::uint32_t kCases = 301U;
+    for (std::uint32_t k = 0U; k < kCases; ++k) {
+        const std::uint32_t target_rva = 0x1100U + k;
+        img[target_rva] = 0xC3U;  // ret
+        std::memcpy(img.data() + 0x2000U + k * 4U, &target_rva, sizeof(target_rva));
+    }
+    const ImageView view(img.data(), kImgBase, kImgSize, kImgBase + 0x1000U, kImgBase + 0x3000U);
+    const std::vector<PeFunctionRange> ranges{{0x1000U, 0x1400U, 0U}};
+    Discoverer disc(view);
+    disc.set_function_ranges(&ranges);
+    const std::set<std::uint64_t> entries{kImgBase + 0x1000U};
+    const DFunction fn = disc.discover(kImgBase + 0x1000U, entries);
+    expect(fn.error.empty() && fn.unresolved_indirect_jumps.empty() && fn.jump_tables.size() == 1U &&
+               !fn.jump_tables[0].by_function_range && fn.jump_tables[0].targets.size() == kCases,
+           "R7 discover: jump table with index==target follows alias past cmp/ja (>256 targets)");
+}
+
+void test_discover_leaf_byte_jump_table() {
+    // Regression check for outlined leaf switches with no `.pdata` entry or local `cmp`/`ja`,
+    // matching 0x1400288e0: `lea r9, [base]; movsxd rax, r8d; movzx eax, byte [r9+rax+btbl];
+    // mov r8d, dword [r9+rax*4+tbl]; add r8, r9; jmp r8`.
+    constexpr std::uint64_t kImgBase = 0x100000ULL;
+    constexpr std::size_t kImgSize = 0x4000U;
+    std::vector<std::uint8_t> img(kImgSize, 0xCCU);
+    const std::uint8_t code[] = {
+        0x4C, 0x8D, 0x0D, 0xF9, 0xEF, 0xFF, 0xFF,        // 0x1000: lea r9, [rip - 0x1007] -> image_base
+        0x49, 0x63, 0xC0,                                // 0x1007: movsxd rax, r8d
+        0x41, 0x0F, 0xB6, 0x84, 0x01, 0x3C, 0x10, 0x00, 0x00,  // 0x100a: movzx eax, byte ptr [r9+rax+0x103c]
+        0x45, 0x8B, 0x84, 0x81, 0x30, 0x10, 0x00, 0x00,  // 0x1013: mov r8d, dword ptr [r9+rax*4+0x1030]
+        0x4D, 0x03, 0xC1,                                // 0x101b: add r8, r9
+        0x41, 0xFF, 0xE0,                                // 0x101e: jmp r8
+    };
+    std::memcpy(img.data() + 0x1000U, code, sizeof(code));
+    const std::uint32_t targets[3] = {0x1024U, 0x1028U, 0x102CU};
+    for (std::uint32_t k = 0U; k < 3U; ++k) {
+        img[targets[k]] = 0xC3U;  // ret
+        std::memcpy(img.data() + 0x1030U + k * 4U, &targets[k], sizeof(targets[k]));
+    }
+    const std::uint8_t btbl[4] = {0U, 1U, 2U, 1U};
+    std::memcpy(img.data() + 0x103CU, btbl, sizeof(btbl));
+    const ImageView view(img.data(), kImgBase, kImgSize, kImgBase + 0x1000U, kImgBase + 0x3000U);
+    Discoverer disc(view);
+    const std::set<std::uint64_t> entries{kImgBase + 0x1000U};
+    const DFunction fn = disc.discover(kImgBase + 0x1000U, entries);
+    expect(fn.error.empty() && fn.unresolved_indirect_jumps.empty() && fn.jump_tables.size() == 1U &&
+               fn.jump_tables[0].by_function_range && fn.jump_tables[0].targets.size() == 3U,
+           "R7 discover: leaf byte-table jump table with no .pdata bounds entries to [entry, table)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -750,6 +818,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     test_translate_small_functions(dir);
+    test_discover_alias_jump_table_over_256();
+    test_discover_leaf_byte_jump_table();
     if (corpus != nullptr) {
         test_corpus(corpus);
     } else {

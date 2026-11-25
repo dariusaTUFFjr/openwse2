@@ -314,6 +314,16 @@ public:
             }
             win64_return(s, 1);
         });
+        // MSVC ConcRT ETW tracing init loads advapi32.dll via LoadLibraryExW + GetProcAddress.
+        bind("RegisterTraceGuidsW", [](CpuState& s) {
+            if (const std::uint64_t out = win64_arg(s, 7)) crt_detail::put<std::uint64_t>(out, 1);
+            win64_return(s, 0);
+        });
+        bind("UnregisterTraceGuids", [](CpuState& s) { win64_return(s, 0); });
+        bind("TraceEvent", [](CpuState& s) { win64_return(s, 0); });
+        bind("GetTraceLoggerHandle", [](CpuState& s) { win64_return(s, 0); });
+        bind("GetTraceEnableLevel", [](CpuState& s) { win64_return(s, 0); });
+        bind("GetTraceEnableFlags", [](CpuState& s) { win64_return(s, 0); });
         bind("CryptAcquireContextA", [this](CpuState& s) {
             const std::uint64_t out = win64_arg(s, 0);
             if (out == 0) return fail(s, teb::kErrorInvalidParameter);

@@ -114,10 +114,12 @@ bool Discoverer::resolve_jump_table(const DFunction& fn, const DInsn& jmp, JumpT
     std::uint64_t table = 0;
     std::int64_t table_disp = 0;
     std::uint64_t entry_load_va = 0;
+    std::size_t entry_load_idx = 0;
     bool have_entry_load = false;
     bool signed_entries = false;
     bool have_add = false;
-    for (const DInsn* p : prev) {
+    for (std::size_t k = 0; k < prev.size(); ++k) {
+        const DInsn* p = prev[k];
         const auto& i = p->ins;
         if (!have_add && i.mnemonic == ZYDIS_MNEMONIC_ADD && is_reg(p->ops[0], target) &&
             p->ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -135,6 +137,7 @@ bool Discoverer::resolve_jump_table(const DFunction& fn, const DInsn& jmp, JumpT
             signed_entries = i.mnemonic == ZYDIS_MNEMONIC_MOVSXD;
             have_entry_load = true;
             entry_load_va = p->va;
+            entry_load_idx = k;
             continue;
         }
     }
@@ -198,8 +201,8 @@ bool Discoverer::resolve_jump_table(const DFunction& fn, const DInsn& jmp, JumpT
     // Optional byte index table feeding the dword index, and the bound.
     std::uint64_t byte_table = 0;
     ZydisRegister bound_reg = index_reg;
-    std::size_t alias_from = 0;  // copies are searched before this position in `prev`
-    for (std::size_t k = 0; k < prev.size(); ++k) {
+    std::size_t alias_from = entry_load_idx + 1;  // copies are searched before the table load in `prev`
+    for (std::size_t k = entry_load_idx + 1; k < prev.size(); ++k) {
         const DInsn* p = prev[k];
         // The image base may be the memory operand's base (`[rB + rI + t]`) or, scale 1, its index
         // (`[rI + rB + t]`: lua5164's lexer switch).
@@ -230,6 +233,7 @@ bool Discoverer::resolve_jump_table(const DFunction& fn, const DInsn& jmp, JumpT
                 const ZydisRegister src = widen(p->ops[1].reg.value);
                 if (src != bound_reg) {
                     bound_reg = src;
+                    alias_from = k + 1;
                     moved = true;
                 }
                 break;
@@ -311,27 +315,49 @@ bool Discoverer::resolve_jump_table(const DFunction& fn, const DInsn& jmp, JumpT
             break;
         }
     }
-    if (limit < 0 && ranges_ != nullptr && !table_relative && byte_table == 0) {
-        // R4: no bound in the code. Read entries while each lands inside the .pdata function
-        // that holds the jmp (at most 256); a table must have two entries to count.
-        const auto rva = static_cast<std::uint32_t>(jmp.va - base);
-        const auto it2 = std::upper_bound(ranges_->begin(), ranges_->end(), rva,
-                                          [](std::uint32_t v, const PeFunctionRange& r) { return v < r.begin; });
-        if (it2 == ranges_->begin() || rva >= std::prev(it2)->end) {
+    if (limit < 0 && !table_relative) {
+        // R4/R7: no local bound in the function. Bound entries to the owning `.pdata` function, or
+        // for an outlined leaf switch (no `.pdata` entry) whose inline RVA table sits directly after
+        // its cases, to `[fn.entry, table)`. Two or more in-range entries confirm a table.
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+        if (ranges_ != nullptr) {
+            const auto rva = static_cast<std::uint32_t>(jmp.va - base);
+            const auto it2 = std::upper_bound(ranges_->begin(), ranges_->end(), rva,
+                                              [](std::uint32_t v, const PeFunctionRange& r) { return v < r.begin; });
+            if (it2 != ranges_->begin() && rva < std::prev(it2)->end) {
+                lo = base + std::prev(it2)->begin;
+                hi = base + std::prev(it2)->end;
+            }
+        }
+        if (lo == 0 && table > jmp.next() && view_.in_text(table) && table - fn.entry <= 65536ULL) {
+            lo = fn.entry;
+            hi = table;
+        }
+        if (hi > lo && table > jmp.next() && table < hi) {
+            hi = table;
+        }
+        if (hi <= lo) {
             return false;
         }
-        const std::uint64_t lo = base + std::prev(it2)->begin;
-        const std::uint64_t hi = base + std::prev(it2)->end;
+        std::uint32_t max_entries = 256U;
+        if (byte_table > table && (byte_table - table) % 4ULL == 0ULL) {
+            max_entries = std::min<std::uint32_t>(256U, static_cast<std::uint32_t>((byte_table - table) / 4ULL));
+        }
         out.jmp_va = jmp.va;
-        for (std::uint32_t k = 0; k < 256; ++k) {
+        for (std::uint32_t k = 0; k < max_entries; ++k) {
             std::uint32_t e = 0;
             if (!view_.read32(table + 4ULL * k, e) || base + e < lo || base + e >= hi) {
                 break;
             }
             out.targets.push_back(base + e);
         }
-        out.by_function_range = true;
-        return out.targets.size() >= 2;
+        if (out.targets.size() >= 2U) {
+            out.by_function_range = true;
+            return true;
+        }
+        out.targets.clear();
+        return false;
     }
     if (limit < 0 || limit > 65535) {
         return false;

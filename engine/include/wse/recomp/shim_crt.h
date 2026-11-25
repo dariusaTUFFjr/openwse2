@@ -151,7 +151,10 @@ public:
         cookie_ = (static_cast<std::uint64_t>(rd()) << 32) ^ rd() ^ 0x5DEECE66DULL;
         if (config_.processors == 0) {
             const unsigned n = std::thread::hardware_concurrency();
-            config_.processors = n == 0 ? 1 : (n > 64 ? 64 : n);
+            config_.processors = n == 0 ? 1 : n;
+        }
+        if (config_.processors > 64) {
+            config_.processors = 64;
         }
         command_a_ = config_.command_line;
         command_a_.push_back('\0');
@@ -265,10 +268,29 @@ public:
             win64_return(s, 0);
         });
         bind("GetLogicalProcessorInformation", [this](CpuState& s) { logical_processors(s); });
+        bind("GetLogicalProcessorInformationEx", [this](CpuState& s) { logical_processors_ex(s); });
         bind("GetProcessAffinityMask", [this](CpuState& s) {
             if (const std::uint64_t p = win64_arg(s, 1)) put<std::uint64_t>(p, mask());
             if (const std::uint64_t p = win64_arg(s, 2)) put<std::uint64_t>(p, mask());
             win64_return(s, 1);
+        });
+        bind("SetThreadGroupAffinity", [this](CpuState& s) {
+            if (const std::uint64_t prev = win64_arg(s, 2)) {
+                std::memset(reinterpret_cast<void*>(prev), 0, 16);
+                put<std::uint64_t>(prev, mask());
+            }
+            win64_return(s, 1);
+        });
+        bind("GetThreadGroupAffinity", [this](CpuState& s) {
+            if (const std::uint64_t aff = win64_arg(s, 1)) {
+                std::memset(reinterpret_cast<void*>(aff), 0, 16);
+                put<std::uint64_t>(aff, mask());
+            }
+            win64_return(s, 1);
+        });
+        bind("GetCurrentProcessorNumberEx", [](CpuState& s) {
+            if (const std::uint64_t p = win64_arg(s, 0)) put<std::uint32_t>(p, 0);
+            win64_return(s, 0);
         });
         bind("GetVersionExW", [](CpuState& s) {
             const std::uint64_t v = win64_arg(s, 0);
@@ -339,6 +361,33 @@ public:
             win64_return(s, 1);
         });
         bind("SetProcessWorkingSetSize", [](CpuState& s) { win64_return(s, 1); });
+        // MSVC ConcRT resolves these Win7/Win8 APIs via GetProcAddress when GetVersionExW >= 6.1.
+        for (const char* ums_or_attr : {
+                 "CreateRemoteThreadEx",
+                 "CreateUmsCompletionList",
+                 "CreateUmsThreadContext",
+                 "DeleteProcThreadAttributeList",
+                 "DeleteUmsCompletionList",
+                 "DeleteUmsThreadContext",
+                 "DequeueUmsCompletionListItems",
+                 "EnterUmsSchedulingMode",
+                 "ExecuteUmsThread",
+                 "GetCurrentUmsThread",
+                 "GetNextUmsListItem",
+                 "GetUmsCompletionListEvent",
+                 "InitializeProcThreadAttributeList",
+                 "QueryUmsThreadInformation",
+                 "SetUmsThreadInformation",
+                 "UmsThreadYield",
+                 "UpdateProcThreadAttribute",
+             }) {
+            bind(ums_or_attr, [](CpuState& s) {
+                teb::set_error(s, 50);  // ERROR_NOT_SUPPORTED
+                win64_return(s, 0);
+            });
+        }
+        n += rt_.set_import("combase.dll", "RoInitialize", [](CpuState& s) { win64_return(s, 0); });
+        n += rt_.set_import("combase.dll", "RoUninitialize", [](CpuState& s) { win64_return(s, 0); });
         return n;
     }
 
@@ -407,6 +456,81 @@ private:
             put<std::uint64_t>(buf + 32ULL * i, std::uint64_t{1} << i);  // ProcessorMask
             put<std::uint32_t>(buf + 32ULL * i + 8, 0);                  // RelationProcessorCore
         }
+        put<std::uint32_t>(len, need);
+        win64_return(s, 1);
+    }
+
+    // GetLogicalProcessorInformationEx(Relationship, Buffer, ReturnedLength) for ConcRT topology.
+    void logical_processors_ex(CpuState& s) const {
+        using crt_detail::get;
+        using crt_detail::put;
+        const auto rel = static_cast<std::uint32_t>(win64_arg(s, 0));
+        const std::uint64_t buf = win64_arg(s, 1);
+        const std::uint64_t len = win64_arg(s, 2);
+        if (len == 0) {
+            teb::set_error(s, teb::kErrorInvalidParameter);
+            win64_return(s, 0);
+            return;
+        }
+        std::vector<std::uint8_t> out;
+        auto append = [&](std::uint32_t bytes, auto&& fill) {
+            const std::size_t base = out.size();
+            out.resize(base + bytes, 0U);
+            fill(out.data() + base);
+        };
+        auto w16 = [](std::uint8_t* p, std::size_t off, std::uint16_t v) { std::memcpy(p + off, &v, 2); };
+        auto w32 = [](std::uint8_t* p, std::size_t off, std::uint32_t v) { std::memcpy(p + off, &v, 4); };
+        auto w64 = [](std::uint8_t* p, std::size_t off, std::uint64_t v) { std::memcpy(p + off, &v, 8); };
+        const bool want_all = (rel == 0xFFFFU);
+        if (want_all || rel == 0U) {  // RelationProcessorCore
+            for (unsigned i = 0; i < config_.processors; ++i) {
+                append(48U, [&](std::uint8_t* p) {
+                    w32(p, 0, 0U);
+                    w32(p, 4, 48U);
+                    w16(p, 30, 1U);
+                    w64(p, 32, std::uint64_t{1} << i);
+                });
+            }
+        }
+        if (want_all || rel == 1U) {  // RelationNumaNode
+            append(48U, [&](std::uint8_t* p) {
+                w32(p, 0, 1U);
+                w32(p, 4, 48U);
+                w64(p, 32, mask());
+            });
+        }
+        if (want_all || rel == 3U) {  // RelationProcessorPackage
+            append(48U, [&](std::uint8_t* p) {
+                w32(p, 0, 3U);
+                w32(p, 4, 48U);
+                w16(p, 30, 1U);
+                w64(p, 32, mask());
+            });
+        }
+        if (want_all || rel == 4U) {  // RelationGroup
+            append(80U, [&](std::uint8_t* p) {
+                w32(p, 0, 4U);
+                w32(p, 4, 80U);
+                w16(p, 8, 1U);
+                w16(p, 10, 1U);
+                p[32] = static_cast<std::uint8_t>(config_.processors);
+                p[33] = static_cast<std::uint8_t>(config_.processors);
+                w64(p, 72, mask());
+            });
+        }
+        const auto need = static_cast<std::uint32_t>(out.size());
+        if (need == 0U) {
+            put<std::uint32_t>(len, 0U);
+            win64_return(s, 1);
+            return;
+        }
+        if (buf == 0 || get<std::uint32_t>(len) < need) {
+            put<std::uint32_t>(len, need);
+            teb::set_error(s, kErrorInsufficientBuffer);
+            win64_return(s, 0);
+            return;
+        }
+        std::memcpy(reinterpret_cast<void*>(buf), out.data(), need);
         put<std::uint32_t>(len, need);
         win64_return(s, 1);
     }

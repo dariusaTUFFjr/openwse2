@@ -338,6 +338,14 @@ public:
             int cy = 0;
             if (input_hub != nullptr) {
                 input_hub->get_cursor_pos(cx, cy);
+                int ox = 0;
+                int oy = 0;
+                {
+                    const std::lock_guard<std::mutex> lock(m_);
+                    main_window_origin_locked(ox, oy);
+                }
+                cx += ox;
+                cy += oy;
             } else {
                 const std::lock_guard<std::mutex> lock(m_);
                 cx = cursor_x_;
@@ -350,24 +358,27 @@ public:
         user("SetCursorPos", [this](CpuState& s) {
             int nx = 0;
             int ny = 0;
+            int ox = 0;
+            int oy = 0;
             {
                 const std::lock_guard<std::mutex> lock(m_);
                 cursor_x_ = clamp(static_cast<int>(win64_arg(s, 0)), clip_[0], clip_[2] - 1);
                 cursor_y_ = clamp(static_cast<int>(win64_arg(s, 1)), clip_[1], clip_[3] - 1);
                 nx = cursor_x_;
                 ny = cursor_y_;
+                main_window_origin_locked(ox, oy);
             }
-            if (input_hub != nullptr) input_hub->set_cursor_pos(nx, ny);
+            if (input_hub != nullptr) input_hub->set_cursor_pos(nx - ox, ny - oy);
             win64_return(s, 1);
         });
         user("ClipCursor", [this](CpuState& s) {
             const std::uint64_t r = win64_arg(s, 0);
             const std::lock_guard<std::mutex> lock(m_);
             if (r == 0) {
-                clip_[0] = 0;
-                clip_[1] = 0;
-                clip_[2] = display_.screen_width;
-                clip_[3] = display_.screen_height;
+                clip_[0] = -(1 << 20);
+                clip_[1] = -(1 << 20);
+                clip_[2] = 1 << 20;
+                clip_[3] = 1 << 20;
             } else {
                 for (int i = 0; i < 4; ++i) clip_[i] = get<std::int32_t>(r + 4 * static_cast<std::uint64_t>(i));
             }
@@ -494,6 +505,19 @@ private:
     bool exists(std::uint64_t h) const {
         const std::lock_guard<std::mutex> lock(m_);
         return windows_.count(h) != 0;
+    }
+    void main_window_origin_locked(int& ox, int& oy) const {
+        std::uint64_t target_hwnd = 0;
+        ox = 0;
+        oy = 0;
+        for (const auto& kv : windows_) {
+            if (target_hwnd == 0 || kv.second.visible) {
+                target_hwnd = kv.first;
+                ox = kv.second.x;
+                oy = kv.second.y;
+                if (kv.second.visible) break;
+            }
+        }
     }
     std::uint64_t swap_active(std::uint64_t h) {
         const std::lock_guard<std::mutex> lock(m_);
@@ -649,8 +673,25 @@ private:
         crt_detail::put<std::uint64_t>(p + 16, m.wparam);
         crt_detail::put<std::uint64_t>(p + 24, m.lparam);
         crt_detail::put<std::uint32_t>(p + 32, m.time);
-        crt_detail::put<std::int32_t>(p + 36, cursor_x_);
-        crt_detail::put<std::int32_t>(p + 40, cursor_y_);
+        int cx = 0;
+        int cy = 0;
+        if (input_hub != nullptr) {
+            input_hub->get_cursor_pos(cx, cy);
+            int ox = 0;
+            int oy = 0;
+            {
+                const std::lock_guard<std::mutex> lock(m_);
+                main_window_origin_locked(ox, oy);
+            }
+            cx += ox;
+            cy += oy;
+        } else {
+            const std::lock_guard<std::mutex> lock(m_);
+            cx = cursor_x_;
+            cy = cursor_y_;
+        }
+        crt_detail::put<std::int32_t>(p + 36, cx);
+        crt_detail::put<std::int32_t>(p + 40, cy);
     }
 
     Runtime& rt_;
@@ -666,7 +707,7 @@ private:
     std::uint64_t next_handle_ = 0x00A00000;
     std::uint64_t cursor_ = 0;
     int cursor_x_ = 0, cursor_y_ = 0;
-    int clip_[4] = {0, 0, 1 << 20, 1 << 20};
+    int clip_[4] = {-(1 << 20), -(1 << 20), 1 << 20, 1 << 20};
     std::map<std::uint32_t, std::vector<std::uint8_t>> clipboard_;
 };
 

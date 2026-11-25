@@ -97,6 +97,12 @@ public:
     // After each Present (device or swap chain), with the frame count so far: the R4 startup
     // runner stops after a set number of frames.
     std::function<void(std::uint64_t frames)> on_present;
+    // Optional R7 tooling hooks (not overwritten by `r4_startup.cpp`; zero overhead when unset).
+    std::function<bool(std::uint64_t frame)> should_readback;
+    std::function<void(std::uint64_t frame, std::span<const std::uint8_t> rgba,
+                       std::uint32_t width, std::uint32_t height)>
+        on_present_rgba;
+    std::function<void(std::uint64_t frames)> on_after_present;
     // Optional rendering backend (Phase 5 R5a step 4, e.g. `VulkanD3d9Backend`). When set,
     // live D3D9/D3DX calls drive it directly; when null, the device stays headless (R4).
     D3d9Backend* backend = nullptr;
@@ -1032,6 +1038,24 @@ private:
 
     void build_vtables();
 
+    void handle_present() {
+        ++frames_;
+        if (backend != nullptr) {
+            if (on_present_rgba && (!should_readback || should_readback(frames_))) {
+                std::uint32_t w = 0, h = 0;
+                if (backend->present(&present_rb_rgba_, &w, &h) && !present_rb_rgba_.empty()) {
+                    on_present_rgba(frames_, present_rb_rgba_, w, h);
+                }
+            } else {
+                (void)backend->present();
+            }
+        }
+        sweep_released();
+        if (on_after_present) on_after_present(frames_);
+        if (input_hub != nullptr) input_hub->tick_frame();
+        if (on_present) on_present(frames_);
+    }
+
     Runtime& rt_;
     D3d9Config cfg_;
     mutable std::mutex m_;
@@ -1049,6 +1073,7 @@ private:
     // Effect parameter handles: the name each was looked up by (stable storage: the guest reads
     // D3DXPARAMETER_DESC::Name through a pointer into it).
     std::map<std::uint64_t, std::string> handle_names_;
+    std::vector<std::uint8_t> present_rb_rgba_;
 };
 
 // The implemented methods, interface by interface.
@@ -1197,11 +1222,7 @@ inline void D3d9::build_vtables() {
              ret(s, 0);
          }},
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
-             if (backend != nullptr) (void)backend->present();
-             if (input_hub != nullptr) input_hub->tick_frame();
-             sweep_released();
-             ++frames_;
-             if (on_present) on_present(frames_);
+             handle_present();
              ret(s, 0);
          }},
         {"ShowCursor", [this, ret](CpuState& s, Obj&, std::uint64_t) {
@@ -1665,11 +1686,7 @@ inline void D3d9::build_vtables() {
     // IDirect3DSwapChain9
     make_table(Kind::swapchain, 0, com::kIDirect3DSwapChain9, {
         {"Present", [this, ret](CpuState& s, Obj&, std::uint64_t) {
-             if (backend != nullptr) (void)backend->present();
-             if (input_hub != nullptr) input_hub->tick_frame();
-             sweep_released();
-             ++frames_;
-             if (on_present) on_present(frames_);
+             handle_present();
              ret(s, 0);
          }},
         {"GetBackBuffer", [this, ret](CpuState& s, Obj& o, std::uint64_t) { put_ref(*this, win64_arg(s, 3), dev(o.parent)->backbuffer); ret(s, 0); }},
