@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/recomp/code_loader.h"
 #include "../src/recomp/discover.h"
 #include "../src/recomp/lift_r1.h"
 #include "../src/recomp/r0_spikes.h"
@@ -782,6 +783,125 @@ void test_discover_leaf_byte_jump_table() {
            "R7 discover: leaf byte-table jump table with no .pdata bounds entries to [entry, table)");
 }
 
+void test_cross_batch_direct_calls(const char* dir) {
+    // R8: direct cross-batch `call` and tail `jmp` lower through writable `wse_ext_calls[]`.
+    // Before patching, calls fall back cleanly to `Runtime::hook_dispatch`; after
+    // `Runtime::patch_external_calls`, both `dlopen` and `LoadedCode::load_own` jump straight to
+    // the callee without touching `Runtime::hook_dispatch`.
+    constexpr std::uint64_t kImgBase = 0x100000ULL;
+    constexpr std::uint64_t kCalleeVa = kImgBase + 0x1000U;
+    constexpr std::uint64_t kCallerVa = kImgBase + 0x1100U;
+    constexpr std::uint64_t kTailVa = kImgBase + 0x1200U;
+    std::vector<std::uint8_t> img(0x2000U, 0xCCU);
+    // Callee @ 0x101000: mov rax, rcx; add rax, 7; ret
+    const std::uint8_t callee_bytes[] = {0x48, 0x89, 0xC8, 0x48, 0x83, 0xC0, 0x07, 0xC3};
+    std::memcpy(img.data() + 0x1000U, callee_bytes, sizeof(callee_bytes));
+    // Caller @ 0x101100: call 0x101000; add rax, 3; ret (rel32 = 0x101000 - 0x101105 = -0x105)
+    const std::uint8_t caller_bytes[] = {0xE8, 0xFB, 0xFE, 0xFF, 0xFF, 0x48, 0x83, 0xC0, 0x03, 0xC3};
+    std::memcpy(img.data() + 0x1100U, caller_bytes, sizeof(caller_bytes));
+    // Tail @ 0x101200: add rcx, 10; jmp 0x101000 (rel32 = 0x101000 - 0x101209 = -0x209)
+    const std::uint8_t tail_bytes[] = {0x48, 0x83, 0xC1, 0x0A, 0xE9, 0xF7, 0xFD, 0xFF, 0xFF};
+    std::memcpy(img.data() + 0x1200U, tail_bytes, sizeof(tail_bytes));
+
+    const ImageView view(img.data(), kImgBase, img.size(), kImgBase + 0x1000U, kImgBase + 0x1400U);
+    const std::set<std::uint64_t> entries{kCalleeVa, kCallerVa, kTailVa};
+    Discoverer disc(view);
+    ImageInfo info;
+    info.base = kImgBase;
+
+    auto emit_batch = [&](const std::vector<std::uint64_t>& vas, const std::string& tag) -> std::string {
+        R1Translator tr(info);
+        tr.declare(vas);
+        std::string why;
+        for (const std::uint64_t va : vas) {
+            expect(tr.lift(disc.discover(va, entries), &why), ("R8 cross-batch lift " + tag).c_str());
+        }
+        std::vector<char> obj;
+        std::string err;
+        expect(tr.emit_object(2, obj, nullptr, &err) && !obj.empty(), ("R8 cross-batch emit " + tag).c_str());
+        const std::string o = std::string(dir) + "/" + tag + ".o";
+        const std::string so = std::string(dir) + "/" + tag + ".so";
+        std::ofstream(o, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
+        std::string log;
+        expect(link_shared_object({o}, so, &log), ("R8 cross-batch link " + tag).c_str());
+        return so;
+    };
+
+    const std::string so_b = emit_batch({kCalleeVa}, "r8_batch_b");
+    const std::string so_a = emit_batch({kCallerVa, kTailVa}, "r8_batch_a");
+
+    auto run_with_loader = [&](bool own_loader) {
+        auto load = [&](const std::string& path, LoadedCode& out) {
+            std::string err;
+            if (own_loader) {
+                std::ifstream in(path, std::ios::binary);
+                std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                return out.load_own(bytes, &err);
+            }
+            void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (h == nullptr) return false;
+            out.adopt_handle(h);
+            return true;
+        };
+        LoadedCode code_a;
+        LoadedCode code_b;
+        expect(load(so_a, code_a) && load(so_b, code_b),
+               own_loader ? "R8 cross-batch: load_own loads both batches" : "R8 cross-batch: dlopen loads both batches");
+        Runtime rt;
+        rt.add_table(static_cast<const FnRow*>(code_a.sym("wse_fn_table")),
+                     static_cast<std::size_t>(*static_cast<const std::uint64_t*>(code_a.sym("wse_fn_table_count"))));
+        rt.add_table(static_cast<const FnRow*>(code_b.sym("wse_fn_table")),
+                     static_cast<std::size_t>(*static_cast<const std::uint64_t*>(code_b.sym("wse_fn_table_count"))));
+
+        // Unpatched fallback works through `Runtime::hook_dispatch`.
+        {
+            GuestStack stack;
+            CpuState s;
+            stack.prepare(s);
+            s.gpr[1] = 32;
+            expect(rt.run(s, kCallerVa) && s.gpr[0] == 42, "R8 cross-batch: unpatched direct call works");
+            stack.prepare(s);
+            s.gpr[1] = 32;
+            expect(rt.run(s, kTailVa) && s.gpr[0] == 49, "R8 cross-batch: unpatched direct tail-call works");
+        }
+
+        // Patch `wse_ext_calls[]` and prove direct calls bypass `hooks->dispatch` completely.
+        const auto* cnt = static_cast<const std::uint64_t*>(code_a.sym("wse_ext_call_count"));
+        auto* slots = static_cast<GuestFn*>(code_a.sym("wse_ext_calls"));
+        const auto* vas = static_cast<const std::uint64_t*>(code_a.sym("wse_ext_call_vas"));
+        expect(cnt != nullptr && *cnt == 1U && slots != nullptr && vas != nullptr && vas[0] == kCalleeVa,
+               "R8 cross-batch: batch A exports 1 external call slot for callee");
+        expect(rt.patch_external_calls(slots, vas, static_cast<std::size_t>(*cnt)) == 1U,
+               "R8 cross-batch: patch_external_calls resolves callee");
+
+        static int dispatch_hits = 0;
+        dispatch_hits = 0;
+        RuntimeHooks trap_hooks = *rt.hooks();
+        trap_hooks.dispatch = [](CpuState*, std::uint64_t) { ++dispatch_hits; };
+        {
+            GuestStack stack;
+            CpuState s;
+            stack.prepare(s);
+            s.hooks = &trap_hooks;
+            s.gpr[1] = 100;
+            rt.find(kCallerVa)(&s);
+            expect(s.gpr[0] == 110 && dispatch_hits == 0,
+                   own_loader ? "R8 cross-batch (load_own): patched call skips dispatch"
+                              : "R8 cross-batch (dlopen): patched call skips dispatch");
+            stack.prepare(s);
+            s.hooks = &trap_hooks;
+            s.gpr[1] = 100;
+            rt.find(kTailVa)(&s);
+            expect(s.gpr[0] == 117 && dispatch_hits == 0,
+                   own_loader ? "R8 cross-batch (load_own): patched tail-call skips dispatch"
+                              : "R8 cross-batch (dlopen): patched tail-call skips dispatch");
+        }
+    };
+
+    run_with_loader(false);
+    run_with_loader(true);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -820,6 +940,7 @@ int main(int argc, char** argv) {
     test_translate_small_functions(dir);
     test_discover_alias_jump_table_over_256();
     test_discover_leaf_byte_jump_table();
+    test_cross_batch_direct_calls(dir);
     if (corpus != nullptr) {
         test_corpus(corpus);
     } else {

@@ -63,6 +63,11 @@ fun AdvancedScreen(
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onClearInstallCache: () -> Unit = {},
     onClearTextureCache: () -> Unit = {},
+    onClearSoCache: () -> Unit = {},
+    onClearShaderCache: () -> Unit = {},
+    onClearSaveBackups: () -> Unit = {},
+    onOpenSaveManager: () -> Unit = {},
+    onCustomDriverSharedBuffersChange: (Boolean) -> Unit = {},
     onDismissR4Report: () -> Unit = {},
     onPictureResolutionChange: (Int) -> Unit = {},
     onPictureSharpenChange: (Boolean) -> Unit = {},
@@ -158,6 +163,15 @@ fun AdvancedScreen(
                     checked = state.driverState.allowMockFallback,
                     enabled = true,
                     onCheckedChange = onAllowMockFallbackChange
+                )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Custom driver zero-copy buffers",
+                    supporting = "Experimental AHardwareBuffer bridge for PanVK/Turnip (off uses reliable CPU upload)",
+                    checked = state.customDriverSharedBuffers,
+                    enabled = true,
+                    onCheckedChange = onCustomDriverSharedBuffersChange
                 )
                 LauncherSectionDivider()
 
@@ -325,46 +339,95 @@ fun AdvancedScreen(
                     enabled = liveVulkanEnabled,
                     onClick = onLaunchRecompVulkan
                 )
-                val cacheMb = r4State.installCacheBytes / (1024L * 1024L)
                 val clearCacheEnabled = !r4State.running && !r0State.running
+                val soMb = r4State.soCacheBytes / (1024L * 1024L)
+                val texCacheMb = r4State.textureCacheBytes / (1024L * 1024L)
+                val shaderMb = r4State.shaderCacheBytes / (1024L * 1024L)
+                val cacheMb = r4State.installCacheBytes / (1024L * 1024L)
+                val backupsMb = r4State.saveBackupsBytes / (1024L * 1024L)
+
                 WseListRow(
-                    title = "Copied game files",
-                    supporting = "$cacheMb MB kept in the app so the game loads faster. Free " +
-                        "this space if you need it; the game copies files again as it reads them.",
+                    title = "Manage saved games",
+                    supporting = "Inspect, import/export .sav files, restore backups, and configure auto-sync mirror.",
+                    trailing = {
+                        Text(
+                            text = "Open",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = colors.primary
+                        )
+                    },
+                    showDivider = true,
+                    onClick = onOpenSaveManager
+                )
+                WseListRow(
+                    title = "Translated game code",
+                    supporting = "$soMb MB of prepared arm64 code batches. Freeing this requires translating again or re-importing a PC zip.",
                     trailing = {
                         Text(
                             text = "Free up",
                             style = MaterialTheme.typography.labelLarge,
-                            color = if (clearCacheEnabled) {
-                                colors.primary
-                            } else {
-                                colors.onSurfaceVariant.copy(alpha = 0.45f)
-                            }
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = onClearSoCache
+                )
+                WseListRow(
+                    title = "Converted textures",
+                    supporting = "$texCacheMb MB. Textures converted for your phone's graphics chip. Cleared files are converted again on the next load.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = onClearTextureCache
+                )
+                WseListRow(
+                    title = "Vulkan shader cache",
+                    supporting = "$shaderMb MB of compiled graphics shaders. Rebuilds automatically if cleared.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = onClearShaderCache
+                )
+                WseListRow(
+                    title = "Copied game files",
+                    supporting = "$cacheMb MB kept in the app so the game loads faster. Free this space if you need it; the game copies files again as it reads them.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
                         )
                     },
                     showDivider = true,
                     enabled = clearCacheEnabled,
                     onClick = onClearInstallCache
                 )
-                val texCacheMb = r4State.textureCacheBytes / (1024L * 1024L)
                 WseListRow(
-                    title = "Converted textures",
-                    supporting = "$texCacheMb MB. Textures converted for your phone's graphics chip. " +
-                        "Cleared files are converted again on the next load.",
+                    title = "Savegame rolling backups",
+                    supporting = "$backupsMb MB of automatic .bak1-.bak3 save backups. Live saves are untouched.",
                     trailing = {
                         Text(
                             text = "Free up",
                             style = MaterialTheme.typography.labelLarge,
-                            color = if (clearCacheEnabled) {
-                                colors.primary
-                            } else {
-                                colors.onSurfaceVariant.copy(alpha = 0.45f)
-                            }
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
                         )
                     },
                     showDivider = true,
                     enabled = clearCacheEnabled,
-                    onClick = onClearTextureCache
+                    onClick = onClearSaveBackups
                 )
                 // Saves the report as a file the player picks, during a run too (the user's
                 // request, 2026-11-21: keep the phone's report when finishing on the PC).

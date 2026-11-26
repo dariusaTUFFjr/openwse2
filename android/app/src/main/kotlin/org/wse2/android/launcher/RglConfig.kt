@@ -105,9 +105,12 @@ data class RglConfigState(
     // Unrecognized properties preserved verbatim on round-trip
     val extraEntries: Map<String, String> = emptyMap()
 ) {
-    /** Approximate soldier count using Warband's standard 30..150 scale. */
+    /**
+     * Approximate soldier count: Warband's standard 0.0..1.0 maps 30..150, and WSE2 extends
+     * `battle_size` above 1.0 up to 1,000+ troops (`docs/PLATFORM_PLAN.md` "P14").
+     */
     val battleSizeTroops: Int
-        get() = (30 + (battleSize.coerceIn(0f, 1f) * 120f).roundToInt()).coerceIn(30, 150)
+        get() = (30 + (battleSize.coerceIn(0f, 8.0834f) * 120f).roundToInt()).coerceIn(30, 1000)
 
     fun withQualityPreset(presetKey: String): RglConfigState = when (presetKey) {
         "low" -> copy(
@@ -337,7 +340,7 @@ object RglConfigCodec {
             ),
             verboseDamage = parseBool(parsed["verbose_damage"], defaults.verboseDamage),
             verboseShotDifficulty = parseBool(parsed["verbose_shot_difficulty"], defaults.verboseShotDifficulty),
-            battleSize = parseFloat(parsed["battle_size"], defaults.battleSize, 0f, 1f),
+            battleSize = parseFloat(parsed["battle_size"], defaults.battleSize, 0f, 8.0834f),
             attackDirectionControl = parseInt(parsed["attack_direction_control"], defaults.attackDirectionControl, 0, 3),
             defendDirectionControl = parseInt(parsed["defend_direction_control"], defaults.defendDirectionControl, 0, 3),
             lanceControl = parseInt(parsed["lance_control"], defaults.lanceControl, 0, 2),
@@ -559,13 +562,14 @@ object RglConfigCodec {
 internal enum class RglConfigSource { MISSING, LOADED, UNREADABLE }
 
 internal object RglConfigStore {
-    private const val RELATIVE_PATH = "recomp/r4/user/Documents/Mount&Blade Warband/rgl_config.txt"
+    private const val RELATIVE_PATH = "wse2/user/Documents/Mount&Blade Warband/rgl_config.txt"
     private const val UNREADABLE_SUFFIX = ".unreadable"
 
     fun configFile(filesDir: File): File = File(filesDir, RELATIVE_PATH)
 
-    // Reads the file; writes nothing.
+    // Reads the file; writes nothing unless migrating an existing legacy `recomp/r4/user` tree.
     fun load(filesDir: File): Pair<RglConfigState, RglConfigSource> {
+        UserStorage.migrateLegacyUserDirIfNeeded(filesDir)
         val file = configFile(filesDir)
         if (!file.exists()) return RglConfigState() to RglConfigSource.MISSING
         return try {
@@ -576,6 +580,7 @@ internal object RglConfigStore {
     }
 
     fun save(filesDir: File, state: RglConfigState): Boolean {
+        UserStorage.migrateLegacyUserDirIfNeeded(filesDir)
         return try {
             val file = configFile(filesDir)
             file.parentFile?.mkdirs()

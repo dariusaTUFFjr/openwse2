@@ -58,6 +58,7 @@ public:
     // --- types ---------------------------------------------------------------------------
     llvm::IntegerType* ity(unsigned bits) { return B.getIntNTy(bits); }
     llvm::Type* i128() { return B.getInt128Ty(); }
+    llvm::FixedVectorType* v2i64() { return llvm::FixedVectorType::get(B.getInt64Ty(), 2); }
     llvm::Type* ptr() { return llvm::PointerType::getUnqual(C); }
 
     // --- registers -----------------------------------------------------------------------
@@ -67,8 +68,9 @@ public:
     llvm::Value* gpr64(int index);
     void set_gpr64(int index, llvm::Value* v);
     static int gpr_index(ZydisRegister r);  // 0..15, or -1 when not a GPR
-    llvm::Value* xmm(int index);             // i128
-    void set_xmm(int index, llvm::Value* v); // i128
+    llvm::Value* xmm_vec(int index);         // native <2 x i64> (stays in NEON v0..v31 on AArch64)
+    llvm::Value* xmm(int index);             // i128 view of xmm_vec(index)
+    void set_xmm(int index, llvm::Value* v); // accepts 128-bit vector or integer (zero-extended)
     static int xmm_index(ZydisRegister r);   // 0..15, or -1
 
     // --- flags ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ public:
     llvm::Value* address(const DInsn& d, const ZydisDecodedOperand& o);  // i64 effective address
     llvm::Value* host_ptr(llvm::Value* addr64);
     llvm::Value* load(llvm::Value* addr64, unsigned bits, Mem kind = Mem::automatic);
+    llvm::Value* load_vec128(llvm::Value* addr64, Mem kind = Mem::automatic);
     void store(llvm::Value* addr64, llvm::Value* v, Mem kind = Mem::automatic);
     bool last_address_stack = false;  // set by `address()`, read by the next automatic access
     // Operand `i` as an iN of its size (immediates are truncated/sign-extended per Zydis).

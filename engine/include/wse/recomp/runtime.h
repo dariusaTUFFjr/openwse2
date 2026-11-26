@@ -99,13 +99,43 @@ public:
         table_.erase(std::unique(table_.begin(), table_.end(),
                                  [](const FnRow& a, const FnRow& b) { return a.va == b.va; }),
                      table_.end());
+        rebuild_hash_table();
     }
     [[nodiscard]] std::size_t function_count() const noexcept { return table_.size(); }
 
     [[nodiscard]] GuestFn find(std::uint64_t va) const noexcept {
-        const auto it = std::lower_bound(table_.begin(), table_.end(), va,
-                                         [](const FnRow& r, std::uint64_t v) { return r.va < v; });
-        return it != table_.end() && it->va == va ? it->fn : nullptr;
+        if (va == 0 || hash_mask_ == 0) {
+            return nullptr;
+        }
+        std::size_t idx = hash_va(va) & hash_mask_;
+        for (;;) {
+            const FnRow& row = hash_table_[idx];
+            if (row.va == va) {
+                return row.fn;
+            }
+            if (row.va == 0) {
+                return nullptr;
+            }
+            idx = (idx + 1U) & hash_mask_;
+        }
+    }
+
+    // Patches a translated batch's direct cross-batch call table (`wse_ext_calls[]`) once all
+    // batches are registered. Entries whose target VA is present in this runtime bypass
+    // `Runtime::hook_dispatch` and jump straight to the target `GuestFn`; missing targets keep
+    // their fallback dispatch thunk so faults still report cleanly.
+    std::size_t patch_external_calls(GuestFn* slots, const std::uint64_t* vas, std::size_t count) const noexcept {
+        if (slots == nullptr || vas == nullptr || count == 0) {
+            return 0;
+        }
+        std::size_t patched = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (GuestFn fn = find(vas[i]); fn != nullptr) {
+                slots[i] = fn;
+                ++patched;
+            }
+        }
+        return patched;
     }
 
     void set_import(std::uint64_t slot_va, ImportShim shim) { imports_[slot_va] = std::move(shim); }
@@ -407,8 +437,41 @@ private:
         return 0;
     }
 
+    static std::size_t hash_va(std::uint64_t va) noexcept {
+        va ^= va >> 30U;
+        va *= 0xBF58476D1CE4E5B9ULL;
+        va ^= va >> 27U;
+        va *= 0x94D049BB133111EBULL;
+        va ^= va >> 31U;
+        return static_cast<std::size_t>(va);
+    }
+
+    void rebuild_hash_table() {
+        hash_table_.clear();
+        hash_mask_ = 0;
+        if (table_.empty()) {
+            return;
+        }
+        std::size_t cap = 16;
+        while (cap < table_.size() * 2U) {
+            cap <<= 1U;
+        }
+        hash_table_.assign(cap, FnRow{0, nullptr});
+        hash_mask_ = cap - 1U;
+        for (const FnRow& r : table_) {
+            if (r.va == 0) continue;
+            std::size_t idx = hash_va(r.va) & hash_mask_;
+            while (hash_table_[idx].va != 0) {
+                idx = (idx + 1U) & hash_mask_;
+            }
+            hash_table_[idx] = r;
+        }
+    }
+
     RuntimeHooks hooks_;
     std::vector<FnRow> table_;
+    std::vector<FnRow> hash_table_;
+    std::size_t hash_mask_ = 0;
     std::map<std::uint64_t, ImportShim> imports_;
     std::map<std::uint64_t, std::string> import_names_;
     std::vector<PeImport> import_list_;

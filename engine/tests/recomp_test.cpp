@@ -37,6 +37,7 @@
 #include "wse/recomp/r2_rig.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/scripted_input.h"
+#include "wse/recomp/session_replay.h"
 #include "wse/recomp/shim_advapi.h"
 #include "wse/recomp/shim_crt.h"
 #include "wse/recomp/shim_d3d9.h"
@@ -7061,6 +7062,196 @@ void test_r7_scripted_input_and_d3d9_hooks() {
     }
 }
 
+void test_r8_wave_features() {
+    namespace sh = wse::recomp::shim;
+    namespace tb = wse::recomp::teb;
+    namespace kn = wse::recomp::kernel;
+    using thr_test::call;
+
+    // 1. Runtime O(1) hash lookup + cross-batch external call patching.
+    {
+        Runtime rt;
+        const FnRow rows[] = {
+            {0x140100000ULL, &rt_test::leaf},
+            {0x140100040ULL, &rt_test::caller},
+        };
+        rt.add_table(rows, 2);
+        expect(rt.find(0x140100000ULL) == &rt_test::leaf &&
+                   rt.find(0x140100040ULL) == &rt_test::caller &&
+                   rt.find(0x140100080ULL) == nullptr,
+               "R8 Runtime: O(1) hash table finds registered functions and rejects missing VAs");
+
+        GuestFn sentinel = [](CpuState*) {};
+        GuestFn slots[3] = {sentinel, sentinel, sentinel};
+        const std::uint64_t vas[3] = {0x140100000ULL, 0x140999999ULL, 0x140100040ULL};
+        const std::size_t patched = rt.patch_external_calls(slots, vas, 3);
+        expect(patched == 2 && slots[0] == &rt_test::leaf && slots[1] == sentinel &&
+                   slots[2] == &rt_test::caller,
+               "R8 Runtime: patch_external_calls patches resolved VAs and preserves unresolved stubs");
+    }
+
+    // 2. Atomic savegame writes + 3-version rolling backups + on_save_written callback.
+    {
+        wse::platform::MemoryVfs install_vfs;
+        wse::platform::MemoryVfs user_vfs;
+        std::vector<std::uint8_t> img(0x1000, 0);
+        img[0x3C] = 0x80;
+        PeImage pe;
+        pe.image_base = 0x150000000ULL;
+        pe.size_of_image = static_cast<std::uint32_t>(img.size());
+        Runtime rt;
+        std::vector<PeImport> imps;
+        const char* fnames[] = {"CreateFileA", "WriteFile", "CloseHandle", "CreateDirectoryA"};
+        for (std::size_t i = 0; i < std::size(fnames); ++i) {
+            imps.push_back({thr_test::slot(fnames[i]), "KERNEL32.dll", fnames[i], 0});
+        }
+        rt.name_imports(imps);
+        tb::Process proc(rt, pe, img.data());
+        kn::Kernel kern(rt);
+        sh::FilesConfig fcfg;
+        fcfg.install = &install_vfs;
+        fcfg.user = &user_vfs;
+        sh::Files files(rt, kern, fcfg);
+        std::vector<std::string> saved_events;
+        files.on_save_written = [&](const std::string& rel) { saved_events.push_back(rel); };
+        std::string err;
+        expect(proc.init(&err) && kern.install() > 0 && files.install() > 0,
+               "R8 Saves: files shim initializes");
+
+        GuestStack stack(64 * 1024);
+        CpuState s;
+        stack.prepare(s);
+        rt.attach(s);
+        tb::GuestThread& t = proc.create_thread(0, 0);
+        tb::Process::attach(s, t);
+        auto va = [](const void* p) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p)); };
+
+        const char* sav_path = "C:\\Users\\Player\\Documents\\Mount&Blade Warband WSE2\\Native\\Savegames\\sg00.sav";
+        (void)wse::platform::make_parent_dirs(user_vfs, "Documents/Mount&Blade Warband WSE2/Native/Savegames/sg00.sav");
+        for (int ver = 1; ver <= 4; ++ver) {
+            const std::uint64_t h = call(s, "CreateFileA", {va(sav_path), sh::kGenericWrite, 0, 0, sh::kCreateAlways, 0, 0});
+            const std::string body = "WRDR_VERSION_" + std::to_string(ver);
+            alignas(8) std::uint32_t written = 0;
+            (void)call(s, "WriteFile", {h, va(body.data()), body.size(), va(&written), 0});
+            (void)call(s, "CloseHandle", {h});
+        }
+
+        auto read_str = [&](const char* rel) {
+            std::vector<std::uint8_t> out;
+            if (!user_vfs.read_file(rel, out)) return std::string();
+            return std::string(reinterpret_cast<const char*>(out.data()), out.size());
+        };
+        const std::string cur = read_str("Documents/Mount&Blade Warband WSE2/Native/Savegames/sg00.sav");
+        const std::string b1 = read_str("Documents/Mount&Blade Warband WSE2/Native/Savegames/sg00.sav.bak1");
+        const std::string b2 = read_str("Documents/Mount&Blade Warband WSE2/Native/Savegames/sg00.sav.bak2");
+        const std::string b3 = read_str("Documents/Mount&Blade Warband WSE2/Native/Savegames/sg00.sav.bak3");
+        expect(cur == "WRDR_VERSION_4" && b1 == "WRDR_VERSION_3" && b2 == "WRDR_VERSION_2" &&
+                   b3 == "WRDR_VERSION_1" && saved_events.size() == 4,
+               "R8 Saves: atomic write rotates .bak1/.bak2/.bak3 with exact non-empty payloads and fires callback");
+    }
+
+    // 3. Deterministic SessionLog record & replay (clocks, RNG, frame marks, inputs).
+    {
+        const std::string path = "wse_r8_session_test.bin";
+        sh::SessionLog rec;
+        expect(rec.start_record(path), "R8 Replay: start_record creates binary log");
+        (void)rec.on_qpc(123456789LL);
+        (void)rec.on_tick32(4242U);
+        (void)rec.on_tick64(9988776655ULL);
+        (void)rec.on_time_get_time(7777U);
+        std::uint8_t rng_in[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+        rec.on_rtl_random(rng_in, sizeof(rng_in));
+        sh::SessionInputEvent ev{};
+        ev.tag = sh::SessionEventTag::input_key;
+        ev.a = 0x11;
+        ev.b = 1;
+        ev.fx = 0.5F;
+        rec.record_input(ev);
+        rec.record_frame_mark(1ULL);
+        rec.stop();
+
+        sh::SessionLog rep;
+        expect(rep.start_replay(path), "R8 Replay: start_replay loads WSE2RPL1 binary log");
+        const std::int64_t qpc = rep.on_qpc(0LL);
+        const std::uint32_t t32 = rep.on_tick32(0U);
+        const std::uint64_t t64 = rep.on_tick64(0ULL);
+        const std::uint32_t tgt = rep.on_time_get_time(0U);
+        std::uint8_t rng_out[4] = {};
+        rep.on_rtl_random(rng_out, sizeof(rng_out));
+        expect(qpc == 123456789LL && t32 == 4242U && t64 == 9988776655ULL && tgt == 7777U &&
+                   std::memcmp(rng_in, rng_out, sizeof(rng_in)) == 0,
+               "R8 Replay: clocks and RtlGenRandom replay byte-identically");
+        const auto drained = rep.pop_replay_inputs_for_frame(1ULL);
+        expect(drained.size() == 1 && drained[0].tag == sh::SessionEventTag::input_key &&
+                   drained[0].a == 0x11 && drained[0].b == 1,
+               "R8 Replay: per-frame input stream drains up to frame mark");
+        rep.stop();
+        std::remove(path.c_str());
+
+        // Also verify live RecompInputHub injections record into SessionLog::shared().
+        const std::string hub_path = "wse_r8_hub_session_test.bin";
+        sh::RecompInputHub rec_hub;
+        expect(sh::SessionLog::shared().start_record(hub_path),
+               "R8 Replay: shared SessionLog starts recording for input hub");
+        rec_hub.inject_key(0x1E, true);
+        rec_hub.inject_mouse_button(0, true);
+        sh::SessionLog::shared().record_frame_mark(1ULL);
+        sh::SessionLog::shared().stop();
+        expect(sh::SessionLog::shared().start_replay(hub_path),
+               "R8 Replay: shared SessionLog loads hub-recorded session");
+        const auto hub_drained = sh::SessionLog::shared().pop_replay_inputs_for_frame(1ULL);
+        sh::SessionLog::shared().stop();
+        std::remove(hub_path.c_str());
+        expect(hub_drained.size() == 2 && hub_drained[0].tag == sh::SessionEventTag::input_key &&
+                   hub_drained[0].a == 0x1E && hub_drained[1].tag == sh::SessionEventTag::input_mouse_btn &&
+                   hub_drained[1].a == 0 && hub_drained[1].b == 1,
+               "R8 Replay: RecompInputHub injections are recorded into SessionLog::shared()");
+    }
+
+    // 4. Touch Layout Editor (edit mode drag clamped to safe area + JSON round-trip + reset).
+    {
+        sh::RecompInputHub hub;
+        hub.set_screen_size(1000, 500);
+        hub.set_surface_size(1000, 500);
+        hub.set_safe_area(wse::platform::SafeAreaInsets{0.08F, 0.05F, 0.08F, 0.05F});
+        hub.set_inferred_scene(sh::TouchScene::battle);
+        hub.on_show_cursor(false);
+
+        auto parse_attack = [](const std::string& json, float& nx, float& ny) -> bool {
+            const std::size_t p = json.find("\"attack\":[");
+            if (p == std::string::npos) return false;
+            return std::sscanf(json.c_str() + p + 10, "%f,%f", &nx, &ny) == 2;
+        };
+
+        const std::string initial_json = hub.export_layout_json();
+        float init_nx = -1.0F, init_ny = -1.0F;
+        expect(parse_attack(initial_json, init_nx, init_ny) && init_nx > 0.0F,
+               "R8 TouchEditor: export_layout_json includes battle buttons");
+
+        hub.set_edit_mode(true);
+        expect(hub.edit_mode(), "R8 TouchEditor: set_edit_mode toggles edit mode");
+        const float ax = 0.08F * 1000.0F + init_nx * (1000.0F * (1.0F - 0.16F));
+        const float ay = 0.05F * 500.0F + init_ny * (500.0F * (1.0F - 0.10F));
+        hub.on_touch_event(1, 0, ax, ay);          // DOWN on attack
+        hub.on_touch_event(1, 2, 995.0F, 10.0F);   // MOVE past right/top safe insets
+        hub.on_touch_event(1, 1, 995.0F, 10.0F);   // UP
+        hub.set_edit_mode(false);
+
+        const std::string moved_json = hub.export_layout_json();
+        float moved_nx = 0.0F, moved_ny = 0.0F;
+        expect(moved_json != initial_json && parse_attack(moved_json, moved_nx, moved_ny) &&
+                   moved_nx >= 0.96F && moved_nx <= 0.971F && moved_ny >= 0.039F && moved_ny <= 0.05F,
+               "R8 TouchEditor: dragging in edit mode updates layout and clamps inside safe area");
+
+        hub.reset_layout_to_defaults();
+        expect(hub.export_layout_json() == initial_json,
+               "R8 TouchEditor: reset_layout_to_defaults restores initial layout");
+
+        expect(hub.import_layout_json(moved_json) && hub.export_layout_json() == moved_json,
+               "R8 TouchEditor: import_layout_json restores exported custom layout");
+    }
+}
+
 }  // namespace
 
 namespace wse::selftest {
@@ -7115,6 +7306,7 @@ int run_recomp_suite(const char* fixture_path) {
     test_r6_input_shims_and_adaptive_touch();
     test_r6_mod_controls_detector_and_icons();
     test_r7_scripted_input_and_d3d9_hooks();
+    test_r8_wave_features();
     {
         GuestStack gs(64 * 1024);
         expect(gs.data() != nullptr && gs.usable_size() >= 64 * 1024 + 64,

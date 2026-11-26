@@ -1187,6 +1187,9 @@ struct VulkanD3d9Backend::Impl {
     float timestamp_period_ns = 0.0F;
     bool frame_has_start_ts = false;
     double last_gpu_frame_ms = -1.0;
+    double reported_gpu_ms = -1.0;
+    double reported_frame_ms = 0.0;
+    double reported_cpu_ms = 0.0;
     bool has_last_present_tp = false;
     std::chrono::steady_clock::time_point last_present_tp{};
 
@@ -1619,6 +1622,9 @@ struct VulkanD3d9Backend::Impl {
             ext_img.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
             ext_img.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 
+            // Match AHB usage bits (`GPU_SAMPLED_IMAGE | GPU_FRAMEBUFFER | COMPOSER_OVERLAY`)
+            // per Vulkan AHB VUID-VkImageCreateInfo-pNext-02396 so Mali/PanVK Gralloc AFBC/tiling
+            // negotiation agrees between Vulkan and SurfaceFlinger (R5c).
             VkImageCreateInfo ici{};
             ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             ici.pNext = &ext_img;
@@ -1629,10 +1635,15 @@ struct VulkanD3d9Backend::Impl {
             ici.arrayLayers = 1U;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            const VkResult ir = vk.create_image(h.device, &ici, nullptr, &slot.img);
+            VkResult ir = vk.create_image(h.device, &ici, nullptr, &slot.img);
+            if (ir != VK_SUCCESS || slot.img == VK_NULL_HANDLE) {
+                ici.tiling = VK_IMAGE_TILING_LINEAR;
+                ir = vk.create_image(h.device, &ici, nullptr, &slot.img);
+            }
             if (ir != VK_SUCCESS || slot.img == VK_NULL_HANDLE) {
                 report.missing_features.push_back("vkCreateImage(AHB) failed (" +
                                                   std::to_string(static_cast<int>(ir)) + ") -> ANativeWindow_lock");
@@ -6354,14 +6365,21 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
 
         if (ok) {
             const auto now = std::chrono::steady_clock::now();
+            double wall_ms = 0.0;
+            if (impl_->has_last_present_tp) {
+                wall_ms = std::chrono::duration<double, std::milli>(now - impl_->last_present_tp).count();
+                impl_->reported_frame_ms = wall_ms;
+                impl_->reported_cpu_ms = wall_ms;
+            }
             double frame_ms = 0.0;
             bool have_frame_ms = false;
             if (impl_->last_gpu_frame_ms >= 0.0) {
                 frame_ms = impl_->last_gpu_frame_ms;
+                impl_->reported_gpu_ms = impl_->last_gpu_frame_ms;
                 impl_->last_gpu_frame_ms = -1.0;
                 have_frame_ms = true;
             } else if (impl_->has_last_present_tp) {
-                frame_ms = std::chrono::duration<double, std::milli>(now - impl_->last_present_tp).count();
+                frame_ms = wall_ms;
                 have_frame_ms = true;
             }
             impl_->last_present_tp = now;
@@ -6429,6 +6447,39 @@ void VulkanD3d9Backend::set_thermal_status(ThermalStatus status) noexcept {
 
 float VulkanD3d9Backend::current_render_scale() const noexcept {
     return impl_->active_scale.load(std::memory_order_relaxed);
+}
+
+void VulkanD3d9Backend::set_graphics_options(float render_scale, bool auto_resolution, float sharpness,
+                                             bool fxaa, float target_fps) noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    const float clamped_scale = std::clamp(render_scale, 0.5F, 1.0F);
+    const float clamped_fps = (target_fps > 0.0F) ? std::clamp(target_fps, 15.0F, 240.0F) : 60.0F;
+    impl_->config.render_scale = clamped_scale;
+    impl_->config.auto_resolution = auto_resolution;
+    impl_->config.sharpness = std::max(0.0F, sharpness);
+    impl_->config.fxaa = fxaa;
+    impl_->config.target_fps = clamped_fps;
+
+    DynResConfig dcfg{};
+    dcfg.min_scale = std::clamp(impl_->config.min_render_scale, 0.5F, 1.0F);
+    dcfg.max_scale = 1.0F;
+    dcfg.target_frame_ms = 1000.0 / static_cast<double>(clamped_fps);
+    impl_->dyn_res = DynamicResolution(dcfg);
+    if (!auto_resolution) {
+        impl_->active_scale.store(clamped_scale, std::memory_order_relaxed);
+    }
+    impl_->update_render_report();
+}
+
+VulkanD3d9Backend::FrameTimings VulkanD3d9Backend::last_frame_timings() const noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->api_mutex);
+    FrameTimings ft{};
+    ft.frame_ms = impl_->reported_frame_ms;
+    ft.cpu_ms = impl_->reported_cpu_ms;
+    ft.gpu_ms = impl_->reported_gpu_ms;
+    ft.render_scale = impl_->active_scale.load(std::memory_order_relaxed);
+    ft.thermal = impl_->thermal_status;
+    return ft;
 }
 
 void VulkanD3d9Backend::flush_pipeline_cache() noexcept {

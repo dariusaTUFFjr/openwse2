@@ -271,7 +271,32 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
     const std::size_t batch = o.batch_kib;
     const auto [text_b, text_e] = text_range(m.img);
     ImageView view(m.mapped, m.img.image_base, m.img.size_of_image, text_b, text_e);
-    const std::string key = cache_key(*m.file, o.opt, batch, translator_fingerprint());
+    // Hot-subsystem PDB patterns: batches containing any hot physics, AI, rendering, skinning,
+    // mission, map, or script-VM symbol optimize at `o.opt` (-O2); cold batches (UI, loaders,
+    // networking, CRT, setup) optimize at `o.cold_opt` (-O1) to cut on-phone translation time
+    // without hurting battle frame rate (`docs/RECOMP_PLAN.md` "R8"). `lua5164` stays hot.
+    std::set<std::uint64_t> hot_vas;
+    auto is_hot_symbol = [](const std::string& name) -> bool {
+        static constexpr const char* kHot[] = {
+            "bt", "mbAgent", "mbMission", "mbTactical", "mbStatement", "mbScript", "mbParty", "mbMap",
+            "mbBattle", "rglMesh", "rglSkeleton", "rglEntity", "rglScene", "rglMatrix", "rglVector",
+            "rglQuaternion", "rglRender", "rglGraphics", "rglCollision", "rglManifold", "rglBody",
+            "rglAnim", "lua", "WSE",
+        };
+        for (const char* p : kHot) {
+            if (name.find(p) != std::string::npos) return true;
+        }
+        return false;
+    };
+    for (const PdbPublic& p : publics) {
+        if (p.section == 0 || p.section > m.img.sections.size()) continue;
+        if (is_hot_symbol(p.name)) {
+            hot_vas.insert(m.img.image_base + m.img.sections[p.section - 1].virtual_address + p.offset);
+        }
+    }
+    const int cold_opt = std::clamp(o.cold_opt, 0, o.opt);
+    const std::string hot_key = cache_key(*m.file, o.opt, batch, translator_fingerprint());
+    const std::string cold_key = cache_key(*m.file, cold_opt, batch, translator_fingerprint());
     const std::set<std::uint64_t> entries = entries_of(m, view, publics);
     const EhContinuations eh = find_eh_continuations(view, m.img, entries);
     std::vector<PeImport> imports;
@@ -371,8 +396,22 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
     const std::size_t n_batches = batch_name.size();
     std::vector<fs::path> sos(n_batches);
     std::vector<std::size_t> weight(n_batches, 0);
+    std::vector<int> batch_opt(n_batches, o.opt);
+    std::size_t cold_batches = 0;
     for (std::size_t b = 0; b < n_batches; ++b) {
-        for (std::size_t i = batch_range[b].first; i < batch_range[b].second; ++i) weight[b] += cost_of[all[i]];
+        bool has_hot = hot_vas.empty();  // no PDB (e.g. lua5164): keep all batches hot
+        for (std::size_t i = batch_range[b].first; i < batch_range[b].second; ++i) {
+            weight[b] += cost_of[all[i]];
+            if (!has_hot && hot_vas.count(all[i]) != 0) has_hot = true;
+        }
+        if (!has_hot && cold_opt != o.opt) {
+            batch_opt[b] = cold_opt;
+            ++cold_batches;
+        }
+    }
+    if (cold_batches != 0) {
+        out("%s: %zu/%zu cold batches scheduled at -O%d (hot batches at -O%d)\n", m.tag.c_str(), cold_batches,
+            n_batches, cold_opt, o.opt);
     }
     // Files of batches that no longer exist (a different batch size, an older translator that
     // batched differently, an interrupted link's object file) are removed, so old translations do
@@ -406,7 +445,8 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
         const bool have = std::getline(in, line) && fs::exists(sos[b], ec);
         const bool legacy = have && (!std::getline(in, fns) || fns == list_hash(b));
         const bool same_fns = legacy ? legacy_ok(b) : fns == batch_hash(b);
-        if (o.retranslate || !have || !same_fns || (line != key && !o.reuse)) {
+        const std::string& bkey = batch_opt[b] == o.opt ? hot_key : cold_key;
+        if (o.retranslate || !have || !same_fns || (line != bkey && !o.reuse)) {
             todo.push_back(b);
         } else if (legacy) {
             in.close();
@@ -482,7 +522,7 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
             std::vector<char> obj;
             std::string log;
             const fs::path obj_path = so_dir / (batch_name[b] + ".o");
-            if (e.empty() && !tr.emit_object(o.opt, obj, nullptr, &e) && e.empty()) e = "emit failed";
+            if (e.empty() && !tr.emit_object(batch_opt[b], obj, nullptr, &e) && e.empty()) e = "emit failed";
             if (e.empty()) {
                 std::ofstream(obj_path, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
                 std::error_code ec;
@@ -496,7 +536,8 @@ bool translate(Image& m, const std::vector<PdbPublic>& publics, const StartupOpt
                 failed = true;
                 return;
             }
-            std::ofstream(so_dir / (batch_name[b] + ".key")) << key << "\n" << batch_hash(b) << "\n";
+            const std::string& bkey = batch_opt[b] == o.opt ? hot_key : cold_key;
+            std::ofstream(so_dir / (batch_name[b] + ".key")) << bkey << "\n" << batch_hash(b) << "\n";
             const std::size_t d = ++done;
             out("  %s batch %zu done (%zu/%zu, %.0f s)\n", m.tag.c_str(), b, d, todo.size(), ms_since(t0) / 1000.0);
             if (o.progress) o.progress(m.tag, d, todo.size());
@@ -700,6 +741,25 @@ int run_startup(const StartupOptions& o) {
     };
     for (const auto& [rows, n] : lx.tables) rt.add_table(rows, n);
     for (const auto& [rows, n] : ll.tables) rt.add_table(rows, n);
+    {
+        std::size_t patched_edges = 0;
+        std::size_t total_edges = 0;
+        auto patch_loaded = [&](const Loaded& loaded) {
+            for (const auto& code : loaded.code) {
+                const auto* cnt = static_cast<const std::uint64_t*>(code->sym("wse_ext_call_count"));
+                if (cnt == nullptr || *cnt == 0) continue;
+                auto* slots = static_cast<GuestFn*>(code->sym("wse_ext_calls"));
+                const auto* vas = static_cast<const std::uint64_t*>(code->sym("wse_ext_call_vas"));
+                total_edges += static_cast<std::size_t>(*cnt);
+                patched_edges += rt.patch_external_calls(slots, vas, static_cast<std::size_t>(*cnt));
+            }
+        };
+        patch_loaded(lx);
+        patch_loaded(ll);
+        if (total_edges != 0) {
+            out("linked %zu/%zu direct cross-batch call edges\n", patched_edges, total_edges);
+        }
+    }
 
     static shim::Modules modules(rt);
     if (modules.add_image("C:\\WSE2\\mb_warband_wse2_x64.exe", exe.img, exe.mapped, true, &err) == nullptr ||

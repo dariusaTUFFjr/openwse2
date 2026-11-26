@@ -31,6 +31,7 @@
 #include "wse/platform/mod_controls_detector.h"
 #include "wse/platform/rhi_geometry.h"
 #include "wse/platform/touch_icons.h"
+#include "wse/recomp/session_replay.h"
 
 namespace wse::recomp::shim {
 
@@ -431,6 +432,103 @@ public:
         safe_area_ = insets;
     }
 
+    // ---- P14.2 In-Game Touch Layout Editor & Per-Module Layout JSON ----
+    void set_edit_mode(bool enabled) {
+        const std::lock_guard<std::mutex> lock(m_);
+        edit_mode_ = enabled;
+        edit_drag_pointer_ = -1;
+        edit_selected_btn_ = static_cast<std::size_t>(-1);
+        if (enabled) {
+            touches_.clear();
+            stick_pointer_ = -1;
+            update_stick_keys_locked(0.0F, 0.0F);
+        }
+    }
+    [[nodiscard]] bool edit_mode() const {
+        const std::lock_guard<std::mutex> lock(m_);
+        return edit_mode_;
+    }
+
+    void reset_layout_to_defaults() {
+        const std::lock_guard<std::mutex> lock(m_);
+        init_default_buttons();
+        edit_drag_pointer_ = -1;
+        edit_selected_btn_ = static_cast<std::size_t>(-1);
+    }
+
+    // Serializes customized button coordinates/sizes/visibility to a compact flat JSON object:
+    // `{"version":1,"buttons":{"attack":[0.850,0.680,0.140,1],...}}`.
+    [[nodiscard]] std::string export_layout_json() const {
+        const std::lock_guard<std::mutex> lock(m_);
+        std::string out = "{\"version\":1,\"buttons\":{";
+        bool first = true;
+        char buf[128]{};
+        for (const auto& b : buttons_) {
+            if (b.id.empty()) continue;
+            if (!first) out.push_back(',');
+            first = false;
+            out.push_back('"');
+            for (const char ch : b.id) {
+                if (ch == '"' || ch == '\\') out.push_back('\\');
+                out.push_back(ch);
+            }
+            std::snprintf(buf, sizeof(buf), "\":[%.4f,%.4f,%.4f,%d]",
+                          static_cast<double>(b.nx), static_cast<double>(b.ny),
+                          static_cast<double>(b.size_short), b.visible ? 1 : 0);
+            out += buf;
+        }
+        out += "}}";
+        return out;
+    }
+
+    // Restores button positions/sizes/visibility from `export_layout_json()` output.
+    bool import_layout_json(std::string_view json) {
+        const std::lock_guard<std::mutex> lock(m_);
+        const std::size_t bpos = json.find("\"buttons\"");
+        if (bpos == std::string_view::npos) return false;
+        const std::size_t open = json.find('{', bpos);
+        if (open == std::string_view::npos) return false;
+        std::size_t pos = open + 1U;
+        std::size_t applied = 0U;
+        while (pos < json.size()) {
+            while (pos < json.size() && (json[pos] == ' ' || json[pos] == ',' || json[pos] == '\n' ||
+                                         json[pos] == '\r' || json[pos] == '\t')) {
+                ++pos;
+            }
+            if (pos >= json.size() || json[pos] == '}') break;
+            if (json[pos] != '"') break;
+            ++pos;
+            std::string id;
+            while (pos < json.size() && json[pos] != '"') {
+                if (json[pos] == '\\' && pos + 1U < json.size()) ++pos;
+                id.push_back(json[pos++]);
+            }
+            if (pos >= json.size()) break;
+            ++pos;  // closing quote
+            const std::size_t arr_open = json.find('[', pos);
+            const std::size_t arr_close = arr_open == std::string_view::npos ? std::string_view::npos
+                                                                             : json.find(']', arr_open);
+            if (arr_open == std::string_view::npos || arr_close == std::string_view::npos) break;
+            const std::string slice(json.substr(arr_open + 1U, arr_close - arr_open - 1U));
+            float nx = 0.0F, ny = 0.0F, sz = 0.0F;
+            int vis = 1;
+            if (std::sscanf(slice.c_str(), "%f,%f,%f,%d", &nx, &ny, &sz, &vis) >= 3) {
+                for (auto& b : buttons_) {
+                    if (b.id == id) {
+                        b.nx = std::clamp(nx, 0.03F, 0.97F);
+                        b.ny = std::clamp(ny, 0.04F, 0.96F);
+                        b.size_short = std::clamp(sz, 0.06F, 0.24F);
+                        b.visible = (vis != 0);
+                        ++applied;
+                        break;
+                    }
+                }
+            }
+            pos = arr_close + 1U;
+        }
+        return applied > 0U;
+    }
+
     // Applies automatically detected mod controls (from `detect_mod_controls`) into the
     // assignable extra slots without overwriting user-customized buttons.
     void apply_detected_mod_controls(const wse::platform::DetectedModControls& detected) {
@@ -545,8 +643,17 @@ public:
         return menu_zoom_;
     }
 
+    static void record_session_input(SessionEventTag tag, std::int32_t a, std::int32_t b = 0,
+                                     float fx = 0.0F, float fy = 0.0F) {
+        auto& log = SessionLog::shared();
+        if (log.mode() == SessionMode::record) {
+            log.record_input(SessionInputEvent{tag, a, b, fx, fy});
+        }
+    }
+
     // ---- Physical Keyboard & Mouse (Desktop Mode / DeX / Host) ----
     void inject_key(std::uint8_t dik_code, bool down, std::uint32_t vk_code = 0U) {
+        record_session_input(SessionEventTag::input_key, static_cast<std::int32_t>(dik_code), down ? 1 : 0);
         PostWindowMsgFn sink;
         {
             const std::lock_guard<std::mutex> lock(m_);
@@ -611,6 +718,7 @@ public:
     }
 
     void inject_mouse_move_abs(int x, int y) {
+        record_session_input(SessionEventTag::input_mouse_abs, x, y);
         PostWindowMsgFn sink;
         int cx = 0;
         int cy = 0;
@@ -635,6 +743,7 @@ public:
     }
 
     void inject_mouse_delta(int dx, int dy) {
+        record_session_input(SessionEventTag::input_mouse_delta, dx, dy);
         const std::lock_guard<std::mutex> lock(m_);
         input_mode_ = ActiveInputMode::keyboard_mouse;
         mouse_dx_ += dx;
@@ -644,6 +753,7 @@ public:
     }
 
     void inject_mouse_button(int button, bool down) {
+        record_session_input(SessionEventTag::input_mouse_btn, button, down ? 1 : 0);
         PostWindowMsgFn sink;
         int cx = 0;
         int cy = 0;
@@ -667,6 +777,7 @@ public:
     }
 
     void inject_mouse_wheel(int wheel_delta) {
+        record_session_input(SessionEventTag::input_mouse_wheel, wheel_delta, 0);
         PostWindowMsgFn sink;
         int cx = 0;
         int cy = 0;
@@ -757,6 +868,7 @@ public:
 
     // ---- Android Multi-Touch Input (`action`: 0=DOWN, 1=UP, 2=MOVE, 3=CANCEL) ----
     void on_touch_event(int pointer_id, int action, float x_px, float y_px) {
+        record_session_input(SessionEventTag::input_touch, pointer_id, action, x_px, y_px);
         PostWindowMsgFn msg_sink;
         UiActionFn ui_sink;
         std::string triggered_ui_action;
@@ -771,6 +883,43 @@ public:
             map_surface_to_backbuffer_locked(bx, by);
             const float nx = std::clamp(bx / static_cast<float>(screen_w_), 0.0F, 1.0F);
             const float ny = std::clamp(by / static_cast<float>(screen_h_), 0.0F, 1.0F);
+
+            if (edit_mode_) {
+                const float w = static_cast<float>(screen_w_);
+                const float h = static_cast<float>(screen_h_);
+                const float left = safe_area_.left * w;
+                const float top = safe_area_.top * h;
+                const float uw = std::max(1.0F, w * (1.0F - safe_area_.left - safe_area_.right));
+                const float uh = std::max(1.0F, h * (1.0F - safe_area_.top - safe_area_.bottom));
+                if (action == 0) {
+                    std::size_t best = static_cast<std::size_t>(-1);
+                    float best_d2 = 1e30F;
+                    for (std::size_t i = 0; i < buttons_.size(); ++i) {
+                        const auto& b = buttons_[i];
+                        if (!is_button_visible_locked(b)) continue;
+                        float cx = 0.0F, cy = 0.0F, cr = 0.0F;
+                        button_pixel_circle_locked(b, w, h, cx, cy, cr);
+                        const float dx = bx - cx;
+                        const float dy = by - cy;
+                        const float d2 = dx * dx + dy * dy;
+                        if (d2 <= (cr * 1.25F) * (cr * 1.25F) && d2 < best_d2) {
+                            best = i;
+                            best_d2 = d2;
+                        }
+                    }
+                    if (best < buttons_.size()) {
+                        edit_selected_btn_ = best;
+                        edit_drag_pointer_ = pointer_id;
+                    }
+                } else if (action == 2 && pointer_id == edit_drag_pointer_ &&
+                           edit_selected_btn_ < buttons_.size()) {
+                    buttons_[edit_selected_btn_].nx = std::clamp((bx - left) / uw, 0.03F, 0.97F);
+                    buttons_[edit_selected_btn_].ny = std::clamp((by - top) / uh, 0.04F, 0.96F);
+                } else if (action != 2 && pointer_id == edit_drag_pointer_) {
+                    edit_drag_pointer_ = -1;
+                }
+                return;
+            }
 
             if (action == 0) {  // DOWN
                 handle_pointer_down_locked(pointer_id, bx, by, nx, ny, triggered_ui_action, move_cx, move_cy);
@@ -2072,6 +2221,9 @@ private:
     float pinch_prev_dist_ = 0.0F;
     float pinch_prev_mid_x_ = 0.0F;
     float pinch_prev_mid_y_ = 0.0F;
+    bool edit_mode_ = false;
+    int edit_drag_pointer_ = -1;
+    std::size_t edit_selected_btn_ = static_cast<std::size_t>(-1);
 
     PostWindowMsgFn post_msg_;
     UiActionFn on_ui_action_;

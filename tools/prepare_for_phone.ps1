@@ -130,12 +130,40 @@ set -e
 cd /root/wse/phone-parts
 rm -f "$wslZip"
 python3 - "$wslZip" <<'PY'
-import sys, zipfile, glob
+import datetime, glob, hashlib, json, os, sys, zipfile
+
+files = sorted(
+    glob.glob("exe_w*.so")
+    + glob.glob("exe_w*.key")
+    + glob.glob("lua5164_w*.so")
+    + glob.glob("lua5164_w*.key")
+    + glob.glob("texcache/*.etc2")
+)
+hashes = {}
+fingerprint = ""
+for f in files:
+    h = hashlib.sha256()
+    with open(f, "rb") as fp:
+        for chunk in iter(lambda: fp.read(65536), b""):
+            h.update(chunk)
+    hashes[os.path.basename(f)] = h.hexdigest()
+    if not fingerprint and f.endswith(".key"):
+        with open(f, "r", encoding="utf-8", errors="ignore") as kf:
+            first_line = kf.readline().strip()
+            idx = first_line.find("lifter ")
+            if idx >= 0:
+                fingerprint = first_line[idx:]
+
+manifest = {
+    "format": 1,
+    "created_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "translator_fingerprint": fingerprint,
+    "files": hashes,
+}
+
 with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-    for f in sorted(glob.glob("exe_w*.so") + glob.glob("exe_w*.key") + glob.glob("lua5164_w*.so") + glob.glob("lua5164_w*.key")):
-        z.write(f)
-    # Textures converted for the phone's graphics chip (r4_run --for-phone writes them).
-    for f in sorted(glob.glob("texcache/*.etc2")):
+    z.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    for f in files:
         z.write(f)
 PY
 "@

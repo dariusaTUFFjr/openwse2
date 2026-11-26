@@ -36,7 +36,8 @@ struct StartupOptions {
     bool translate_only = false;
     std::string module = "Native";  // seeded as last_module_warband, and passed as --module
     unsigned jobs = 2;               // translation worker threads
-    int opt = 2;                     // LLVM optimization level
+    int opt = 2;                     // LLVM optimization level for hot batches
+    int cold_opt = 1;                // LLVM optimization level for cold batches (-O1 cuts first-run phone time)
     std::size_t batch_kib = 64;      // KiB of .text per translated batch
     bool retranslate = false;        // ignore every cached batch
     bool reuse = false;              // keep cached batches whatever their key (never their functions)

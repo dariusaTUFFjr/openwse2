@@ -93,12 +93,26 @@ void Ctx::set_gpr(ZydisRegister r, llvm::Value* v) {
     set_gpr64(idx, merged);
 }
 
-llvm::Value* Ctx::xmm(int index) { return B.CreateLoad(i128(), xmm_slot[index]); }
+llvm::Value* Ctx::xmm_vec(int index) { return B.CreateLoad(v2i64(), xmm_slot[index]); }
+llvm::Value* Ctx::xmm(int index) { return B.CreateBitCast(xmm_vec(index), i128()); }
 void Ctx::set_xmm(int index, llvm::Value* v) {
-    if (v->getType()->isVectorTy()) {
-        v = B.CreateBitCast(v, i128());
+    llvm::Type* ty = v->getType();
+    if (ty->isVectorTy()) {
+        B.CreateStore(B.CreateBitCast(v, v2i64()), xmm_slot[index]);
+        return;
     }
-    B.CreateStore(B.CreateZExtOrTrunc(v, i128()), xmm_slot[index]);
+    if (ty->isIntegerTy(32)) {
+        auto* v4 = llvm::FixedVectorType::get(B.getInt32Ty(), 4);
+        llvm::Value* ins = B.CreateInsertElement(llvm::ConstantAggregateZero::get(v4), v, std::uint64_t{0});
+        B.CreateStore(B.CreateBitCast(ins, v2i64()), xmm_slot[index]);
+        return;
+    }
+    if (ty->isIntegerTy(64)) {
+        llvm::Value* ins = B.CreateInsertElement(llvm::ConstantAggregateZero::get(v2i64()), v, std::uint64_t{0});
+        B.CreateStore(ins, xmm_slot[index]);
+        return;
+    }
+    B.CreateStore(B.CreateBitCast(B.CreateZExtOrTrunc(v, i128()), v2i64()), xmm_slot[index]);
 }
 
 llvm::Value* Ctx::flag(Flag f) { return B.CreateLoad(B.getInt1Ty(), flag_slot[f]); }
@@ -268,6 +282,17 @@ llvm::Value* Ctx::load(llvm::Value* addr64, unsigned bits_in, Mem kind) {
     return phi;
 }
 
+llvm::Value* Ctx::load_vec128(llvm::Value* addr64, Mem kind) {
+    const bool stack = is_stack(kind, last_address_stack);
+    last_address_stack = false;
+    llvm::LoadInst* l = B.CreateLoad(v2i64(), host_ptr(addr64));
+    l->setAlignment(llvm::Align(1));
+    if (!stack) {
+        B.CreateFence(llvm::AtomicOrdering::Acquire);
+    }
+    return l;
+}
+
 void Ctx::store(llvm::Value* addr64, llvm::Value* v, Mem kind) {
     const bool stack = is_stack(kind, last_address_stack);
     last_address_stack = false;
@@ -316,6 +341,13 @@ llvm::Value* Ctx::read(const DInsn& d, int i) {
     case ZYDIS_OPERAND_TYPE_REGISTER: {
         const int x = xmm_index(o.reg.value);
         if (x >= 0) {
+            if (o.size == 64) {
+                return B.CreateExtractElement(xmm_vec(x), std::uint64_t{0});
+            }
+            if (o.size == 32) {
+                auto* v4 = llvm::FixedVectorType::get(B.getInt32Ty(), 4);
+                return B.CreateExtractElement(B.CreateBitCast(xmm_vec(x), v4), std::uint64_t{0});
+            }
             return B.CreateTrunc(xmm(x), ity(o.size));
         }
         return gpr(o.reg.value);
@@ -346,6 +378,12 @@ void Ctx::write(const DInsn& d, int i, llvm::Value* v) {
         if (x >= 0) {
             if (o.size >= 128) {
                 set_xmm(x, v);
+            } else if (o.size == 64) {
+                set_xmm(x, B.CreateInsertElement(xmm_vec(x), B.CreateZExtOrTrunc(v, B.getInt64Ty()), std::uint64_t{0}));
+            } else if (o.size == 32) {
+                auto* v4 = llvm::FixedVectorType::get(B.getInt32Ty(), 4);
+                set_xmm(x, B.CreateInsertElement(B.CreateBitCast(xmm_vec(x), v4),
+                                                 B.CreateZExtOrTrunc(v, B.getInt32Ty()), std::uint64_t{0}));
             } else {
                 // Narrow XMM writes merge into the low bits (families decide when to zero).
                 const std::uint64_t n = o.size;
@@ -369,7 +407,7 @@ void Ctx::write(const DInsn& d, int i, llvm::Value* v) {
 void Ctx::flush() {
     for (int r = 0; r < 16; ++r) {
         B.CreateStore(B.CreateLoad(B.getInt64Ty(), gpr_slot[r]), state_ptr(cpu_offset::gpr + 8U * r));
-        llvm::StoreInst* s = B.CreateStore(B.CreateLoad(i128(), xmm_slot[r]), state_ptr(cpu_offset::xmm + 16U * r));
+        llvm::StoreInst* s = B.CreateStore(B.CreateLoad(v2i64(), xmm_slot[r]), state_ptr(cpu_offset::xmm + 16U * r));
         s->setAlignment(llvm::Align(16));
     }
     for (int k = 0; k < kFlagCount; ++k) {
@@ -381,7 +419,7 @@ void Ctx::flush() {
 void Ctx::reload() {
     for (int r = 0; r < 16; ++r) {
         B.CreateStore(B.CreateLoad(B.getInt64Ty(), state_ptr(cpu_offset::gpr + 8U * r)), gpr_slot[r]);
-        llvm::LoadInst* x = B.CreateLoad(i128(), state_ptr(cpu_offset::xmm + 16U * r));
+        llvm::LoadInst* x = B.CreateLoad(v2i64(), state_ptr(cpu_offset::xmm + 16U * r));
         x->setAlignment(llvm::Align(16));
         B.CreateStore(x, xmm_slot[r]);
     }
@@ -422,6 +460,11 @@ struct R1Translator::Impl {
     std::unique_ptr<llvm::Module> module;
     std::map<std::uint64_t, llvm::Function*> functions;  // declared (some defined)
     std::set<std::uint64_t> light;                       // translated without optimisation
+    // Direct cross-batch calls (`wse_ext_calls[]`): writable pointer slots patched at startup
+    // by `Runtime::patch_external_calls` so hot cross-batch edges skip `Runtime::hook_dispatch`.
+    std::map<std::uint64_t, std::size_t> ext_call_index;
+    std::vector<std::uint64_t> ext_call_vas;
+    llvm::GlobalVariable* ext_calls_gv = nullptr;
     std::string init_error;
     LiftReport report;
     double lift_ms = 0.0;
@@ -430,7 +473,31 @@ struct R1Translator::Impl {
     void reset() {
         module = std::make_unique<llvm::Module>("wse_r1", *context);
         functions.clear();
+        ext_call_index.clear();
+        ext_call_vas.clear();
+        ext_calls_gv = nullptr;
         lift_ms = 0.0;
+    }
+
+    llvm::Value* ext_call_slot_ptr(llvm::IRBuilder<>& b, std::uint64_t va) {
+        auto [it, fresh] = ext_call_index.emplace(va, ext_call_vas.size());
+        if (fresh) {
+            ext_call_vas.push_back(va);
+        }
+        if (ext_calls_gv == nullptr) {
+            auto* arr_ty = llvm::ArrayType::get(llvm::PointerType::getUnqual(*context), 0);
+            ext_calls_gv = new llvm::GlobalVariable(*module, arr_ty, false, llvm::GlobalValue::ExternalLinkage,
+                                                    nullptr, "wse_ext_calls_placeholder");
+            ext_calls_gv->setVisibility(llvm::GlobalValue::ProtectedVisibility);
+            ext_calls_gv->setDSOLocal(true);
+            ext_calls_gv->setSection(".data");
+        }
+        return b.CreateConstInBoundsGEP1_64(llvm::PointerType::getUnqual(*context), ext_calls_gv, it->second);
+    }
+
+    llvm::FunctionType* guest_fn_ty() {
+        return llvm::FunctionType::get(llvm::Type::getVoidTy(*context),
+                                       {llvm::PointerType::getUnqual(*context)}, false);
     }
 
     llvm::Function* function(std::uint64_t va) {
@@ -548,7 +615,7 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
     c.B.SetInsertPoint(entry);
     for (int r = 0; r < 16; ++r) {
         c.gpr_slot[r] = c.B.CreateAlloca(c.B.getInt64Ty(), nullptr, "r" + std::to_string(r));
-        c.xmm_slot[r] = c.B.CreateAlloca(c.i128(), nullptr, "x" + std::to_string(r));
+        c.xmm_slot[r] = c.B.CreateAlloca(c.v2i64(), nullptr, "x" + std::to_string(r));
     }
     for (int k = 0; k < r1::kFlagCount; ++k) {
         c.flag_slot[k] = c.B.CreateAlloca(c.B.getInt1Ty(), nullptr, "f" + std::to_string(k));
@@ -610,7 +677,9 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
         if (impl_->functions.count(target) != 0) {
             c.B.CreateCall(impl_->function(target), {c.state})->setTailCallKind(llvm::CallInst::TCK_MustTail);
         } else {
-            call_dispatch(c, c.B.getInt64(target))->setTailCall();
+            llvm::LoadInst* fp = c.B.CreateLoad(c.ptr(), impl_->ext_call_slot_ptr(c.B, target));
+            fp->setAlignment(llvm::Align(8));
+            c.B.CreateCall(impl_->guest_fn_ty(), fp, {c.state})->setTailCallKind(llvm::CallInst::TCK_MustTail);
         }
         c.B.CreateRetVoid();
     };
@@ -722,7 +791,9 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
                         if (impl_->functions.count(target) != 0) {
                             c.B.CreateCall(impl_->function(target), {c.state});
                         } else {
-                            call_dispatch(c, c.B.getInt64(target));
+                            llvm::LoadInst* fp = c.B.CreateLoad(c.ptr(), impl_->ext_call_slot_ptr(c.B, target));
+                            fp->setAlignment(llvm::Align(8));
+                            c.B.CreateCall(impl_->guest_fn_ty(), fp, {c.state});
                         }
                     });
                 } else if (o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.base == ZYDIS_REGISTER_RIP &&
@@ -842,6 +913,53 @@ bool R1Translator::emit_object(int opt_level, std::vector<char>& object, Transla
                              llvm::ConstantArray::get(arr_ty, rows), "wse_fn_table");
     new llvm::GlobalVariable(m, b.getInt64Ty(), true, llvm::GlobalValue::ExternalLinkage,
                              b.getInt64(rows.size()), "wse_fn_table_count");
+
+    // Cross-batch direct call slots (`wse_ext_calls[]`): each entry starts pointing to a small
+    // internal fallback thunk that calls `hooks->dispatch(state, va)` so an unpatched module still
+    // works identically. Placed in writable `.data` (outside RELRO) for `Runtime::patch_external_calls`.
+    const std::size_t ext_n = impl_->ext_call_vas.size();
+    if (ext_n > 0) {
+        std::vector<llvm::Constant*> ext_inits;
+        std::vector<llvm::Constant*> ext_vas;
+        ext_inits.reserve(ext_n);
+        ext_vas.reserve(ext_n);
+        auto* guest_ty = impl_->guest_fn_ty();
+        auto* disp_ty = llvm::FunctionType::get(b.getVoidTy(), {b.getPtrTy(), b.getInt64Ty()}, false);
+        for (const std::uint64_t va : impl_->ext_call_vas) {
+            char stub_name[40];
+            std::snprintf(stub_name, sizeof(stub_name), "wse_ext_fwd_%llx", static_cast<unsigned long long>(va));
+            auto* stub = llvm::Function::Create(guest_ty, llvm::GlobalValue::InternalLinkage, stub_name, m);
+            stub->addFnAttr(llvm::Attribute::NoUnwind);
+            b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", stub));
+            llvm::Value* hooks = b.CreateLoad(
+                b.getPtrTy(), b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), stub->getArg(0), cpu_offset::hooks));
+            llvm::Value* fp = b.CreateLoad(
+                b.getPtrTy(), b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), hooks, offsetof(RuntimeHooks, dispatch)));
+            b.CreateCall(disp_ty, fp, {stub->getArg(0), b.getInt64(va)})->setTailCall();
+            b.CreateRetVoid();
+            ext_inits.push_back(stub);
+            ext_vas.push_back(b.getInt64(va));
+        }
+        auto* ext_arr_ty = llvm::ArrayType::get(b.getPtrTy(), ext_n);
+        auto* real_ext = new llvm::GlobalVariable(m, ext_arr_ty, false, llvm::GlobalValue::ExternalLinkage,
+                                                  llvm::ConstantArray::get(ext_arr_ty, ext_inits), "wse_ext_calls");
+        real_ext->setVisibility(llvm::GlobalValue::ProtectedVisibility);
+        real_ext->setDSOLocal(true);
+        real_ext->setSection(".data");
+        if (impl_->ext_calls_gv != nullptr) {
+            impl_->ext_calls_gv->replaceAllUsesWith(real_ext);
+            impl_->ext_calls_gv->eraseFromParent();
+            impl_->ext_calls_gv = nullptr;
+        }
+        auto* va_arr_ty = llvm::ArrayType::get(b.getInt64Ty(), ext_n);
+        new llvm::GlobalVariable(m, va_arr_ty, true, llvm::GlobalValue::ExternalLinkage,
+                                 llvm::ConstantArray::get(va_arr_ty, ext_vas), "wse_ext_call_vas");
+    } else if (impl_->ext_calls_gv != nullptr) {
+        impl_->ext_calls_gv->eraseFromParent();
+        impl_->ext_calls_gv = nullptr;
+    }
+    new llvm::GlobalVariable(m, b.getInt64Ty(), true, llvm::GlobalValue::ExternalLinkage,
+                             b.getInt64(ext_n), "wse_ext_call_count");
 
     const llvm_common::TargetSetup t = llvm_common::make_target(opt_level);
     if (!t.tm) {

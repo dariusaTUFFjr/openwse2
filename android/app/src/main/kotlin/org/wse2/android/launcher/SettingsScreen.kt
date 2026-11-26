@@ -768,15 +768,15 @@ private fun RglGameplaySettingsSection(
     LauncherSectionHeader(title = "Battle & difficulty")
     LauncherGroupedCard {
         FloatSliderListItem(
-            headline = "Battle size",
-            supporting = "Maximum soldiers active in a battle at once",
+            headline = "Battle size (WSE2)",
+            supporting = "Maximum soldiers active in battle (30–150 vanilla, up to 1,000 WSE2)",
             persistedValue = rgl.battleSize,
             minValue = 0f,
-            maxValue = 1f,
-            step = 0.025f,
+            maxValue = 8.0834f,
+            step = 0.083333f,
             enabled = true,
             formatValue = { v ->
-                val troops = (30 + (v.coerceIn(0f, 1f) * 120f).roundToInt()).coerceIn(30, 150)
+                val troops = (30 + (v.coerceIn(0f, 8.0834f) * 120f).roundToInt()).coerceIn(30, 1000)
                 "$troops troops"
             },
             onCommitValue = { v -> onUpdate { it.copy(battleSize = v) } }

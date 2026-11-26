@@ -96,6 +96,68 @@ fun WseDialog(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun WseContentDialog(
+    title: String,
+    confirm: WseDialogAction,
+    dismiss: WseDialogAction? = null,
+    onDismissRequest: () -> Unit = dismiss?.onClick ?: confirm.onClick,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    val colors = LocalWseColors.current
+    Dialog(onDismissRequest = onDismissRequest) {
+        Surface(
+            shape = WseShapes.large,
+            color = colors.surfaceContainerHigh,
+            border = BorderStroke(1.dp, colors.hairline),
+            modifier = modifier
+                .fillMaxWidth()
+                .heightIn(max = 580.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = colors.onSurface
+                )
+                HorizontalDivider(
+                    thickness = 1.dp,
+                    color = colors.hairline
+                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                ) {
+                    content()
+                }
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp, androidx.compose.ui.Alignment.End),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (dismiss != null) {
+                        WseTextButton(
+                            text = dismiss.label,
+                            onClick = dismiss.onClick
+                        )
+                    }
+                    WsePrimaryButton(
+                        text = confirm.label,
+                        onClick = confirm.onClick
+                    )
+                }
+            }
+        }
+    }
+}
+
 @Preview(name = "WSE Dialog", showBackground = true)
 @Composable
 private fun PreviewWseDialog() {

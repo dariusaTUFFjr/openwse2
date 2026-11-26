@@ -187,6 +187,8 @@ public:
 
     // Text written to the standard handles when `console` is set (UTF-8).
     std::function<void(const std::string&)> on_console;
+    // Invoked after an atomic savegame write commits under `user` (relative VFS path).
+    std::function<void(const std::string&)> on_save_written;
 
     // `path` (Win32, UTF-8) made absolute and canonical (`C:\a\b`), or nothing when invalid.
     [[nodiscard]] std::optional<std::string> canonical(const std::string& path) const {
@@ -602,12 +604,56 @@ private:
         if (lower_file(l)) return l.mount->lower->file_size(join(l.mount->lower_root, l.rel), size);
         return false;
     }
+    static bool is_savegame_rel(const std::string& up) {
+        const std::string up_upper = files_detail::upper_utf8(up);
+        return up_upper.size() >= 4 &&
+               up_upper.compare(up_upper.size() - 4, 4, ".SAV") == 0 &&
+               up_upper.find("SAVEGAMES/") != std::string::npos &&
+               up_upper.find("NEW_GAME.SAV") == std::string::npos &&
+               up_upper.find("LAST_SAVEGAME_BACKUP.SAV") == std::string::npos;
+    }
+
     bool write_whole(const Location& l, const std::vector<std::uint8_t>& data) {
         if (l.mount == nullptr || l.mount->upper == nullptr) return false;
         const std::string up = join(l.mount->upper_root, l.rel);
         if (!platform::make_parent_dirs(*l.mount->upper, up)) return false;
         whiteouts_.erase(files_detail::upper_utf8(l.guest));
-        return l.mount->upper->write_file(up, std::span<const std::uint8_t>(data.data(), data.size()));
+
+        // Safe atomic saves + rolling 3-version backups for Warband `.sav` files
+        // (`docs/RECOMP_PLAN.md` "v1 must-haves": an interrupted save leaves the previous save
+        // intact, and the last three versions stay available for Save Manager restore).
+        const bool is_save = is_savegame_rel(up);
+        const auto span = std::span<const std::uint8_t>(data.data(), data.size());
+        if (!is_save) {
+            return l.mount->upper->write_file(up, span);
+        }
+        auto& vfs = *l.mount->upper;
+        // Never overwrite an existing savegame with a 0-byte placeholder or rotate empty backups.
+        if (data.empty() && vfs.is_file(up)) {
+            return true;
+        }
+        const std::string tmp = up + ".wse_tmp";
+        if (!vfs.write_file(tmp, span)) {
+            return false;
+        }
+        if (vfs.is_file(up)) {
+            const std::string b1 = up + ".bak1";
+            const std::string b2 = up + ".bak2";
+            const std::string b3 = up + ".bak3";
+            if (vfs.is_file(b3)) (void)vfs.remove_file(b3);
+            if (vfs.is_file(b2)) (void)vfs.rename_file(b2, b3);
+            if (vfs.is_file(b1)) (void)vfs.rename_file(b1, b2);
+            (void)vfs.rename_file(up, b1);
+        }
+        bool ok = vfs.rename_file(tmp, up);
+        if (!ok) {
+            ok = vfs.write_file(up, span);
+            (void)vfs.remove_file(tmp);
+        }
+        if (ok && on_save_written) {
+            on_save_written(up);
+        }
+        return ok;
     }
     bool remove(const Location& l) {
         bool any = false;
@@ -782,9 +828,14 @@ private:
             return fail_handle(s, kErrorAccessDenied);
         }
         if (f->dirty) {
-            // A new or truncated file exists from now on (CreateFile writes it at once).
-            (void)write_whole(l, f->data);
-            f->dirty = false;
+            // For savegames, defer the disk commit until FlushFileBuffers / CloseHandle so the
+            // previous save stays untouched until the complete payload is written atomically.
+            const std::string up = join(l.mount->upper_root, l.rel);
+            if (!is_savegame_rel(up)) {
+                // A new or truncated file exists from now on (CreateFile writes it at once).
+                (void)write_whole(l, f->data);
+                f->dirty = false;
+            }
         }
         lock.unlock();
         const std::uint64_t h = file_handle(std::move(f));

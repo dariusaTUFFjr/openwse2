@@ -24,6 +24,7 @@
 
 #include "wse/recomp/cpu_state.h"
 #include "wse/recomp/runtime.h"
+#include "wse/recomp/session_replay.h"
 #include "wse/recomp/teb.h"
 
 namespace wse::recomp::shim {
@@ -170,7 +171,7 @@ public:
         };
         using time_detail::put;
         bind("KERNEL32.dll", "QueryPerformanceCounter", [](CpuState& s) {
-            put<std::int64_t>(win64_arg(s, 0), counter_now());
+            put<std::int64_t>(win64_arg(s, 0), SessionLog::shared().on_qpc(counter_now()));
             win64_return(s, 1);
         });
         bind("KERNEL32.dll", "QueryPerformanceFrequency", [](CpuState& s) {
@@ -178,13 +179,13 @@ public:
             win64_return(s, 1);
         });
         bind("KERNEL32.dll", "GetTickCount", [](CpuState& s) {
-            win64_return(s, static_cast<std::uint32_t>(counter_now() / 10000));
+            win64_return(s, SessionLog::shared().on_tick32(static_cast<std::uint32_t>(counter_now() / 10000)));
         });
         bind("KERNEL32.dll", "GetTickCount64", [](CpuState& s) {
-            win64_return(s, static_cast<std::uint64_t>(counter_now() / 10000));
+            win64_return(s, SessionLog::shared().on_tick64(static_cast<std::uint64_t>(counter_now() / 10000)));
         });
         bind("WINMM.dll", "timeGetTime", [](CpuState& s) {
-            win64_return(s, static_cast<std::uint32_t>(counter_now() / 10000));
+            win64_return(s, SessionLog::shared().on_time_get_time(static_cast<std::uint32_t>(counter_now() / 10000)));
         });
         bind("WINMM.dll", "timeBeginPeriod", [](CpuState& s) { win64_return(s, 0); });  // TIMERR_NOERROR
         bind("WINMM.dll", "timeEndPeriod", [](CpuState& s) { win64_return(s, 0); });

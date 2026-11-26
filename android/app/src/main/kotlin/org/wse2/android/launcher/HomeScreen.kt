@@ -96,7 +96,8 @@ fun HomeScreen(
     modules: List<ModuleChoice> = emptyList(),
     selectedIndex: Int = -1,
     moduleArt: Map<String, ModuleArt> = emptyMap(),
-    onSelectModule: (Int) -> Unit = {}
+    onSelectModule: (Int) -> Unit = {},
+    onOpenSaveManager: (() -> Unit)? = null
 ) {
     val hasFolder = state.installFolder.treeUri != null ||
         !state.installFolder.displayName.isNullOrBlank()
@@ -210,7 +211,8 @@ fun HomeScreen(
                         },
                         onChooseFolder = onChooseFolder,
                         onShowMissingFiles = onShowMissingFiles,
-                        onPlay = onPlay
+                        onPlay = onPlay,
+                        onOpenSaveManager = onOpenSaveManager
                     )
                 }
             }
@@ -266,7 +268,8 @@ fun HomeScreen(
                         },
                         onChooseFolder = onChooseFolder,
                         onShowMissingFiles = onShowMissingFiles,
-                        onPlay = onPlay
+                        onPlay = onPlay,
+                        onOpenSaveManager = onOpenSaveManager
                     )
                 }
             }
@@ -480,7 +483,8 @@ private fun HomeActionsPanel(
     moduleSection: (@Composable () -> Unit)?,
     onChooseFolder: () -> Unit,
     onShowMissingFiles: (ModuleChoice, List<String>) -> Unit,
-    onPlay: () -> Unit
+    onPlay: () -> Unit,
+    onOpenSaveManager: (() -> Unit)? = null
 ) {
     val colors = LocalWseColors.current
     val haptic = LocalHapticFeedback.current
@@ -568,6 +572,12 @@ private fun HomeActionsPanel(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
+            if (onOpenSaveManager != null) {
+                WseTextButton(
+                    text = "Saves",
+                    onClick = onOpenSaveManager
+                )
+            }
             WseTextButton(
                 text = "Change folder",
                 onClick = onChooseFolder,

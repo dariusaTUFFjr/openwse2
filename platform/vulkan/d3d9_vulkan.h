@@ -156,6 +156,18 @@ public:
     void set_thermal_status(ThermalStatus status) noexcept;
     // Active render scale in [0.5, 1.0] for the current/next frame.
     [[nodiscard]] float current_render_scale() const noexcept;
+    // P14.2 live in-game quick-settings drawer update (thread-safe, applies on next frame).
+    void set_graphics_options(float render_scale, bool auto_resolution, float sharpness,
+                              bool fxaa, float target_fps) noexcept;
+    // P14.4 per-frame CPU/GPU/thermal telemetry snapshot.
+    struct FrameTimings {
+        double frame_ms = 0.0;
+        double cpu_ms = 0.0;
+        double gpu_ms = -1.0;  // <0 when VkQueryPool timestamps are unavailable
+        float render_scale = 1.0F;
+        ThermalStatus thermal = ThermalStatus::None;
+    };
+    [[nodiscard]] FrameTimings last_frame_timings() const noexcept;
     // Persists VkPipelineCache to `config.pipeline_cache_path` (safe to call before process exit).
     void flush_pipeline_cache() noexcept;
     [[nodiscard]] std::string active_presentation_path() const;

@@ -35,6 +35,7 @@
 #include "wse/platform/vfs.h"
 #include "wse/recomp/cpu_state.h"
 #include "wse/recomp/runtime.h"
+#include "wse/recomp/session_replay.h"
 #include "wse/recomp/shim_crt.h"
 #include "wse/recomp/teb.h"
 
@@ -311,6 +312,10 @@ public:
             for (std::uint32_t i = 0; i < len && buf != 0; i += 4) {
                 const std::uint32_t r = rd();
                 std::memcpy(reinterpret_cast<void*>(buf + i), &r, std::min<std::uint32_t>(4, len - i));
+            }
+            if (buf != 0 && len > 0) {
+                SessionLog::shared().on_rtl_random(reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(buf)),
+                                                   len);
             }
             win64_return(s, 1);
         });

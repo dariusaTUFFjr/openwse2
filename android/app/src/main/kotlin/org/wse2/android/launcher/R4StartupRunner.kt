@@ -63,10 +63,10 @@ class R4StartupRunner private constructor(private val app: Application) {
     private var r5Preparing = false
 
     init {
+        UserStorage.migrateLegacyUserDirIfNeeded(app.filesDir)
         // "Work from a copy" is remembered across app starts, not only across interrupted runs.
         state = state.copy(useCopy = prefs.getBoolean(PREF_USE_COPY, false))
-        refreshInstallCacheSize()
-        refreshTextureCacheSize()
+        refreshAllStorageSizes()
     }
 
     fun addListener(listener: (R4UiState) -> Unit) {
@@ -102,12 +102,157 @@ class R4StartupRunner private constructor(private val app: Application) {
     // The result notification was tapped (or RecompGameActivity returned): show the last report,
     // even if this process was restarted since the run (the report is in app storage).
     fun showLastReport(force: Boolean = false) {
-        refreshInstallCacheSize()
-        refreshTextureCacheSize()
+        refreshAllStorageSizes()
         if (state.running || (!force && state.report != null)) return
         val file = File(r4Dir, "report.txt")
         if (!file.isFile) return
         update(state.copy(report = reportText(null)))
+    }
+
+    fun refreshAllStorageSizes() {
+        Thread({
+            val installBytes = readInstallCacheBytes()
+            val texBytes = readTextureCacheBytes()
+            val soBytes = dirSizeBytes(File(r4Dir, "so"))
+            val shaderBytes = dirSizeBytes(File(app.cacheDir, "mesa_shader_cache"))
+            val backupBytes = SaveManager.backupBytesUsed(app.filesDir)
+            synchronized(this) {
+                if (state.installCacheBytes != installBytes ||
+                    state.textureCacheBytes != texBytes ||
+                    state.soCacheBytes != soBytes ||
+                    state.shaderCacheBytes != shaderBytes ||
+                    state.saveBackupsBytes != backupBytes
+                ) {
+                    update(
+                        state.copy(
+                            installCacheBytes = installBytes,
+                            textureCacheBytes = texBytes,
+                            soCacheBytes = soBytes,
+                            shaderCacheBytes = shaderBytes,
+                            saveBackupsBytes = backupBytes
+                        )
+                    )
+                }
+            }
+        }, "wse-r4-storage-sizes").start()
+    }
+
+    private fun dirSizeBytes(dir: File): Long {
+        if (!dir.isDirectory) return 0L
+        return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+    }
+
+    fun clearSoCache() {
+        if (state.running) return
+        Thread({
+            File(r4Dir, "so").listFiles()?.forEach { it.deleteRecursively() }
+            refreshAllStorageSizes()
+        }, "wse-r4-so-clear").start()
+    }
+
+    fun clearShaderCache() {
+        if (state.running) return
+        Thread({
+            File(app.cacheDir, "mesa_shader_cache").listFiles()?.forEach { it.deleteRecursively() }
+            refreshAllStorageSizes()
+        }, "wse-r4-shader-clear").start()
+    }
+
+    fun clearSaveBackups() {
+        if (state.running) return
+        Thread({
+            SaveManager.clearAllBackups(app.filesDir)
+            refreshAllStorageSizes()
+        }, "wse-r4-backups-clear").start()
+    }
+
+    /**
+     * Checks whether the Warband folder contains an unconfirmed `wse2-prepared*.zip` prepared on
+     * a PC (`docs/PLATFORM_PLAN.md` "P14.6"). Returns `null` if none exists or if the user already
+     * imported or declined that exact zip (name/size/lastModified stamp).
+     */
+    fun findPendingPreparedZip(treeUri: Uri): PendingPreparedZip? {
+        return try {
+            val root = DocumentsContract.getTreeDocumentId(treeUri)
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, root)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED
+            )
+            var pending: PendingPreparedZip? = null
+            app.contentResolver.query(children, projection, null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    val name = c.getString(1) ?: continue
+                    if (PREPARED_ZIP.matches(name)) {
+                        val size = if (c.isNull(2)) -1L else c.getLong(2)
+                        val mtime = if (c.isNull(3)) -1L else c.getLong(3)
+                        val stamp = "$name/$size/$mtime"
+                        val alreadyImported = prefs.getString(PREF_IMPORTED, null) == stamp
+                        val alreadyDeclined = prefs.getString(PREF_DECLINED_ZIP, null) == stamp
+                        if (!alreadyImported && !alreadyDeclined) {
+                            pending = PendingPreparedZip(
+                                documentId = c.getString(0),
+                                fileName = name,
+                                sizeBytes = size,
+                                lastModifiedMs = mtime,
+                                stamp = stamp
+                            )
+                            break
+                        }
+                    }
+                }
+            }
+            pending
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun declinePreparedZip(zip: PendingPreparedZip) {
+        prefs.edit().putString(PREF_DECLINED_ZIP, zip.stamp).apply()
+        importNote("Skipped ${zip.fileName} (user declined).")
+    }
+
+    fun importConfirmedPreparedZip(
+        treeUri: Uri,
+        zip: PendingPreparedZip,
+        onProgress: (String) -> Unit,
+        onDone: (PreparedZipImportResult) -> Unit
+    ) {
+        Thread({
+            r4Dir.mkdirs()
+            val soDir = File(r4Dir, "so").apply { mkdirs() }
+            val texDir = File(r4Dir, "texcache").apply { mkdirs() }
+            val doc = DocumentsContract.buildDocumentUriUsingTree(treeUri, zip.documentId)
+            val result = try {
+                app.contentResolver.openInputStream(doc)?.use { input ->
+                    main.post { onProgress("Verifying SHA-256 hashes in ${zip.fileName}…") }
+                    PreparedZipVerifier.verifyAndExtract(
+                        zipStream = input,
+                        soDir = soDir,
+                        texDir = texDir,
+                        isCancelled = { stopRequested },
+                        onProgress = { parts, tex ->
+                            main.post {
+                                onProgress("Verified & imported $parts code parts, $tex textures…")
+                            }
+                        }
+                    )
+                } ?: PreparedZipImportResult(ok = false, error = "Could not open ${zip.fileName}.")
+            } catch (t: Throwable) {
+                PreparedZipImportResult(ok = false, error = t.message ?: t.javaClass.simpleName)
+            }
+            if (result.ok) {
+                prefs.edit().putString(PREF_IMPORTED, zip.stamp).remove(PREF_DECLINED_ZIP).apply()
+                importNote("Verified and imported ${result.partsImported} parts and ${result.texturesImported} textures from ${zip.fileName}.")
+                refreshAllStorageSizes()
+            } else {
+                importNote("PC zip verification failed (${zip.fileName}): ${result.error}")
+            }
+            main.post { onDone(result) }
+        }, "wse-r4-zip-verify").start()
     }
 
     fun refreshInstallCacheSize() {
@@ -184,9 +329,10 @@ class R4StartupRunner private constructor(private val app: Application) {
         }
     }
 
-    // Prepares for a live R5a Vulkan run: rotates the previous report, imports any PC-prepared
-    // `wse2-prepared*.zip` in the Warband folder, computes the memory-safe thread count, and
-    // calls `onReady` on the main thread with (copyDir, workDir, jobs).
+    // Prepares for a live R5a/R8 Vulkan run: rotates the previous report, computes the memory-safe
+    // thread count, and calls `onReady` on the main thread with (copyDir, workDir, jobs).
+    // PC-prepared zips are now confirmed and SHA-256 verified via `findPendingPreparedZip` +
+    // `importConfirmedPreparedZip` before launching (P14.6).
     fun prepareForLiveVulkan(
         treeUri: Uri,
         onReady: (copyDir: String, workDir: String, jobs: Int) -> Unit
@@ -194,6 +340,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         if (state.running || r5Preparing) return
         r5Preparing = true
         stopRequested = false
+        UserStorage.migrateLegacyUserDirIfNeeded(app.filesDir)
         r4Dir.mkdirs()
         val previous = File(r4Dir, "report.txt")
         if (previous.isFile && previous.length() > 0) {
@@ -214,17 +361,10 @@ class R4StartupRunner private constructor(private val app: Application) {
         } else {
             ""
         }
-        Thread({
-            try {
-                importPrepared(treeUri)
-            } catch (t: Throwable) {
-                importNote("Importing the zip prepared on a PC failed: ${t.message ?: t.javaClass.simpleName}")
-            }
-            main.post {
-                r5Preparing = false
-                onReady(resolvedCopy, workDir.absolutePath, resolvedJobs)
-            }
-        }, "wse-r5a-prep").start()
+        main.post {
+            r5Preparing = false
+            onReady(resolvedCopy, workDir.absolutePath, resolvedJobs)
+        }
     }
 
     // The report to save as a file (Advanced > "Save the game test report"), during a run too:
@@ -433,115 +573,35 @@ class R4StartupRunner private constructor(private val app: Application) {
         }, "wse-r4-copy").start()
     }
 
-    // Imports the parts a PC prepared (tools/prepare_for_phone.ps1 writes
-    // `wse2-prepared-for-phone.zip`; the player puts it in the Warband folder): its `.so` and `.key`
-    // files go into the batch cache, where the run checks each one's key as it checks its own, so
-    // a zip from another app version or exe is translated again here rather than used. A zip is
-    // imported once (name, size and time remembered). Returns the number of parts imported.
+    // Background R4 game test: only imports a PC zip if it passes full SHA-256 `manifest.json`
+    // verification (P14.6). Unverified zips are refused and logged cleanly.
     private fun importPrepared(treeUri: Uri): Int {
-        val root = DocumentsContract.getTreeDocumentId(treeUri)
-        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, root)
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_SIZE,
-            DocumentsContract.Document.COLUMN_LAST_MODIFIED
-        )
-        var found: Pair<String, String>? = null
-        app.contentResolver.query(children, projection, null, null, null)?.use { c ->
-            while (c.moveToNext()) {
-                val name = c.getString(1) ?: continue
-                if (PREPARED_ZIP.matches(name)) {
-                    val stamp = "$name/${if (c.isNull(2)) -1 else c.getLong(2)}/${if (c.isNull(3)) -1 else c.getLong(3)}"
-                    found = c.getString(0) to stamp
-                    break
-                }
-            }
-        }
-        val (id, stamp) = found ?: run {
-            importNote("No wse2-prepared*.zip in the Warband folder's top level: nothing imported.")
-            return 0
-        }
-        if (prefs.getString(PREF_IMPORTED, null) == stamp) {
-            importNote("${stamp.substringBefore('/')} was already imported by an earlier run.")
+        val pending = findPendingPreparedZip(treeUri) ?: run {
+            importNote("No new wse2-prepared*.zip to import.")
             return 0
         }
         val soDir = File(r4Dir, "so").apply { mkdirs() }
-        update(state.copy(status = "Importing the game files prepared on your PC…"))
-        var parts = 0
-        var textures = 0
-        val doc = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
-        app.contentResolver.openInputStream(doc)?.use { input ->
-            // A part is its .so and its .key. They are installed together, the .key last and only
-            // after the old .key is gone: a stop or a failure part-way never leaves a key that
-            // vouches for code it was not made with (the run would load that code). A part whose
-            // key is already here unchanged is skipped.
-            val keys = HashMap<String, ByteArray>()
-            val staged = HashMap<String, File>()
-            fun install(part: String) {
-                val key = keys[part] ?: return
-                val so = staged[part] ?: return
-                keys.remove(part)
-                staged.remove(part)
-                val destKey = File(soDir, "$part.key")
-                val destSo = File(soDir, "$part.so")
-                if (destSo.isFile && destKey.isFile && destKey.readBytes().contentEquals(key)) {
-                    so.delete()
-                    return
+        val texDir = File(r4Dir, "texcache").apply { mkdirs() }
+        update(state.copy(status = "Verifying SHA-256 hashes in ${pending.fileName}…"))
+        val doc = DocumentsContract.buildDocumentUriUsingTree(treeUri, pending.documentId)
+        val res = app.contentResolver.openInputStream(doc)?.use { input ->
+            PreparedZipVerifier.verifyAndExtract(
+                zipStream = input,
+                soDir = soDir,
+                texDir = texDir,
+                isCancelled = { stopRequested },
+                onProgress = { parts, _ ->
+                    if (parts > 0) update(state.copy(status = "Verified & imported $parts parts from ${pending.fileName}…"))
                 }
-                destKey.delete()
-                destSo.delete()
-                val keyTmp = File(soDir, "$part.key.import")
-                keyTmp.writeBytes(key)
-                if (!so.renameTo(destSo) || !keyTmp.renameTo(destKey)) {
-                    so.delete()
-                    keyTmp.delete()
-                    destSo.delete()
-                    throw IllegalStateException("cannot write $part")
-                }
-                ++parts
-                if (parts % 10 == 0) update(state.copy(status = "Importing the game files prepared on your PC: $parts parts"))
-            }
-            try {
-                java.util.zip.ZipInputStream(input.buffered(1 shl 16)).use { zip ->
-                    while (true) {
-                        if (stopRequested) return parts
-                        val entry = zip.nextEntry ?: break
-                        val name = entry.name.substringAfterLast('/').substringAfterLast('\\')
-                        if (!entry.isDirectory && PREPARED_TEXTURE.matches(name)) {
-                            // A texture converted on the PC: into the texture cache as the phone
-                            // would have written it (a whole file or nothing).
-                            val texDir = File(r4Dir, "texcache").apply { mkdirs() }
-                            val dest = File(texDir, name)
-                            if (!dest.isFile) {
-                                val tmp = File(texDir, "$name.import")
-                                tmp.outputStream().use { zip.copyTo(it, 1 shl 16) }
-                                if (tmp.renameTo(dest)) ++textures else tmp.delete()
-                            }
-                            continue
-                        }
-                        if (entry.isDirectory || !PREPARED_PART.matches(name)) continue
-                        val part = name.substringBeforeLast('.')
-                        if (name.endsWith(".key")) {
-                            keys[part] = zip.readBytes()
-                        } else {
-                            val tmp = File(soDir, "$name.import")
-                            tmp.outputStream().use { zip.copyTo(it, 1 shl 16) }
-                            staged[part] = tmp
-                        }
-                        install(part)
-                    }
-                }
-            } finally {
-                staged.values.forEach { it.delete() }  // a .so whose .key never came
-            }
-        } ?: run {
-            importNote("${stamp.substringBefore('/')} could not be opened.")
+            )
+        } ?: PreparedZipImportResult(ok = false, error = "${pending.fileName} could not be opened.")
+        if (!res.ok) {
+            importNote("Refused ${pending.fileName}: ${res.error}")
             return 0
         }
-        prefs.edit().putString(PREF_IMPORTED, stamp).apply()
-        importNote("Imported $parts parts and $textures converted textures from ${stamp.substringBefore('/')}.")
-        return parts
+        prefs.edit().putString(PREF_IMPORTED, pending.stamp).remove(PREF_DECLINED_ZIP).apply()
+        importNote("Verified and imported ${res.partsImported} parts and ${res.texturesImported} converted textures from ${pending.fileName}.")
+        return res.partsImported
     }
 
     private fun bind(treeUri: Uri, copy: String) {
@@ -658,11 +718,10 @@ class R4StartupRunner private constructor(private val app: Application) {
         val report = reportText(error)
         update(state.copy(running = false, status = "", report = report))
         R4ForegroundService.finish(app, report.substringBefore("\n\n"))
-        refreshInstallCacheSize()
-        refreshTextureCacheSize()
+        refreshAllStorageSizes()
     }
 
-    // The headline (the given error, or the report's RESULT line) and the report.
+    // The headline (the given error, or a plain-language diagnostic from the report) and the report.
     private fun reportText(error: String?): String {
         val text = try {
             File(r4Dir, "report.txt").readText()
@@ -670,15 +729,31 @@ class R4StartupRunner private constructor(private val app: Application) {
             ""
         }
         val result = text.lineSequence().lastOrNull { it.startsWith("RESULT ") }?.removePrefix("RESULT ")
+        val lower = text.lowercase()
         val headline = when {
             error != null -> error
-            result == null -> "The game test ended unexpectedly (the phone may have closed it). " +
-                "Everything finished so far is saved."
-            result.startsWith("pass-r5a") -> "Live Vulkan run finished ($result)."
-            result.startsWith("stopped-r5a") -> "Live Vulkan run stopped before the first frame."
-            result.startsWith("vulkan-error") -> "Vulkan driver failed to start. Please share this report."
+            result == null -> "The game ended unexpectedly (Android may have closed it for memory). " +
+                "Everything translated so far is saved."
+            result.startsWith("pass-r5a") -> "Game session finished cleanly ($result)."
+            result.startsWith("stopped-r5a") -> "Game closed before the first frame appeared."
+            result.startsWith("vulkan-error") -> "Your phone's Vulkan graphics driver could not start. " +
+                "Try switching back to System Vulkan under Advanced -> GPU Driver."
+            lower.contains("pdb") && (lower.contains("missing") || lower.contains("mismatch") || lower.contains("not found")) ->
+                "Missing or mismatched mb_warband_wse2_x64.pdb. Copy the matching .pdb file from your " +
+                    "WSE2 PC installation into the Warband folder and try again."
+            lower.contains("missing_import") -> {
+                val impLine = text.lineSequence().firstOrNull { it.contains("missing_import", ignoreCase = true) }?.trim()
+                "This version of WSE2 called a Windows function that is not yet supported" +
+                    (if (impLine != null) " ($impLine)." else ".") + " Please share this report."
+            }
             result.startsWith("pass") -> "The game test passed."
-            else -> "The game test stopped with a problem. Please share this report."
+            else -> {
+                val faultLine = text.lineSequence().firstOrNull {
+                    it.contains("FAULT", ignoreCase = true) || it.contains("SIGSEGV", ignoreCase = true)
+                }?.trim()
+                "The game stopped with an error" +
+                    (if (faultLine != null) " ($faultLine)." else ".") + " Please share this report."
+            }
         }
         return "$headline\n\nDetails for the developers:\n$text"
     }
@@ -800,7 +875,8 @@ class R4StartupRunner private constructor(private val app: Application) {
         private const val PREF_JOBS = "jobs"
         private const val PREVIOUS_REPORT = "report.previous.txt"
         private const val IMPORT_NOTE = "import.txt"
-        private const val PREF_IMPORTED ="imported_zip"  // the last PC zip imported (name/size/time)
+        private const val PREF_IMPORTED = "imported_zip"  // the last PC zip imported (name/size/time)
+        private const val PREF_DECLINED_ZIP = "declined_zip"
         private val PREPARED_ZIP = Regex("""(?i)wse2-prepared.*\.zip""")
         private val PREPARED_PART = Regex("""(exe|lua5164)_w\d+\.(so|key)""")
         private val PREPARED_TEXTURE = Regex("""[0-9a-f]{16}\.etc2""")
