@@ -1053,9 +1053,9 @@ Java_org_wse2_android_WseSafBridge_nativeInspectSavegame(
     }
     const int day = static_cast<int>(game_date_hours / 24.0f) + 1;
     std::string out = "{\"ok\":true,\"name\":";
-    out += wse::core::json_quote(save_name);
+    wse::core::wse_append_json_string(out, save_name);
     out += ",\"player\":";
-    out += wse::core::json_quote(player_name);
+    wse::core::wse_append_json_string(out, player_name);
     out += ",\"level\":" + std::to_string(player_level);
     out += ",\"day\":" + std::to_string(day);
     out += ",\"save_ver\":" + std::to_string(save_ver);
