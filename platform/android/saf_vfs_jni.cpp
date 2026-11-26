@@ -1037,7 +1037,7 @@ Java_org_wse2_android_WseSafBridge_nativeInspectSavegame(
     std::int32_t save_ver = 0;
     std::int32_t mod_ver = 0;
     if (!r.read_u32(magic) || magic != wse::game::kSavegameMagic) {
-        return utf8_to_jstring(env, R"({"ok":false,"error":"not a Warband savegame (bad WRDR magic)"})");
+        return utf8_to_jstring(env, R"json({"ok":false,"error":"not a Warband savegame (bad WRDR magic)"})json");
     }
     if (!r.read_i32(save_ver) || save_ver < wse::game::kSavegameMinVersion ||
         save_ver > wse::game::kSavegameFormatVersion || !r.read_i32(mod_ver)) {
