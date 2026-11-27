@@ -120,6 +120,18 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     private val _customDriverSharedBuffers = MutableStateFlow(false)
     val customDriverSharedBuffers: StateFlow<Boolean> = _customDriverSharedBuffers.asStateFlow()
 
+    private val _strictTso = MutableStateFlow(false)
+    val strictTso: StateFlow<Boolean> = _strictTso.asStateFlow()
+
+    private val _recordPgoProfile = MutableStateFlow(false)
+    val recordPgoProfile: StateFlow<Boolean> = _recordPgoProfile.asStateFlow()
+
+    private val _pgoProfileSummary = MutableStateFlow("None")
+    val pgoProfileSummary: StateFlow<String> = _pgoProfileSummary.asStateFlow()
+
+    private val _crashReportText = MutableStateFlow<String?>(null)
+    val crashReportText: StateFlow<String?> = _crashReportText.asStateFlow()
+
     private val _saveManagerState = MutableStateFlow(SaveManagerUiState())
     val saveManagerState: StateFlow<SaveManagerUiState> = _saveManagerState.asStateFlow()
 
@@ -406,6 +418,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     fun onRecompActivityReturned() {
         r4Runner.refreshAllStorageSizes()
+        refreshDiagnostics()
         syncSaveMirrorNow(silentIfUnset = true)
         val reportFile = File(app.filesDir, "recomp/r4/report.txt")
         val text = try {
@@ -425,6 +438,50 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         if (_customDriverSharedBuffers.value == enabled) return
         _customDriverSharedBuffers.value = enabled
         prefs().edit().putBoolean(KEY_CUSTOM_DRIVER_SHARED_BUFFERS, enabled).apply()
+    }
+
+    fun setStrictTso(enabled: Boolean) {
+        if (_strictTso.value == enabled) return
+        _strictTso.value = enabled
+        prefs().edit().putBoolean(KEY_STRICT_TSO, enabled).apply()
+    }
+
+    fun setRecordPgoProfile(enabled: Boolean) {
+        if (_recordPgoProfile.value == enabled) return
+        _recordPgoProfile.value = enabled
+        prefs().edit().putBoolean(KEY_RECORD_PGO_PROFILE, enabled).apply()
+    }
+
+    fun refreshDiagnostics() {
+        val app = getApplication<Application>()
+        val pgoFile = UserStorage.pgoProfileFile(app.filesDir)
+        _pgoProfileSummary.value = if (pgoFile.isFile) {
+            val lines = runCatching { pgoFile.readLines() }.getOrDefault(emptyList())
+            val fns = lines.count { it.isNotBlank() && !it.startsWith("#") }
+            "Active ($fns hot VAs, ${pgoFile.length() / 1024} KiB)"
+        } else {
+            "None"
+        }
+        val crashFile = UserStorage.crashReportFile(app.filesDir)
+        _crashReportText.value = if (crashFile.isFile) {
+            runCatching { crashFile.readText().take(8192) }.getOrNull()?.takeIf { it.isNotBlank() }
+        } else {
+            null
+        }
+    }
+
+    fun clearPgoProfile() {
+        val f = UserStorage.pgoProfileFile(getApplication<Application>().filesDir)
+        if (f.exists()) f.delete()
+        refreshDiagnostics()
+        _events.trySend(LauncherEvent.ShowToast("Performance profile cleared."))
+    }
+
+    fun clearCrashReport() {
+        val f = UserStorage.crashReportFile(getApplication<Application>().filesDir)
+        if (f.exists()) f.delete()
+        refreshDiagnostics()
+        _events.trySend(LauncherEvent.ShowToast("Crash report cleared."))
     }
 
     // ---- P14.3 Save Manager & Auto-Sync SAF Save Mirror ----
@@ -689,7 +746,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                         sharpness = modPic.sharpnessValue,
                         fxaa = modPic.fxaa,
                         customDriverSharedBuffers = _customDriverSharedBuffers.value,
-                        targetFps = modPic.targetFps
+                        targetFps = modPic.targetFps,
+                        strictTso = _strictTso.value,
+                        recordPgoProfile = _recordPgoProfile.value
                     )
                 )
             }
@@ -1096,6 +1155,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         _pictureSharpen.value = prefs.getBoolean(KEY_PICTURE_SHARPEN, true)
         _pictureFxaa.value = prefs.getBoolean(KEY_PICTURE_FXAA, false)
         _customDriverSharedBuffers.value = prefs.getBoolean(KEY_CUSTOM_DRIVER_SHARED_BUFFERS, false)
+        _strictTso.value = prefs.getBoolean(KEY_STRICT_TSO, false)
+        _recordPgoProfile.value = prefs.getBoolean(KEY_RECORD_PGO_PROFILE, false)
+        refreshDiagnostics()
 
         // Stored as the stable mode id; older builds stored the display label.
         val savedDriver = prefs.getString(KEY_GPU_DRIVER, DRIVER_MODE_KEYS.first()) ?: ""
@@ -1960,6 +2022,8 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         private const val KEY_PICTURE_SHARPEN = "picture_sharpen"
         private const val KEY_PICTURE_FXAA = "picture_fxaa"
         private const val KEY_CUSTOM_DRIVER_SHARED_BUFFERS = "custom_driver_shared_buffers"
+        private const val KEY_STRICT_TSO = "strict_tso"
+        private const val KEY_RECORD_PGO_PROFILE = "record_pgo_profile"
         private const val KEY_SAVE_MIRROR_URI = "save_mirror_tree_uri"
         private const val KEY_SAVE_MIRROR_LABEL = "save_mirror_label"
         private const val KEY_FRAME_RATE_CAP = "frame_rate_cap_hz"

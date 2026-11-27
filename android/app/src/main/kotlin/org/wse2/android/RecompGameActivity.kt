@@ -1074,6 +1074,12 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         val sharpness = pic.sharpnessValue
         val fxaa = pic.fxaa
         val customDriverSharedBuffers = intent.getBooleanExtra(EXTRA_CUSTOM_DRIVER_SHARED_BUFFERS, false)
+        val strictTso = intent.getBooleanExtra(EXTRA_STRICT_TSO, false)
+        val recordPgo = intent.getBooleanExtra(EXTRA_RECORD_PGO_PROFILE, false)
+        val pgoFile = UserStorage.pgoProfileFile(filesDir)
+        val profileInPath = if (pgoFile.isFile) pgoFile.absolutePath else ""
+        val profileOutPath = if (recordPgo) pgoFile.absolutePath else ""
+        val crashReportPath = UserStorage.crashReportFile(filesDir).absolutePath
 
         pushLiveConfig()
         ModuleProfileStore.loadTouchLayoutJson(filesDir, module)?.let { layoutJson ->
@@ -1134,6 +1140,10 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                     fxaa,
                     pic.targetFps.toFloat(),
                     customDriverSharedBuffers,
+                    strictTso,
+                    profileInPath,
+                    profileOutPath,
+                    crashReportPath,
                     hudListener
                 )
             } catch (t: Throwable) {
@@ -1230,5 +1240,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         const val EXTRA_FXAA = "wse.recomp.fxaa"
         const val EXTRA_CUSTOM_DRIVER_SHARED_BUFFERS = "wse.recomp.custom_driver_shared_buffers"
         const val EXTRA_TARGET_FPS = "wse.recomp.target_fps"
+        const val EXTRA_STRICT_TSO = "wse.recomp.strict_tso"
+        const val EXTRA_RECORD_PGO_PROFILE = "wse.recomp.record_pgo_profile"
     }
 }

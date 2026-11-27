@@ -63,6 +63,10 @@ object R4Native {
         fxaa: Boolean,
         targetFps: Float,
         customDriverSharedBuffers: Boolean,
+        strictTso: Boolean,
+        profileInPath: String,
+        profileOutPath: String,
+        crashReportPath: String,
         hudListener: HudListener?
     ): Int
 

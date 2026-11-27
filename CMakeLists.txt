@@ -675,6 +675,7 @@ if(WSE_ENABLE_LLVM)
         engine/src/recomp/llvm_common.h engine/src/recomp/recomp_llvm.h engine/src/recomp/r4_startup.cpp
         engine/include/wse/recomp/cpu_state.h engine/include/wse/recomp/x86_decode.h
         engine/include/wse/recomp/x86_interp.h engine/include/wse/recomp/pe_image.h
+        engine/include/wse/recomp/pgo_profile.h
         engine/include/wse/recomp/runtime.h engine/include/wse/recomp/seh.h)
     set(_wse_lifter_text "")
     foreach(_f IN LISTS _wse_lifter_sources)

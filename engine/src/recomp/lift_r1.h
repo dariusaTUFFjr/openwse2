@@ -18,6 +18,11 @@
 
 namespace wse::recomp {
 
+struct AddrRange {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+};
+
 struct ImageInfo {
     std::uint64_t base = 0;
     std::uint64_t iat_begin = 0;  // import address table range (calls through it are imports)
@@ -25,6 +30,17 @@ struct ImageInfo {
     // Functions that can catch (a `.pdata` exception or termination handler): they get a resume
     // switch so an unwind can continue them at any of their blocks (`docs/RECOMP_PLAN.md` "R3").
     std::set<std::uint64_t> resumable;
+    // Non-writable PE sections (.rdata, .pdata, .rsrc): RIP-relative loads from these ranges are
+    // immutable and omit TSO fences/alignment branches even under strict TSO.
+    std::vector<AddrRange> readonly_ranges;
+    // IAT slots of synchronization/threading imports: functions calling them stay strictly ordered.
+    std::set<std::uint64_t> sync_iat_slots;
+    // Functions forced to strict TSO (threading, atomics, allocators, LuaJIT).
+    std::set<std::uint64_t> strict_tso_fns;
+    // R9 selective TSO relaxation: non-sync functions emit plain loads/stores on AArch64.
+    bool relaxed_tso = true;
+    // Cross-batch functions eligible for the R9 register-passing fast ABI (`wse_fast_<va>`).
+    std::set<std::uint64_t> fast_abi_vas;
 };
 
 struct LiftReport {
@@ -56,6 +72,8 @@ public:
     // Lifts one discovered function; on failure the function body becomes a call to the
     // `unsupported` hook at the first instruction that could not be lifted, and `why` names it.
     bool lift(const DFunction& fn, std::string* why);
+    // Clones a small external leaf function into this module as an internal inline candidate.
+    void add_inline_leaf(const DFunction& fn);
 
     // Functions translated without optimisation (LLVM `optnone`: unoptimised IR and fast code
     // generation) while the rest of the module gets `opt_level`: for functions that run rarely and
@@ -78,5 +96,7 @@ private:
 };
 
 [[nodiscard]] std::string r1_symbol(std::uint64_t va);
+[[nodiscard]] std::string r1_fast_symbol(std::uint64_t va);
+[[nodiscard]] bool is_fast_abi_eligible(const DFunction& fn, const ImageInfo& image);
 
 }  // namespace wse::recomp

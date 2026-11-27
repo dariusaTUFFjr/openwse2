@@ -23,6 +23,12 @@ std::string r1_symbol(std::uint64_t va) {
     return buf;
 }
 
+std::string r1_fast_symbol(std::uint64_t va) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "wse_fast_%llx", static_cast<unsigned long long>(va));
+    return buf;
+}
+
 namespace r1 {
 namespace {
 
@@ -198,8 +204,20 @@ llvm::Value* Ctx::state_ptr(std::size_t offset) {
 }
 
 llvm::Value* Ctx::address(const DInsn& d, const ZydisDecodedOperand& o) {
-    last_address_stack = o.mem.base == ZYDIS_REGISTER_RSP && o.mem.segment != ZYDIS_REGISTER_FS &&
-                         o.mem.segment != ZYDIS_REGISTER_GS;
+    const bool no_seg = o.mem.segment != ZYDIS_REGISTER_FS && o.mem.segment != ZYDIS_REGISTER_GS;
+    const int base_idx = gpr_index(o.mem.base);
+    last_address_stack = image.relaxed_tso && no_seg && base_idx >= 0 && (stack_reg_mask & (1U << base_idx)) != 0;
+    last_address_readonly = false;
+    if (no_seg && o.mem.base == ZYDIS_REGISTER_RIP && o.mem.index == ZYDIS_REGISTER_NONE) {
+        const std::uint64_t target =
+            d.next() + (o.mem.disp.has_displacement ? static_cast<std::uint64_t>(o.mem.disp.value) : 0ULL);
+        for (const AddrRange& r : image.readonly_ranges) {
+            if (target >= r.begin && target < r.end) {
+                last_address_readonly = true;
+                break;
+            }
+        }
+    }
     llvm::Value* a = B.getInt64(o.mem.disp.has_displacement ? static_cast<std::uint64_t>(o.mem.disp.value) : 0);
     if (o.mem.base == ZYDIS_REGISTER_RIP) {
         a = B.CreateAdd(a, B.getInt64(d.next()));
@@ -239,9 +257,11 @@ bool is_stack(Mem kind, bool last_address_stack) {
 // load (`dmb ishld`) or before a store (`dmb ish`). On x86 all of this compiles to plain moves.
 llvm::Value* Ctx::load(llvm::Value* addr64, unsigned bits_in, Mem kind) {
     const bool stack = is_stack(kind, last_address_stack);
+    const bool is_ro = (kind == Mem::automatic && last_address_readonly);
     last_address_stack = false;
+    last_address_readonly = false;
     llvm::Type* t = ity(bits_in);
-    if (stack) {
+    if (kind != Mem::shared && (stack || is_ro || fn_relaxed_tso)) {
         llvm::LoadInst* l = B.CreateLoad(t, host_ptr(addr64));
         l->setAlignment(llvm::Align(1));
         return l;
@@ -284,10 +304,12 @@ llvm::Value* Ctx::load(llvm::Value* addr64, unsigned bits_in, Mem kind) {
 
 llvm::Value* Ctx::load_vec128(llvm::Value* addr64, Mem kind) {
     const bool stack = is_stack(kind, last_address_stack);
+    const bool is_ro = (kind == Mem::automatic && last_address_readonly);
     last_address_stack = false;
+    last_address_readonly = false;
     llvm::LoadInst* l = B.CreateLoad(v2i64(), host_ptr(addr64));
     l->setAlignment(llvm::Align(1));
-    if (!stack) {
+    if (kind == Mem::shared || (!stack && !is_ro && !fn_relaxed_tso)) {
         B.CreateFence(llvm::AtomicOrdering::Acquire);
     }
     return l;
@@ -296,11 +318,15 @@ llvm::Value* Ctx::load_vec128(llvm::Value* addr64, Mem kind) {
 void Ctx::store(llvm::Value* addr64, llvm::Value* v, Mem kind) {
     const bool stack = is_stack(kind, last_address_stack);
     last_address_stack = false;
+    last_address_readonly = false;
     const unsigned bits_in = v->getType()->getPrimitiveSizeInBits();
-    if (stack || !v->getType()->isIntegerTy()) {
-        if (!stack) {
-            B.CreateFence(llvm::AtomicOrdering::Release);
-        }
+    if (kind != Mem::shared && (stack || fn_relaxed_tso)) {
+        llvm::StoreInst* s = B.CreateStore(v, host_ptr(addr64));
+        s->setAlignment(llvm::Align(1));
+        return;
+    }
+    if (!v->getType()->isIntegerTy()) {
+        B.CreateFence(llvm::AtomicOrdering::Release);
         llvm::StoreInst* s = B.CreateStore(v, host_ptr(addr64));
         s->setAlignment(llvm::Align(1));
         return;
@@ -447,24 +473,43 @@ void Ctx::emit_unsupported(std::uint64_t va, const std::string& what) {
     B.CreateStore(B.getInt64(va), state_ptr(cpu_offset::rip));
     llvm::Constant* text = B.CreateGlobalStringPtr(what, "why");
     call_hook(offsetof(RuntimeHooks, unsupported), {B.getInt64(va), text}, {B.getInt64Ty(), ptr()});
-    B.CreateRetVoid();  // the hook does not return in practice; returning keeps the IR valid
+    if (is_fast_abi) {
+        llvm::Value* ret = llvm::ConstantAggregateZero::get(F->getReturnType());
+        ret = B.CreateInsertValue(ret, B.getInt64(va), {12});
+        B.CreateRet(ret);
+    } else {
+        B.CreateRetVoid();  // the hook does not return in practice; returning keeps the IR valid
+    }
 }
 
 }  // namespace r1
 
 // ---------------------------------------------------------------------------------------------
 
+namespace {
+
+constexpr int kFastArgGprs[7] = {1, 2, 8, 9, 10, 11, 4};       // rcx, rdx, r8, r9, r10, r11, rsp
+constexpr int kFastRetGprs[8] = {0, 1, 2, 8, 9, 10, 11, 4};    // rax, rcx, rdx, r8, r9, r10, r11, rsp
+
+}  // namespace
+
 struct R1Translator::Impl {
     ImageInfo image;
     std::unique_ptr<llvm::LLVMContext> context = std::make_unique<llvm::LLVMContext>();
     std::unique_ptr<llvm::Module> module;
-    std::map<std::uint64_t, llvm::Function*> functions;  // declared (some defined)
-    std::set<std::uint64_t> light;                       // translated without optimisation
+    std::map<std::uint64_t, llvm::Function*> functions;      // declared (some defined)
+    std::map<std::uint64_t, llvm::Function*> fast_functions; // defined wse_fast_<va>
+    std::map<std::uint64_t, llvm::Function*> inline_leaves;  // cloned external inline leaves
+    std::set<std::uint64_t> light;                           // translated without optimisation
     // Direct cross-batch calls (`wse_ext_calls[]`): writable pointer slots patched at startup
     // by `Runtime::patch_external_calls` so hot cross-batch edges skip `Runtime::hook_dispatch`.
     std::map<std::uint64_t, std::size_t> ext_call_index;
     std::vector<std::uint64_t> ext_call_vas;
     llvm::GlobalVariable* ext_calls_gv = nullptr;
+    // Fast-ABI cross-batch calls (`wse_ext_fast_calls[]`).
+    std::map<std::uint64_t, std::size_t> ext_fast_index;
+    std::vector<std::uint64_t> ext_fast_vas;
+    llvm::GlobalVariable* ext_fast_gv = nullptr;
     std::string init_error;
     LiftReport report;
     double lift_ms = 0.0;
@@ -473,10 +518,28 @@ struct R1Translator::Impl {
     void reset() {
         module = std::make_unique<llvm::Module>("wse_r1", *context);
         functions.clear();
+        fast_functions.clear();
+        inline_leaves.clear();
         ext_call_index.clear();
         ext_call_vas.clear();
         ext_calls_gv = nullptr;
+        ext_fast_index.clear();
+        ext_fast_vas.clear();
+        ext_fast_gv = nullptr;
         lift_ms = 0.0;
+    }
+
+    llvm::StructType* fast_ret_ty() {
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*context);
+        llvm::Type* v2 = llvm::FixedVectorType::get(i64, 2);
+        return llvm::StructType::get(*context, {i64, i64, i64, i64, i64, i64, i64, i64, v2, v2, v2, v2, i64});
+    }
+
+    llvm::FunctionType* fast_fn_ty() {
+        llvm::Type* p = llvm::PointerType::getUnqual(*context);
+        llvm::Type* i64 = llvm::Type::getInt64Ty(*context);
+        llvm::Type* v2 = llvm::FixedVectorType::get(i64, 2);
+        return llvm::FunctionType::get(fast_ret_ty(), {p, i64, i64, i64, i64, i64, i64, i64, v2, v2, v2, v2}, false);
     }
 
     llvm::Value* ext_call_slot_ptr(llvm::IRBuilder<>& b, std::uint64_t va) {
@@ -493,6 +556,22 @@ struct R1Translator::Impl {
             ext_calls_gv->setSection(".data");
         }
         return b.CreateConstInBoundsGEP1_64(llvm::PointerType::getUnqual(*context), ext_calls_gv, it->second);
+    }
+
+    llvm::Value* ext_fast_slot_ptr(llvm::IRBuilder<>& b, std::uint64_t va) {
+        auto [it, fresh] = ext_fast_index.emplace(va, ext_fast_vas.size());
+        if (fresh) {
+            ext_fast_vas.push_back(va);
+        }
+        if (ext_fast_gv == nullptr) {
+            auto* arr_ty = llvm::ArrayType::get(llvm::PointerType::getUnqual(*context), 0);
+            ext_fast_gv = new llvm::GlobalVariable(*module, arr_ty, false, llvm::GlobalValue::ExternalLinkage,
+                                                   nullptr, "wse_ext_fast_placeholder");
+            ext_fast_gv->setVisibility(llvm::GlobalValue::ProtectedVisibility);
+            ext_fast_gv->setDSOLocal(true);
+            ext_fast_gv->setSection(".data");
+        }
+        return b.CreateConstInBoundsGEP1_64(llvm::PointerType::getUnqual(*context), ext_fast_gv, it->second);
     }
 
     llvm::FunctionType* guest_fn_ty() {
@@ -516,6 +595,8 @@ struct R1Translator::Impl {
         functions.emplace(va, f);
         return f;
     }
+
+    static bool lift_body(Impl& impl, const DFunction& fn, llvm::Function* f, bool fast_abi, std::string* why);
 };
 
 R1Translator::R1Translator(const ImageInfo& image) : impl_(std::make_unique<Impl>()) {
@@ -598,20 +679,322 @@ llvm::CallInst* call_dispatch(Ctx& c, llvm::Value* target) {
     return c.call_hook(offsetof(RuntimeHooks, dispatch), {target}, {c.B.getInt64Ty()});
 }
 
-}  // namespace
+bool function_has_sync(const DFunction& fn, const ImageInfo& image) {
+    for (const auto& [va, d] : fn.insns) {
+        (void)va;
+        if ((d.ins.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0) return true;
+        const auto mn = d.ins.mnemonic;
+        if (mn == ZYDIS_MNEMONIC_MFENCE || mn == ZYDIS_MNEMONIC_SFENCE || mn == ZYDIS_MNEMONIC_LFENCE ||
+            mn == ZYDIS_MNEMONIC_PAUSE || mn == ZYDIS_MNEMONIC_CMPXCHG || mn == ZYDIS_MNEMONIC_CMPXCHG8B ||
+            mn == ZYDIS_MNEMONIC_CMPXCHG16B || mn == ZYDIS_MNEMONIC_XADD) {
+            return true;
+        }
+        if (mn == ZYDIS_MNEMONIC_XCHG) {
+            for (std::uint8_t i = 0; i < d.ins.operand_count_visible; ++i) {
+                if (d.ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY) return true;
+            }
+        }
+        if (d.ins.meta.category == ZYDIS_CATEGORY_CALL || d.ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+            const ZydisDecodedOperand& o = d.ops[0];
+            if (o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.base == ZYDIS_REGISTER_RIP &&
+                o.mem.index == ZYDIS_REGISTER_NONE) {
+                const std::uint64_t slot = d.next() + static_cast<std::uint64_t>(o.mem.disp.value);
+                if (image.sync_iat_slots.count(slot) != 0) return true;
+            }
+        }
+    }
+    return false;
+}
 
-bool R1Translator::lift(const DFunction& fn, std::string* why) {
-    const auto t0 = std::chrono::steady_clock::now();
-    ++impl_->report.attempted;
-    llvm::Function* f = impl_->function(fn.entry);
-    if (!f->empty()) {
-        if (why != nullptr) {
-            *why = "already lifted";
+bool function_uses_rbp_frame(const DFunction& fn) {
+    bool initialized_in_entry = false;
+    std::uint64_t va = fn.entry;
+    while (const DInsn* dp = fn.at(va)) {
+        const DInsn& d = *dp;
+        const auto mn = d.ins.mnemonic;
+        if ((mn == ZYDIS_MNEMONIC_MOV && d.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+             d.ops[0].reg.value == ZYDIS_REGISTER_RBP && d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+             d.ops[1].reg.value == ZYDIS_REGISTER_RSP) ||
+            (mn == ZYDIS_MNEMONIC_LEA && d.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+             d.ops[0].reg.value == ZYDIS_REGISTER_RBP && d.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+             d.ops[1].mem.base == ZYDIS_REGISTER_RSP && d.ops[1].mem.index == ZYDIS_REGISTER_NONE &&
+             d.ops[1].mem.segment != ZYDIS_REGISTER_FS && d.ops[1].mem.segment != ZYDIS_REGISTER_GS)) {
+            initialized_in_entry = true;
+            break;
+        }
+        // Allow initial prologue save `push rbp` before `mov/lea rbp, rsp`.
+        if (mn == ZYDIS_MNEMONIC_PUSH && d.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            d.ops[0].reg.value == ZYDIS_REGISTER_RBP) {
+            va = d.next();
+            if (fn.block_starts.count(va) != 0) break;
+            continue;
+        }
+        // Any other read/write of RBP before initialization disqualifies it.
+        for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
+            const ZydisDecodedOperand& o = d.ops[i];
+            if (o.type == ZYDIS_OPERAND_TYPE_REGISTER && Ctx::gpr_index(o.reg.value) == 5) return false;
+            if (o.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                (Ctx::gpr_index(o.mem.base) == 5 || Ctx::gpr_index(o.mem.index) == 5)) {
+                return false;
+            }
+        }
+        if (d.ins.meta.category == ZYDIS_CATEGORY_COND_BR || d.ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+            d.ins.meta.category == ZYDIS_CATEGORY_RET || d.ins.meta.category == ZYDIS_CATEGORY_CALL) {
+            break;
+        }
+        va = d.next();
+        if (fn.block_starts.count(va) != 0) break;
+    }
+    if (!initialized_in_entry) return false;
+    for (const auto& [iva, d] : fn.insns) {
+        (void)iva;
+        const auto mn = d.ins.mnemonic;
+        bool writes_rbp = false;
+        for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
+            const ZydisDecodedOperand& o = d.ops[i];
+            if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 && o.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                Ctx::gpr_index(o.reg.value) == 5) {
+                writes_rbp = true;
+                break;
+            }
+        }
+        if (!writes_rbp) continue;
+        if (mn == ZYDIS_MNEMONIC_MOV && d.ops[0].reg.value == ZYDIS_REGISTER_RBP &&
+            d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER && d.ops[1].reg.value == ZYDIS_REGISTER_RSP) {
+            continue;
+        }
+        if (mn == ZYDIS_MNEMONIC_LEA && d.ops[0].reg.value == ZYDIS_REGISTER_RBP &&
+            d.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY && d.ops[1].mem.base == ZYDIS_REGISTER_RSP &&
+            d.ops[1].mem.index == ZYDIS_REGISTER_NONE &&
+            d.ops[1].mem.segment != ZYDIS_REGISTER_FS && d.ops[1].mem.segment != ZYDIS_REGISTER_GS) {
+            continue;
+        }
+        // Allow epilogue pop rbp / leave only if followed by ret without further RBP memory use.
+        if (mn == ZYDIS_MNEMONIC_POP || mn == ZYDIS_MNEMONIC_LEAVE) {
+            std::uint64_t nva = d.next();
+            bool ok = false;
+            for (int step = 0; step < 8; ++step) {
+                const DInsn* nd = fn.at(nva);
+                if (nd == nullptr) break;
+                if (nd->ins.meta.category == ZYDIS_CATEGORY_RET) {
+                    ok = true;
+                    break;
+                }
+                if (nd->ins.meta.category == ZYDIS_CATEGORY_COND_BR ||
+                    nd->ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+                    nd->ins.meta.category == ZYDIS_CATEGORY_CALL) {
+                    break;
+                }
+                for (std::uint8_t i = 0; i < nd->ins.operand_count; ++i) {
+                    if (nd->ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                        (Ctx::gpr_index(nd->ops[i].mem.base) == 5 || Ctx::gpr_index(nd->ops[i].mem.index) == 5)) {
+                        ok = false;
+                        step = 8;
+                        break;
+                    }
+                }
+                nva = nd->next();
+            }
+            if (ok) continue;
         }
         return false;
     }
-    llvm::BasicBlock* entry = llvm::BasicBlock::Create(*impl_->context, "entry", f);
-    Ctx c(*impl_->module, f, fn, impl_->image);
+    return true;
+}
+
+void update_stack_reg_mask(Ctx& c, const DInsn& d) {
+    const auto mn = d.ins.mnemonic;
+    if (d.ins.meta.category == ZYDIS_CATEGORY_CALL) {
+        c.stack_reg_mask = static_cast<std::uint16_t>((1U << 4) | (c.rbp_is_frame_ptr ? (1U << 5) : 0U));
+        return;
+    }
+    if (mn == ZYDIS_MNEMONIC_LEA && d.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && d.ops[0].size == 64 &&
+        d.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY && d.ops[1].mem.index == ZYDIS_REGISTER_NONE &&
+        d.ops[1].mem.segment != ZYDIS_REGISTER_FS && d.ops[1].mem.segment != ZYDIS_REGISTER_GS) {
+        const int dst = Ctx::gpr_index(d.ops[0].reg.value);
+        const int src = Ctx::gpr_index(d.ops[1].mem.base);
+        if (dst >= 0 && dst != 4) {
+            if (src >= 0 && (c.stack_reg_mask & (1U << src)) != 0) {
+                c.stack_reg_mask |= static_cast<std::uint16_t>(1U << dst);
+            } else {
+                c.stack_reg_mask &= static_cast<std::uint16_t>(~(1U << dst));
+            }
+        }
+        return;
+    }
+    if (mn == ZYDIS_MNEMONIC_MOV && d.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && d.ops[0].size == 64 &&
+        d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER && d.ops[1].size == 64) {
+        const int dst = Ctx::gpr_index(d.ops[0].reg.value);
+        const int src = Ctx::gpr_index(d.ops[1].reg.value);
+        if (dst >= 0 && dst != 4) {
+            if (src >= 0 && (c.stack_reg_mask & (1U << src)) != 0) {
+                c.stack_reg_mask |= static_cast<std::uint16_t>(1U << dst);
+            } else {
+                c.stack_reg_mask &= static_cast<std::uint16_t>(~(1U << dst));
+            }
+        }
+        return;
+    }
+    for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
+        const ZydisDecodedOperand& o = d.ops[i];
+        if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 && o.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int idx = Ctx::gpr_index(o.reg.value);
+            if (idx >= 0 && idx != 4) {
+                c.stack_reg_mask &= static_cast<std::uint16_t>(~(1U << idx));
+            }
+        }
+    }
+}
+
+}  // namespace
+
+bool is_fast_abi_eligible(const DFunction& fn, const ImageInfo& image) {
+    if (!fn.error.empty() || fn.insns.empty()) return false;
+    if (image.resumable.count(fn.entry) != 0) return false;
+    if (!fn.call_targets.empty() || !fn.tail_targets.empty() ||
+        !fn.unresolved_indirect_jumps.empty() || !fn.indirect_tail_jumps.empty()) {
+        return false;
+    }
+    auto is_allowed_gpr = [](int idx) -> bool {
+        return idx == 0 || idx == 1 || idx == 2 || idx == 4 || idx == 8 || idx == 9 || idx == 10 || idx == 11;
+    };
+    for (const auto& [va, d] : fn.insns) {
+        (void)va;
+        const auto cat = d.ins.meta.category;
+        const auto mn = d.ins.mnemonic;
+        if (cat == ZYDIS_CATEGORY_CALL || mn == ZYDIS_MNEMONIC_CPUID || insn_is_trap(d) ||
+            insn_gated_ext(d) != nullptr) {
+            return false;
+        }
+        if (cat == ZYDIS_CATEGORY_RET && d.ins.operand_count_visible > 0 && d.ops[0].imm.value.u != 0) {
+            return false;
+        }
+        if (d.ins.cpu_flags != nullptr && d.ins.cpu_flags->tested != 0) {
+            // Only allow flag tests when a flag-modifying instruction precedes in the same block;
+            // conservative check: disallow flag reads in functions without a linear check below.
+        }
+        for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
+            const ZydisDecodedOperand& o = d.ops[i];
+            if (o.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                (o.mem.segment == ZYDIS_REGISTER_FS || o.mem.segment == ZYDIS_REGISTER_GS)) {
+                return false;
+            }
+            if (o.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                const int gi = r1::Ctx::gpr_index(o.reg.value);
+                if (gi >= 0 && !is_allowed_gpr(gi)) return false;
+                const int xi = r1::Ctx::xmm_index(o.reg.value);
+                if (xi >= 4) return false;
+            } else if (o.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                const int bi = r1::Ctx::gpr_index(o.mem.base);
+                if (bi >= 0 && !is_allowed_gpr(bi)) return false;
+                const int ii = r1::Ctx::gpr_index(o.mem.index);
+                if (ii >= 0 && !is_allowed_gpr(ii)) return false;
+            }
+        }
+    }
+    // Check whether entry block defines RAX before exiting; non-entry blocks inherit that guarantee.
+    bool entry_defines_rax = false;
+    {
+        std::uint64_t va = fn.entry;
+        while (const DInsn* dp = fn.at(va)) {
+            const DInsn& d = *dp;
+            for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
+                const ZydisDecodedOperand& o = d.ops[i];
+                if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
+                    o.type == ZYDIS_OPERAND_TYPE_REGISTER && r1::Ctx::gpr_index(o.reg.value) == 0 &&
+                    o.size >= 32) {
+                    entry_defines_rax = true;
+                    break;
+                }
+            }
+            if (entry_defines_rax || d.ins.meta.category == ZYDIS_CATEGORY_COND_BR ||
+                d.ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR || d.ins.meta.category == ZYDIS_CATEGORY_RET) {
+                break;
+            }
+            va = d.next();
+            if (fn.block_starts.count(va) != 0) break;
+        }
+    }
+    // Verify no block reads RAX or any CPU flag before writing it.
+    for (const std::uint64_t bstart : fn.block_starts) {
+        bool rax_written = (bstart != fn.entry) && entry_defines_rax;
+        std::uint64_t flags_defined = 0;
+        std::uint64_t va = bstart;
+        while (const DInsn* dp = fn.at(va)) {
+            const DInsn& d = *dp;
+            if (d.ins.cpu_flags != nullptr && (d.ins.cpu_flags->tested & ~flags_defined) != 0) {
+                return false;
+            }
+            if (!rax_written) {
+                for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
+                    const ZydisDecodedOperand& o = d.ops[i];
+                    if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0 &&
+                        o.type == ZYDIS_OPERAND_TYPE_REGISTER && r1::Ctx::gpr_index(o.reg.value) == 0) {
+                        return false;
+                    }
+                    if (o.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                        (r1::Ctx::gpr_index(o.mem.base) == 0 || r1::Ctx::gpr_index(o.mem.index) == 0)) {
+                        return false;
+                    }
+                }
+                for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
+                    const ZydisDecodedOperand& o = d.ops[i];
+                    if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
+                        o.type == ZYDIS_OPERAND_TYPE_REGISTER && r1::Ctx::gpr_index(o.reg.value) == 0 &&
+                        o.size >= 32) {
+                        rax_written = true;
+                    }
+                }
+            }
+            if (d.ins.cpu_flags != nullptr) {
+                flags_defined |= (d.ins.cpu_flags->modified | d.ins.cpu_flags->set_0 | d.ins.cpu_flags->set_1);
+                flags_defined &= ~d.ins.cpu_flags->undefined;
+            }
+            if (d.ins.meta.category == ZYDIS_CATEGORY_COND_BR || d.ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+                d.ins.meta.category == ZYDIS_CATEGORY_RET) {
+                break;
+            }
+            va = d.next();
+            if (fn.block_starts.count(va) != 0) break;
+        }
+    }
+    return true;
+}
+
+namespace {
+
+bool caller_reads_flags_after(const DFunction& fn, std::uint64_t ret_va) {
+    std::uint64_t flags_defined = 0;
+    std::uint64_t va = ret_va;
+    for (int step = 0; step < 24; ++step) {
+        const DInsn* dp = fn.at(va);
+        if (dp == nullptr) return true;
+        const DInsn& d = *dp;
+        if (d.ins.cpu_flags != nullptr && (d.ins.cpu_flags->tested & ~flags_defined) != 0) return true;
+        if (d.ins.meta.category == ZYDIS_CATEGORY_COND_BR) return true;
+        if (d.ins.meta.category == ZYDIS_CATEGORY_RET) return false;
+        if (d.ins.cpu_flags != nullptr) {
+            flags_defined |= (d.ins.cpu_flags->modified | d.ins.cpu_flags->set_0 | d.ins.cpu_flags->set_1);
+            flags_defined &= ~d.ins.cpu_flags->undefined;
+        }
+        if (d.ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR) return true;
+        va = d.next();
+    }
+    return true;
+}
+
+}  // namespace
+
+bool R1Translator::Impl::lift_body(Impl& impl, const DFunction& fn, llvm::Function* f, bool fast_abi,
+                                   std::string* why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(*impl.context, "entry", f);
+    Ctx c(*impl.module, f, fn, impl.image);
+    c.is_fast_abi = fast_abi;
+    c.fn_relaxed_tso =
+        impl.image.relaxed_tso && impl.image.strict_tso_fns.count(fn.entry) == 0 && !function_has_sync(fn, impl.image);
+    c.rbp_is_frame_ptr = function_uses_rbp_frame(fn);
+    c.stack_reg_mask = static_cast<std::uint16_t>((1U << 4) | (c.rbp_is_frame_ptr ? (1U << 5) : 0U));
     c.B.SetInsertPoint(entry);
     for (int r = 0; r < 16; ++r) {
         c.gpr_slot[r] = c.B.CreateAlloca(c.B.getInt64Ty(), nullptr, "r" + std::to_string(r));
@@ -620,12 +1003,28 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
     for (int k = 0; k < r1::kFlagCount; ++k) {
         c.flag_slot[k] = c.B.CreateAlloca(c.B.getInt1Ty(), nullptr, "f" + std::to_string(k));
     }
-    c.reload();
+    if (fast_abi) {
+        for (int r = 0; r < 16; ++r) {
+            c.B.CreateStore(c.B.getInt64(0), c.gpr_slot[r]);
+            c.B.CreateStore(llvm::ConstantAggregateZero::get(c.v2i64()), c.xmm_slot[r]);
+        }
+        for (int k = 0; k < r1::kFlagCount; ++k) {
+            c.B.CreateStore(c.B.getFalse(), c.flag_slot[k]);
+        }
+        for (int i = 0; i < 7; ++i) {
+            c.B.CreateStore(f->getArg(1 + i), c.gpr_slot[kFastArgGprs[i]]);
+        }
+        for (int i = 0; i < 4; ++i) {
+            c.B.CreateStore(f->getArg(8 + i), c.xmm_slot[i]);
+        }
+    } else {
+        c.reload();
+    }
 
     // A function that can resume (R3/R4) also starts a block at every call's return address:
     // `RtlRestoreContext` continues there (MSVC `longjmp` to a `setjmp` call site, or a context
     // that `RtlCaptureContext` took), so each one must be a case of the resume switch below.
-    const bool resumable = impl_->image.resumable.count(fn.entry) != 0;
+    const bool resumable = !fast_abi && impl.image.resumable.count(fn.entry) != 0;
     std::set<std::uint64_t> starts = fn.block_starts;
     if (resumable) {
         for (const auto& kv : fn.insns) {
@@ -639,7 +1038,7 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
     for (const std::uint64_t b : starts) {
         char name[24];
         std::snprintf(name, sizeof(name), "b%llx", static_cast<unsigned long long>(b));
-        blocks[b] = llvm::BasicBlock::Create(*impl_->context, name, f);
+        blocks[b] = llvm::BasicBlock::Create(*impl.context, name, f);
     }
     c.B.CreateBr(blocks.at(fn.entry));
 
@@ -648,8 +1047,8 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
     // address).
     llvm::BasicBlock* resume = nullptr;
     if (resumable) {
-        resume = llvm::BasicBlock::Create(*impl_->context, "resume", f);
-        llvm::BasicBlock* unknown = llvm::BasicBlock::Create(*impl_->context, "resume_unknown", f);
+        resume = llvm::BasicBlock::Create(*impl.context, "resume", f);
+        llvm::BasicBlock* unknown = llvm::BasicBlock::Create(*impl.context, "resume_unknown", f);
         c.B.SetInsertPoint(resume);
         c.reload();
         llvm::Value* rip = c.B.CreateLoad(c.B.getInt64Ty(), c.state_ptr(cpu_offset::rip));
@@ -674,18 +1073,19 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
     // optimization level); a call through a hook is marked `tail`, which -O1 and up honour.
     auto tail_call = [&](std::uint64_t target) {
         c.flush();
-        if (impl_->functions.count(target) != 0) {
-            c.B.CreateCall(impl_->function(target), {c.state})->setTailCallKind(llvm::CallInst::TCK_MustTail);
+        if (impl.functions.count(target) != 0) {
+            c.B.CreateCall(impl.function(target), {c.state})->setTailCallKind(llvm::CallInst::TCK_MustTail);
         } else {
-            llvm::LoadInst* fp = c.B.CreateLoad(c.ptr(), impl_->ext_call_slot_ptr(c.B, target));
+            llvm::LoadInst* fp = c.B.CreateLoad(c.ptr(), impl.ext_call_slot_ptr(c.B, target));
             fp->setAlignment(llvm::Align(8));
-            c.B.CreateCall(impl_->guest_fn_ty(), fp, {c.state})->setTailCallKind(llvm::CallInst::TCK_MustTail);
+            c.B.CreateCall(impl.guest_fn_ty(), fp, {c.state})->setTailCallKind(llvm::CallInst::TCK_MustTail);
         }
         c.B.CreateRetVoid();
     };
 
     for (const std::uint64_t start : starts) {
         c.B.SetInsertPoint(blocks.at(start));
+        c.stack_reg_mask = static_cast<std::uint16_t>((1U << 4) | (c.rbp_is_frame_ptr ? (1U << 5) : 0U));
         std::uint64_t va = start;
         while (true) {
             const DInsn* dp = fn.at(va);
@@ -694,7 +1094,8 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
                 break;
             }
             const DInsn& d = *dp;
-            c.last_address_stack = false;  // `lea` and atomics compute addresses without an access
+            c.last_address_stack = false;     // `lea` and atomics compute addresses without an access
+            c.last_address_readonly = false;
             const auto cat = d.ins.meta.category;
             const auto mn = d.ins.mnemonic;
             bool terminated = false;
@@ -704,9 +1105,21 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
                 llvm::Value* ret = c.load(rsp, 64, r1::Mem::stack);
                 std::uint64_t extra = d.ins.operand_count_visible > 0 ? d.ops[0].imm.value.u : 0;
                 c.set_gpr64(4, c.B.CreateAdd(rsp, c.B.getInt64(8 + extra)));
-                c.flush();
-                c.B.CreateStore(ret, c.state_ptr(cpu_offset::rip));
-                c.B.CreateRetVoid();
+                if (fast_abi) {
+                    llvm::Value* agg = llvm::UndefValue::get(f->getReturnType());
+                    for (int i = 0; i < 8; ++i) {
+                        agg = c.B.CreateInsertValue(agg, c.gpr64(kFastRetGprs[i]), static_cast<unsigned>(i));
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        agg = c.B.CreateInsertValue(agg, c.xmm_vec(i), static_cast<unsigned>(8 + i));
+                    }
+                    agg = c.B.CreateInsertValue(agg, ret, 12U);
+                    c.B.CreateRet(agg);
+                } else {
+                    c.flush();
+                    c.B.CreateStore(ret, c.state_ptr(cpu_offset::rip));
+                    c.B.CreateRetVoid();
+                }
                 terminated = true;
             } else if (cat == ZYDIS_CATEGORY_COND_BR) {
                 ZyanU64 target = 0;
@@ -770,8 +1183,8 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
                         const std::uint64_t slot = d.next() + static_cast<std::uint64_t>(o.mem.disp.value);
                         c.flush();
                         if (o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.base == ZYDIS_REGISTER_RIP &&
-                            o.mem.index == ZYDIS_REGISTER_NONE && slot >= impl_->image.iat_begin &&
-                            slot < impl_->image.iat_end) {
+                            o.mem.index == ZYDIS_REGISTER_NONE && slot >= impl.image.iat_begin &&
+                            slot < impl.image.iat_end) {
                             c.call_hook(offsetof(RuntimeHooks, import_call), {c.B.getInt64(slot)}, {c.B.getInt64Ty()})
                                 ->setTailCall();
                         } else {
@@ -787,19 +1200,60 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
                 if (o.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                     ZyanU64 target = 0;
                     ZydisCalcAbsoluteAddress(&d.ins, &o, d.va, &target);
-                    guest_call(c, ret_va, resume, [&] {
-                        if (impl_->functions.count(target) != 0) {
-                            c.B.CreateCall(impl_->function(target), {c.state});
+                    const bool try_fast =
+                        !fast_abi && !caller_reads_flags_after(fn, ret_va) &&
+                        (impl.fast_functions.count(target) != 0 || impl.image.fast_abi_vas.count(target) != 0) &&
+                        impl.inline_leaves.count(target) == 0;
+                    if (try_fast) {
+                        llvm::Value* site_rsp = c.gpr64(4);
+                        llvm::Value* rsp = c.B.CreateSub(site_rsp, c.B.getInt64(8));
+                        c.set_gpr64(4, rsp);
+                        c.store(rsp, c.B.getInt64(ret_va), r1::Mem::stack);
+                        std::vector<llvm::Value*> fargs{c.state};
+                        for (int i = 0; i < 7; ++i) fargs.push_back(c.gpr64(kFastArgGprs[i]));
+                        for (int i = 0; i < 4; ++i) fargs.push_back(c.xmm_vec(i));
+                        llvm::CallInst* call = nullptr;
+                        if (const auto fit = impl.fast_functions.find(target); fit != impl.fast_functions.end()) {
+                            call = c.B.CreateCall(fit->second, fargs);
                         } else {
-                            llvm::LoadInst* fp = c.B.CreateLoad(c.ptr(), impl_->ext_call_slot_ptr(c.B, target));
+                            llvm::LoadInst* fp = c.B.CreateLoad(c.ptr(), impl.ext_fast_slot_ptr(c.B, target));
                             fp->setAlignment(llvm::Align(8));
-                            c.B.CreateCall(impl_->guest_fn_ty(), fp, {c.state});
+                            call = c.B.CreateCall(impl.fast_fn_ty(), fp, fargs);
                         }
-                    });
+                        call->setCallingConv(llvm::CallingConv::Fast);
+                        for (int i = 0; i < 8; ++i) {
+                            c.set_gpr64(kFastRetGprs[i], c.B.CreateExtractValue(call, static_cast<unsigned>(i)));
+                        }
+                        for (int i = 0; i < 4; ++i) {
+                            c.set_xmm(i, c.B.CreateExtractValue(call, static_cast<unsigned>(8 + i)));
+                        }
+                        llvm::Value* rip = c.B.CreateExtractValue(call, 12U);
+                        llvm::BasicBlock* bad = llvm::BasicBlock::Create(c.C, "fast_bad_ret", f);
+                        llvm::BasicBlock* ok = llvm::BasicBlock::Create(c.C, "fast_ret_ok", f);
+                        c.B.CreateCondBr(c.B.CreateICmpEQ(rip, c.B.getInt64(ret_va)), ok, bad);
+                        c.B.SetInsertPoint(bad);
+                        c.flush();
+                        c.B.CreateStore(rip, c.state_ptr(cpu_offset::rip));
+                        c.call_hook(offsetof(RuntimeHooks, bad_return), {c.B.getInt64(ret_va)}, {c.B.getInt64Ty()});
+                        c.B.CreateBr(ok);
+                        c.B.SetInsertPoint(ok);
+                    } else {
+                        guest_call(c, ret_va, resume, [&] {
+                            if (impl.functions.count(target) != 0) {
+                                c.B.CreateCall(impl.function(target), {c.state});
+                            } else if (const auto il = impl.inline_leaves.find(target); il != impl.inline_leaves.end()) {
+                                c.B.CreateCall(il->second, {c.state});
+                            } else {
+                                llvm::LoadInst* fp = c.B.CreateLoad(c.ptr(), impl.ext_call_slot_ptr(c.B, target));
+                                fp->setAlignment(llvm::Align(8));
+                                c.B.CreateCall(impl.guest_fn_ty(), fp, {c.state});
+                            }
+                        });
+                    }
                 } else if (o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.base == ZYDIS_REGISTER_RIP &&
                            o.mem.index == ZYDIS_REGISTER_NONE) {
                     const std::uint64_t slot = d.next() + static_cast<std::uint64_t>(o.mem.disp.value);
-                    if (slot >= impl_->image.iat_begin && slot < impl_->image.iat_end) {
+                    if (slot >= impl.image.iat_begin && slot < impl.image.iat_end) {
                         guest_call(c, ret_va, resume, [&] {
                             c.call_hook(offsetof(RuntimeHooks, import_call), {c.B.getInt64(slot)}, {c.B.getInt64Ty()});
                         });
@@ -814,13 +1268,13 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
             } else if (insn_is_trap(d)) {
                 // A deliberate stop (MSVC puts `int3` after no-return calls; `int 0x29` is
                 // __fastfail): reaching it at run time is a fault with its address, not missing work.
-                ++impl_->report.traps;
+                ++impl.report.traps;
                 c.emit_unsupported(d.va, ZydisMnemonicGetString(mn));
                 break;
             } else if (const char* ext = insn_gated_ext(d)) {
                 // Only reachable when `cpuid` advertises the feature, which the runtime's fixed
                 // CPU profile does not (`Runtime::hook_cpuid`): a run-time fault if it is reached.
-                impl_->report.gated[ext]++;
+                impl.report.gated[ext]++;
                 c.emit_unsupported(d.va, std::string("needs ") + ext + " (not advertised by cpuid)");
                 break;
             } else if (mn == ZYDIS_MNEMONIC_CPUID) {
@@ -844,6 +1298,7 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
             if (terminated) {
                 break;
             }
+            update_stack_reg_mask(c, d);
             const std::uint64_t next = d.next();
             if (fn.tail_targets.count(next) != 0) {
                 tail_call(next);
@@ -857,7 +1312,7 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
         }
     }
 
-    impl_->lift_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    impl.lift_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::string verify;
     llvm::raw_string_ostream os(verify);
     if (llvm::verifyFunction(*f, &os)) {
@@ -865,14 +1320,88 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
         if (why != nullptr) {
             *why = "IR verification failed: " + os.str().substr(0, 300);
         }
-        impl_->report.unsupported["(IR verification)"]++;
+        impl.report.unsupported["(IR verification)"]++;
         return false;
     }
     if (!first_failure.empty()) {
-        impl_->report.unsupported[first_failure]++;
+        impl.report.unsupported[first_failure]++;
         if (why != nullptr) {
             *why = first_failure;
         }
+        return false;
+    }
+    return true;
+}
+
+void R1Translator::add_inline_leaf(const DFunction& fn) {
+    if (impl_->functions.count(fn.entry) != 0 || impl_->inline_leaves.count(fn.entry) != 0) return;
+    char name[40];
+    std::snprintf(name, sizeof(name), "wse_inline_%llx", static_cast<unsigned long long>(fn.entry));
+    auto* f = llvm::Function::Create(impl_->guest_fn_ty(), llvm::GlobalValue::InternalLinkage, name, *impl_->module);
+    f->addFnAttr(llvm::Attribute::NoUnwind);
+    f->addFnAttr(llvm::Attribute::InlineHint);
+    std::string dummy;
+    if (!Impl::lift_body(*impl_, fn, f, false, &dummy)) {
+        f->eraseFromParent();
+        return;
+    }
+    impl_->inline_leaves.emplace(fn.entry, f);
+}
+
+bool R1Translator::lift(const DFunction& fn, std::string* why) {
+    ++impl_->report.attempted;
+    llvm::Function* f = impl_->function(fn.entry);
+    if (!f->empty()) {
+        if (why != nullptr) {
+            *why = "already lifted";
+        }
+        return false;
+    }
+    if (impl_->light.count(fn.entry) == 0 && is_fast_abi_eligible(fn, impl_->image)) {
+        auto* fast_f = llvm::Function::Create(impl_->fast_fn_ty(), llvm::GlobalValue::ExternalLinkage,
+                                              r1_fast_symbol(fn.entry), *impl_->module);
+        fast_f->setVisibility(llvm::GlobalValue::ProtectedVisibility);
+        fast_f->setDSOLocal(true);
+        fast_f->setCallingConv(llvm::CallingConv::Fast);
+        fast_f->addFnAttr(llvm::Attribute::NoUnwind);
+        if (Impl::lift_body(*impl_, fn, fast_f, true, why)) {
+            impl_->fast_functions.emplace(fn.entry, fast_f);
+            // Emit thin CpuState* entry thunk `wse_fn_<va>` for indirect dispatch / host callbacks.
+            llvm::IRBuilder<> b(*impl_->context);
+            b.SetInsertPoint(llvm::BasicBlock::Create(*impl_->context, "thunk", f));
+            llvm::Value* st = f->getArg(0);
+            llvm::Type* i64 = b.getInt64Ty();
+            llvm::Type* v2 = llvm::FixedVectorType::get(i64, 2);
+            std::vector<llvm::Value*> args{st};
+            for (int i = 0; i < 7; ++i) {
+                args.push_back(b.CreateLoad(i64, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::gpr + 8U * kFastArgGprs[i])));
+            }
+            for (int i = 0; i < 4; ++i) {
+                llvm::LoadInst* xl = b.CreateLoad(v2, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::xmm + 16U * i));
+                xl->setAlignment(llvm::Align(16));
+                args.push_back(xl);
+            }
+            llvm::CallInst* call = b.CreateCall(fast_f, args);
+            call->setCallingConv(llvm::CallingConv::Fast);
+            for (int i = 0; i < 8; ++i) {
+                b.CreateStore(b.CreateExtractValue(call, static_cast<unsigned>(i)),
+                              b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::gpr + 8U * kFastRetGprs[i]));
+            }
+            for (int i = 0; i < 4; ++i) {
+                llvm::StoreInst* xs = b.CreateStore(
+                    b.CreateExtractValue(call, static_cast<unsigned>(8 + i)),
+                    b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::xmm + 16U * i));
+                xs->setAlignment(llvm::Align(16));
+            }
+            b.CreateStore(b.CreateExtractValue(call, 12U),
+                          b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::rip));
+            b.CreateRetVoid();
+            ++impl_->report.lifted;
+            return true;
+        }
+        fast_f->eraseFromParent();
+    }
+    if (!Impl::lift_body(*impl_, fn, f, false, why)) {
         return false;
     }
     ++impl_->report.lifted;
@@ -960,6 +1489,91 @@ bool R1Translator::emit_object(int opt_level, std::vector<char>& object, Transla
     }
     new llvm::GlobalVariable(m, b.getInt64Ty(), true, llvm::GlobalValue::ExternalLinkage,
                              b.getInt64(ext_n), "wse_ext_call_count");
+
+    // Fast-ABI table (`wse_fast_table`) and cross-batch fast call slots (`wse_ext_fast_calls[]`).
+    {
+        std::vector<llvm::Constant*> frows;
+        frows.reserve(impl_->fast_functions.size());
+        for (const auto& [va, ff] : impl_->fast_functions) {
+            frows.push_back(llvm::ConstantStruct::get(row_ty, {b.getInt64(va), ff}));
+        }
+        auto* farr_ty = llvm::ArrayType::get(row_ty, frows.size());
+        new llvm::GlobalVariable(m, farr_ty, true, llvm::GlobalValue::ExternalLinkage,
+                                 llvm::ConstantArray::get(farr_ty, frows), "wse_fast_table");
+        new llvm::GlobalVariable(m, b.getInt64Ty(), true, llvm::GlobalValue::ExternalLinkage,
+                                 b.getInt64(frows.size()), "wse_fast_table_count");
+    }
+    const std::size_t ext_fast_n = impl_->ext_fast_vas.size();
+    if (ext_fast_n > 0) {
+        std::vector<llvm::Constant*> f_inits;
+        std::vector<llvm::Constant*> f_vas;
+        f_inits.reserve(ext_fast_n);
+        f_vas.reserve(ext_fast_n);
+        auto* fty = impl_->fast_fn_ty();
+        auto* disp_ty = llvm::FunctionType::get(b.getVoidTy(), {b.getPtrTy(), b.getInt64Ty()}, false);
+        llvm::Type* i64 = b.getInt64Ty();
+        llvm::Type* v2 = llvm::FixedVectorType::get(i64, 2);
+        for (const std::uint64_t va : impl_->ext_fast_vas) {
+            char stub_name[48];
+            std::snprintf(stub_name, sizeof(stub_name), "wse_ext_fast_fwd_%llx", static_cast<unsigned long long>(va));
+            auto* stub = llvm::Function::Create(fty, llvm::GlobalValue::InternalLinkage, stub_name, m);
+            stub->setCallingConv(llvm::CallingConv::Fast);
+            stub->addFnAttr(llvm::Attribute::NoUnwind);
+            b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", stub));
+            llvm::Value* st = stub->getArg(0);
+            for (int i = 0; i < 7; ++i) {
+                b.CreateStore(stub->getArg(1 + i),
+                              b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::gpr + 8U * kFastArgGprs[i]));
+            }
+            for (int i = 0; i < 4; ++i) {
+                llvm::StoreInst* xs = b.CreateStore(
+                    stub->getArg(8 + i),
+                    b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::xmm + 16U * i));
+                xs->setAlignment(llvm::Align(16));
+            }
+            llvm::Value* hooks = b.CreateLoad(
+                b.getPtrTy(), b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::hooks));
+            llvm::Value* fp = b.CreateLoad(
+                b.getPtrTy(), b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), hooks, offsetof(RuntimeHooks, dispatch)));
+            b.CreateCall(disp_ty, fp, {st, b.getInt64(va)});
+            llvm::Value* agg = llvm::UndefValue::get(impl_->fast_ret_ty());
+            for (int i = 0; i < 8; ++i) {
+                agg = b.CreateInsertValue(
+                    agg, b.CreateLoad(i64, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::gpr + 8U * kFastRetGprs[i])),
+                    static_cast<unsigned>(i));
+            }
+            for (int i = 0; i < 4; ++i) {
+                llvm::LoadInst* xl = b.CreateLoad(
+                    v2, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::xmm + 16U * i));
+                xl->setAlignment(llvm::Align(16));
+                agg = b.CreateInsertValue(agg, xl, static_cast<unsigned>(8 + i));
+            }
+            agg = b.CreateInsertValue(
+                agg, b.CreateLoad(i64, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::rip)), 12U);
+            b.CreateRet(agg);
+            f_inits.push_back(stub);
+            f_vas.push_back(b.getInt64(va));
+        }
+        auto* farr_ty = llvm::ArrayType::get(b.getPtrTy(), ext_fast_n);
+        auto* real_fext = new llvm::GlobalVariable(m, farr_ty, false, llvm::GlobalValue::ExternalLinkage,
+                                                   llvm::ConstantArray::get(farr_ty, f_inits), "wse_ext_fast_calls");
+        real_fext->setVisibility(llvm::GlobalValue::ProtectedVisibility);
+        real_fext->setDSOLocal(true);
+        real_fext->setSection(".data");
+        if (impl_->ext_fast_gv != nullptr) {
+            impl_->ext_fast_gv->replaceAllUsesWith(real_fext);
+            impl_->ext_fast_gv->eraseFromParent();
+            impl_->ext_fast_gv = nullptr;
+        }
+        auto* va_arr_ty = llvm::ArrayType::get(b.getInt64Ty(), ext_fast_n);
+        new llvm::GlobalVariable(m, va_arr_ty, true, llvm::GlobalValue::ExternalLinkage,
+                                 llvm::ConstantArray::get(va_arr_ty, f_vas), "wse_ext_fast_call_vas");
+    } else if (impl_->ext_fast_gv != nullptr) {
+        impl_->ext_fast_gv->eraseFromParent();
+        impl_->ext_fast_gv = nullptr;
+    }
+    new llvm::GlobalVariable(m, b.getInt64Ty(), true, llvm::GlobalValue::ExternalLinkage,
+                             b.getInt64(ext_fast_n), "wse_ext_fast_call_count");
 
     const llvm_common::TargetSetup t = llvm_common::make_target(opt_level);
     if (!t.tm) {

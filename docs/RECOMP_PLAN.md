@@ -1201,6 +1201,7 @@ own, and none blocks another.
     third-party x64 Windows DLL, surface a clear diagnostic (or translate through `shim::Modules` if
     a supported mod requires it).
 - **Depends on:** R8.
+- **Status (`pw/r9`):** Waves 1–5 implemented and host/WSL verified (`STATUS.md` §2): `.rdata` + `rbp`/intra-block stack tracking + `function_has_sync()` selective TSO relaxation (`--strict-tso` toggle), `wse_fast_<va>` register-passing Fast ABI + cross-batch hot-leaf cloning, 1 kHz `SIGPROF` PGO profiler + hot-5% `-O3` / cold-95% `-O1` batch split, Vulkan D3D9 `max_c_reg` UBO dedup + `D3DPT_TRIANGLELIST` draw coalescing + `kMaxDynInstances = 64` + 512 MiB `.etc2` LRU cache pruning, PDB-symbolized `crash_report.txt` + mod x64 DLL diagnostics + Launcher UI. On-device OPPO Reno 11 verification pending.
 - **Done when:**
   - `Native`, `Phantasy Calradia`, and `FiveDynastiesAndTenKingdoms` run end-to-end on the phone
     (main menu, campaign map, battle, save/load, WSE2 Lua features, custom shaders) without OOM

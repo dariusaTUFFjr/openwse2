@@ -39,6 +39,13 @@ struct FnRow {
 };
 static_assert(sizeof(FnRow) == 16);
 
+// One row of a module's `wse_fast_table` (register-passing `fastcc` entry points).
+struct FastFnRow {
+    std::uint64_t va;
+    void* fn;
+};
+static_assert(sizeof(FastFnRow) == 16);
+
 enum class FaultKind { missing_function, bad_return, unsupported, missing_import, segment };
 
 struct Fault {
@@ -138,6 +145,32 @@ public:
         return patched;
     }
 
+    void add_fast_table(const FastFnRow* rows, std::size_t count) {
+        if (rows == nullptr || count == 0) return;
+        for (std::size_t i = 0; i < count; ++i) {
+            fast_map_.emplace(rows[i].va, rows[i].fn);
+        }
+    }
+
+    [[nodiscard]] void* find_fast(std::uint64_t va) const noexcept {
+        const auto it = fast_map_.find(va);
+        return it == fast_map_.end() ? nullptr : it->second;
+    }
+
+    std::size_t patch_external_fast_calls(void** slots, const std::uint64_t* vas, std::size_t count) const noexcept {
+        if (slots == nullptr || vas == nullptr || count == 0) {
+            return 0;
+        }
+        std::size_t patched = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (void* fn = find_fast(vas[i]); fn != nullptr) {
+                slots[i] = fn;
+                ++patched;
+            }
+        }
+        return patched;
+    }
+
     void set_import(std::uint64_t slot_va, ImportShim shim) { imports_[slot_va] = std::move(shim); }
 
     // Names every IAT slot (`read_pe_imports`), so shims register by name and a missing one is
@@ -215,10 +248,18 @@ public:
     // Prepares `state` to run on this runtime.
     void attach(CpuState& state) const noexcept { state.hooks = &hooks_; }
 
+    static const CpuState* current_thread_state() noexcept { return tls_state_ref(); }
+    static void set_current_thread_state(const CpuState* s) noexcept { tls_state_ref() = s; }
+
     // Runs the function at `va` as a guest call from outside (the caller has pushed the return
     // VA). Returns false, after a fault, when no function is there.
     bool run(CpuState& state, std::uint64_t va) {
         attach(state);
+        struct Guard {
+            const CpuState* prev;
+            ~Guard() { tls_state_ref() = prev; }
+        } guard{tls_state_ref()};
+        tls_state_ref() = &state;
         GuestFn fn = find(va);
         if (fn == nullptr) {
             fault(state, FaultKind::missing_function, va, {});
@@ -468,10 +509,16 @@ private:
         }
     }
 
+    static const CpuState*& tls_state_ref() noexcept {
+        thread_local const CpuState* s = nullptr;
+        return s;
+    }
+
     RuntimeHooks hooks_;
     std::vector<FnRow> table_;
     std::vector<FnRow> hash_table_;
     std::size_t hash_mask_ = 0;
+    std::map<std::uint64_t, void*> fast_map_;
     std::map<std::uint64_t, ImportShim> imports_;
     std::map<std::uint64_t, std::string> import_names_;
     std::vector<PeImport> import_list_;

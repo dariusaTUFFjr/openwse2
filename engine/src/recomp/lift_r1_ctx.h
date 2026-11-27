@@ -89,7 +89,12 @@ public:
     llvm::Value* load(llvm::Value* addr64, unsigned bits, Mem kind = Mem::automatic);
     llvm::Value* load_vec128(llvm::Value* addr64, Mem kind = Mem::automatic);
     void store(llvm::Value* addr64, llvm::Value* v, Mem kind = Mem::automatic);
-    bool last_address_stack = false;  // set by `address()`, read by the next automatic access
+    bool last_address_stack = false;     // set by `address()`, read by the next automatic access
+    bool last_address_readonly = false;  // set by `address()` for RIP-relative loads in read-only PE sections
+    bool fn_relaxed_tso = false;         // true when this function omits per-access TSO fences
+    bool rbp_is_frame_ptr = false;       // true when `rbp` is a stable frame pointer in this function
+    bool is_fast_abi = false;            // true when lifting a register-passing `wse_fast_<va>` body
+    std::uint16_t stack_reg_mask = (1U << 4);  // bitmask of GPRs currently holding stack-derived pointers
     // Operand `i` as an iN of its size (immediates are truncated/sign-extended per Zydis).
     llvm::Value* read(const DInsn& d, int i);
     // Writes `v` (any int width, truncated/extended to the operand's size) to operand `i`.

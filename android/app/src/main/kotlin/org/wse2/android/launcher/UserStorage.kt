@@ -18,6 +18,10 @@ object UserStorage {
 
     fun profilesRoot(filesDir: File): File = File(userDir(filesDir), "profiles")
 
+    fun pgoProfileFile(filesDir: File): File = File(userDir(filesDir), "wse_pgo.txt")
+
+    fun crashReportFile(filesDir: File): File = File(userDir(filesDir), "crash_report.txt")
+
     fun moduleProfileDir(filesDir: File, moduleName: String): File {
         val safe = moduleName.trim().ifEmpty { "Native" }
             .replace(Regex("""[^A-Za-z0-9._-]"""), "_")

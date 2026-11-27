@@ -94,6 +94,10 @@ fun LauncherApp(
     val pictureSharpen by viewModel.pictureSharpen.collectAsStateWithLifecycle()
     val pictureFxaa by viewModel.pictureFxaa.collectAsStateWithLifecycle()
     val customDriverSharedBuffers by viewModel.customDriverSharedBuffers.collectAsStateWithLifecycle()
+    val strictTso by viewModel.strictTso.collectAsStateWithLifecycle()
+    val recordPgoProfile by viewModel.recordPgoProfile.collectAsStateWithLifecycle()
+    val pgoProfileSummary by viewModel.pgoProfileSummary.collectAsStateWithLifecycle()
+    val crashReportText by viewModel.crashReportText.collectAsStateWithLifecycle()
     val saveManagerState by viewModel.saveManagerState.collectAsStateWithLifecycle()
     val pendingPreparedZip by viewModel.pendingPreparedZip.collectAsStateWithLifecycle()
     val preparedZipStatus by viewModel.preparedZipStatus.collectAsStateWithLifecycle()
@@ -206,6 +210,14 @@ fun LauncherApp(
         onOpenSaveManager = viewModel::openSaveManager,
         customDriverSharedBuffers = customDriverSharedBuffers,
         onCustomDriverSharedBuffersChange = viewModel::setCustomDriverSharedBuffers,
+        strictTso = strictTso,
+        onStrictTsoChange = viewModel::setStrictTso,
+        recordPgoProfile = recordPgoProfile,
+        onRecordPgoProfileChange = viewModel::setRecordPgoProfile,
+        pgoProfileSummary = pgoProfileSummary,
+        onClearPgoProfile = viewModel::clearPgoProfile,
+        crashReportText = crashReportText,
+        onClearCrashReport = viewModel::clearCrashReport,
         onDismissR4Report = viewModel::dismissR4Report,
         pictureResolutionIndex = pictureResolutionIndex,
         pictureSharpen = pictureSharpen,
@@ -368,6 +380,14 @@ fun LauncherAppContent(
     onOpenSaveManager: (() -> Unit)? = null,
     customDriverSharedBuffers: Boolean = false,
     onCustomDriverSharedBuffersChange: (Boolean) -> Unit = {},
+    strictTso: Boolean = false,
+    onStrictTsoChange: (Boolean) -> Unit = {},
+    recordPgoProfile: Boolean = false,
+    onRecordPgoProfileChange: (Boolean) -> Unit = {},
+    pgoProfileSummary: String = "None",
+    onClearPgoProfile: () -> Unit = {},
+    crashReportText: String? = null,
+    onClearCrashReport: () -> Unit = {},
     onDismissR4Report: () -> Unit = {},
     pictureResolutionIndex: Int = 0,
     pictureSharpen: Boolean = true,
@@ -410,6 +430,10 @@ fun LauncherAppContent(
         pictureSharpen = pictureSharpen,
         pictureFxaa = pictureFxaa,
         customDriverSharedBuffers = customDriverSharedBuffers,
+        strictTso = strictTso,
+        recordPgoProfile = recordPgoProfile,
+        pgoProfileSummary = pgoProfileSummary,
+        crashReportText = crashReportText,
         statusLog = statusLog
     )
 
@@ -503,6 +527,10 @@ fun LauncherAppContent(
                 onClearSaveBackups = onClearSaveBackups,
                 onOpenSaveManager = onOpenSaveManager ?: {},
                 onCustomDriverSharedBuffersChange = onCustomDriverSharedBuffersChange,
+                onStrictTsoChange = onStrictTsoChange,
+                onRecordPgoProfileChange = onRecordPgoProfileChange,
+                onClearPgoProfile = onClearPgoProfile,
+                onClearCrashReport = onClearCrashReport,
                 onDismissR4Report = onDismissR4Report,
                 onPictureResolutionChange = onPictureResolutionChange,
                 onPictureSharpenChange = onPictureSharpenChange,

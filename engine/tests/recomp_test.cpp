@@ -24,10 +24,12 @@
 #include <utility>
 #include <vector>
 
+#include "wse/asset/texture_cache.h"
 #include "wse/platform/mod_controls_detector.h"
 #include "wse/platform/touch_icons.h"
 #include "wse/recomp/combat_haptics.h"
 #include "wse/recomp/d3d9_capture.h"
+#include "wse/recomp/d3d9_shader.h"
 #include "wse/recomp/fx_effect.h"
 #include "wse/recomp/host_stack.h"
 #include "wse/recomp/input_hub.h"
@@ -7307,6 +7309,55 @@ int run_recomp_suite(const char* fixture_path) {
     test_r6_mod_controls_detector_and_icons();
     test_r7_scripted_input_and_d3d9_hooks();
     test_r8_wave_features();
+    // R9 Wave 4 & 5: shader active-constant tracking, texture cache LRU pruning, on_missing_library,
+    // and Runtime::current_thread_state().
+    {
+        // ps_2_0: mov r0, c5; mov oC0, r0; end -> max_c_reg == 6, !uses_rel_c, !uses_int_c, !uses_bool_c
+        const std::vector<std::uint8_t> ps_bytes = {
+            0x00, 0x02, 0xFF, 0xFF,
+            0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x0F, 0x80, 0x05, 0x00, 0xE4, 0xA0,
+            0x01, 0x00, 0x00, 0x02, 0x00, 0x08, 0x0F, 0x80, 0x00, 0x00, 0xE4, 0x80,
+            0xFF, 0xFF, 0x00, 0x00,
+        };
+        d3d9sh::Shader sh;
+        const bool sh_ok = d3d9sh::translate(ps_bytes, sh);
+        expect(sh_ok && sh.error.empty() && sh.max_c_reg == 6U && !sh.uses_rel_c && !sh.uses_int_c && !sh.uses_bool_c,
+               "R9 Wave 4: d3d9sh::Shader tracks max_c_reg");
+
+        namespace fs = std::filesystem;
+        const fs::path lru_dir = fs::temp_directory_path() / "wse_r9_lru_test";
+        std::error_code ec;
+        fs::remove_all(lru_dir, ec);
+        fs::create_directories(lru_dir, ec);
+        for (int i = 0; i < 4; ++i) {
+            std::ofstream(lru_dir / ("tex_" + std::to_string(i) + ".etc2"), std::ios::binary)
+                << std::string(1024, 'x');
+        }
+        const auto pr = wse::asset::prune_texture_cache_lru(lru_dir, 2048U);
+        expect(pr.removed_files >= 2U && pr.remaining_bytes <= 2048U,
+               "R9 Wave 4: prune_texture_cache_lru evicts oldest entries");
+        fs::remove_all(lru_dir, ec);
+
+        Runtime rt;
+        shim::Modules mods(rt);
+        (void)mods.install();
+        std::string missing_seen;
+        mods.on_missing_library = [&](const std::string& req, const std::string& canon) {
+            missing_seen = req + "|" + canon;
+        };
+        GuestStack st_mem;
+        CpuState cs;
+        st_mem.prepare(cs);
+        rt.attach(cs);
+        expect(Runtime::current_thread_state() == nullptr, "R9 Wave 5: tls_state null outside run");
+        const std::uint64_t name_va = reinterpret_cast<std::uintptr_t>("thirdparty_mod.dll");
+        cs.gpr[1] = name_va;
+        const auto* load_shim = rt.named_shim("KERNEL32.dll", "LoadLibraryA");
+        expect(load_shim != nullptr, "R9 Wave 5: LoadLibraryA shim present");
+        if (load_shim != nullptr) (*load_shim)(cs);
+        expect(missing_seen == "thirdparty_mod.dll|thirdparty_mod.dll",
+               "R9 Wave 5: on_missing_library fires for unbundled DLL");
+    }
     {
         GuestStack gs(64 * 1024);
         expect(gs.data() != nullptr && gs.usable_size() >= 64 * 1024 + 64,

@@ -226,6 +226,10 @@ private:
 // Install reads (count, bytes, wall time including the wait for the lock), for the load-time
 // breakdown in the report's `fps:` lines.
 std::atomic<std::uint64_t> g_file_ns{0}, g_file_count{0}, g_file_bytes{0};
+bool g_strict_tso = false;
+std::string g_profile_in;
+std::string g_profile_out;
+std::string g_crash_report_path;
 
 // Serializes every call of a Vfs that is not thread-safe (`SafVfs`): guest threads read files
 // concurrently (resource loading threads).
@@ -565,6 +569,10 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     }
 
     wse::recomp::StartupOptions o;
+    o.strict_tso = g_strict_tso;
+    o.profile_in = g_profile_in;
+    o.profile_out = g_profile_out;
+    o.crash_report_path = g_crash_report_path.empty() ? (user_root / "crash_report.txt").string() : g_crash_report_path;
     if (hud) hud->update("Reading the game…");
     if (!game_install->read_file("mb_warband_wse2_x64.exe", o.exe) ||
         !game_install->read_file("lua5164.dll", o.lua) ||
@@ -633,6 +641,10 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
 extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_nativeRun(JNIEnv* env, jclass, jobject bridge,
                                                                                     jstring jcopy_dir, jstring jwork_dir,
                                                                                     jstring jmodule, jint jobs, jlong frames) {
+    g_strict_tso = false;
+    g_profile_in.clear();
+    g_profile_out.clear();
+    g_crash_report_path.clear();
     namespace fs = std::filesystem;
     const fs::path work = fs::path(jstring_to_utf8(env, jwork_dir)) / "r4";
     std::error_code ec;
@@ -655,7 +667,12 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     jlong frames, jobject jsurface, jstring jdriver_mode, jstring jcustom_icd_path, jstring jnative_lib_dir,
     jstring jshader_cache_dir, jint max_texture_size, jfloat render_scale, jboolean auto_resolution,
     jfloat sharpness, jboolean fxaa, jfloat target_fps, jboolean custom_driver_shared_buffers,
+    jboolean strict_tso, jstring jprofile_in, jstring jprofile_out, jstring jcrash_report_path,
     jobject jhud_listener) {
+    g_strict_tso = (strict_tso == JNI_TRUE);
+    g_profile_in = jstring_to_utf8(env, jprofile_in);
+    g_profile_out = jstring_to_utf8(env, jprofile_out);
+    g_crash_report_path = jstring_to_utf8(env, jcrash_report_path);
     namespace fs = std::filesystem;
     const fs::path work = fs::path(jstring_to_utf8(env, jwork_dir)) / "r4";
     std::error_code ec;
@@ -1119,6 +1136,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
 }
 
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeFinishReport(JNIEnv*, jclass) {
+    flush_pgo_profile_now();
     {
         const std::lock_guard<std::mutex> lock(g_pause_m);
         g_shutting_down = true;

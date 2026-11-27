@@ -68,6 +68,10 @@ fun AdvancedScreen(
     onClearSaveBackups: () -> Unit = {},
     onOpenSaveManager: () -> Unit = {},
     onCustomDriverSharedBuffersChange: (Boolean) -> Unit = {},
+    onStrictTsoChange: (Boolean) -> Unit = {},
+    onRecordPgoProfileChange: (Boolean) -> Unit = {},
+    onClearPgoProfile: () -> Unit = {},
+    onClearCrashReport: () -> Unit = {},
     onDismissR4Report: () -> Unit = {},
     onPictureResolutionChange: (Int) -> Unit = {},
     onPictureSharpenChange: (Boolean) -> Unit = {},
@@ -80,6 +84,7 @@ fun AdvancedScreen(
         treeUri != null &&
         !state.scanState.inProgress
     var showLicencesDialog by remember { mutableStateOf(false) }
+    var showCrashReportDialog by remember { mutableStateOf(false) }
 
     Box(
         modifier = modifier
@@ -486,6 +491,74 @@ fun AdvancedScreen(
                     enabled = !r4State.running,
                     onCheckedChange = onR4UseCopyChange
                 )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Strict memory ordering (TSO)",
+                    supporting = "Slower safe fallback for mods with lock-free thread races (re-translates on change).",
+                    checked = state.strictTso,
+                    enabled = !r4State.running,
+                    onCheckedChange = onStrictTsoChange
+                )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Record performance profile (PGO)",
+                    supporting = "Samples hot game loops during play (${state.pgoProfileSummary}) to speed up future runs.",
+                    checked = state.recordPgoProfile,
+                    enabled = !r4State.running,
+                    onCheckedChange = onRecordPgoProfileChange
+                )
+                if (state.pgoProfileSummary != "None") {
+                    LauncherSectionDivider()
+                    WseListRow(
+                        title = "Clear performance profile",
+                        supporting = state.pgoProfileSummary,
+                        trailing = {
+                            Text(
+                                text = "Clear",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.primary
+                            )
+                        },
+                        showDivider = false,
+                        enabled = !r4State.running,
+                        onClick = onClearPgoProfile
+                    )
+                }
+            }
+
+            state.crashReportText?.let { crashText ->
+                LauncherSectionHeader(title = "Diagnostics")
+                LauncherGroupedCard {
+                    WseListRow(
+                        title = "Last crash report",
+                        supporting = crashText.lineSequence().firstOrNull { it.isNotBlank() } ?: "Crash report available",
+                        trailing = {
+                            Text(
+                                text = "View",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.primary
+                            )
+                        },
+                        showDivider = true,
+                        onClick = { showCrashReportDialog = true }
+                    )
+                    WseListRow(
+                        title = "Clear crash report",
+                        supporting = "Removes the saved crash_report.txt diagnostic log.",
+                        enabled = !r4State.running,
+                        trailing = {
+                            Text(
+                                text = "Clear",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.primary
+                            )
+                        },
+                        showDivider = false,
+                        onClick = onClearCrashReport
+                    )
+                }
             }
 
             LauncherSectionHeader(title = "Status Log")
@@ -569,6 +642,22 @@ fun AdvancedScreen(
             text = licenceText,
             confirm = WseDialogAction("Close") { showLicencesDialog = false },
             onDismissRequest = { showLicencesDialog = false }
+        )
+    }
+
+    if (showCrashReportDialog && state.crashReportText != null) {
+        val context = LocalContext.current
+        WseDialog(
+            title = "Last crash report",
+            text = state.crashReportText,
+            confirm = WseDialogAction("Copy") {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("WSE2 crash report", state.crashReportText))
+                Toast.makeText(context, "Crash report copied.", Toast.LENGTH_SHORT).show()
+                showCrashReportDialog = false
+            },
+            dismiss = WseDialogAction("Close") { showCrashReportDialog = false },
+            onDismissRequest = { showCrashReportDialog = false }
         )
     }
 }

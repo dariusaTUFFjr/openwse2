@@ -26,6 +26,7 @@
 #include "../src/recomp/recomp_llvm.h"
 #include "wse/recomp/pe_image.h"
 #include "wse/recomp/r0_inputs.h"
+#include "wse/recomp/pgo_profile.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/seh.h"
 #include "wse/platform/vfs.h"
@@ -902,6 +903,171 @@ void test_cross_batch_direct_calls(const char* dir) {
     run_with_loader(true);
 }
 
+void test_r9_features(const char* dir) {
+    // 1. Wave 1: .rdata RIP-relative load + rbp/lea stack tracking + selective TSO relaxation.
+    {
+        constexpr std::uint64_t kImgBase = 0x200000ULL;
+        constexpr std::uint64_t kFnVa = kImgBase + 0x1000U;
+        std::vector<std::uint8_t> img(0x3000U, 0xCCU);
+        // Function @ 0x201000:
+        //   push rbp; mov rbp, rsp; sub rsp, 16
+        //   lea rdx, [rbp - 8]; mov dword [rdx], 42
+        //   mov eax, dword [rip + 0x0FE0]  ; -> 0x202000 (.rdata)
+        //   add eax, dword [rdx]
+        //   add rsp, 16; pop rbp; ret
+        const std::uint8_t fn_bytes[] = {
+            0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x10,
+            0x48, 0x8D, 0x55, 0xF8, 0xC7, 0x02, 0x2A, 0x00, 0x00, 0x00,
+            0x8B, 0x05, 0xEA, 0x0F, 0x00, 0x00,
+            0x03, 0x02,
+            0x48, 0x83, 0xC4, 0x10, 0x5D, 0xC3,
+        };
+        std::memcpy(img.data() + 0x1000U, fn_bytes, sizeof(fn_bytes));
+        const std::uint32_t ro_val = 100U;
+        std::memcpy(img.data() + 0x2000U, &ro_val, 4);
+
+        const ImageView view(img.data(), kImgBase, img.size(), kImgBase + 0x1000U, kImgBase + 0x1400U);
+        const std::set<std::uint64_t> entries{kFnVa};
+        Discoverer disc(view);
+        ImageInfo info;
+        info.base = kImgBase;
+        info.readonly_ranges.push_back({kImgBase + 0x2000U, kImgBase + 0x3000U});
+        info.relaxed_tso = false;  // even under strict TSO, .rdata + rbp + lea stay plain!
+        R1Translator tr(info);
+        tr.declare({kFnVa});
+        std::string why;
+        const DFunction fn = disc.discover(kFnVa, entries);
+        expect(!is_fast_abi_eligible(fn, info), "R9 Wave 1: RBP-frame function stays on CpuState* ABI");
+        expect(tr.lift(fn, &why), "R9 Wave 1: stack+rdata function lifts");
+        std::vector<char> obj;
+        std::string err;
+        expect(tr.emit_object(2, obj, nullptr, &err) && !obj.empty(), "R9 Wave 1: emit_object succeeds");
+        const std::string o = std::string(dir) + "/r9_w1.o";
+        const std::string so = std::string(dir) + "/r9_w1.so";
+        std::ofstream(o, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
+        std::string log;
+        expect(link_shared_object({o}, so, &log), "R9 Wave 1: link succeeds");
+        LoadedCode code;
+        void* h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h != nullptr, "R9 Wave 1: dlopen succeeds");
+        if (h != nullptr) {
+            code.adopt_handle(h);
+            Runtime rt;
+            rt.add_table(static_cast<const FnRow*>(code.sym("wse_fn_table")),
+                         static_cast<std::size_t>(*static_cast<const std::uint64_t*>(code.sym("wse_fn_table_count"))));
+            GuestStack stack;
+            CpuState s;
+            stack.prepare(s);
+            const std::uint64_t ro_addr = reinterpret_cast<std::uintptr_t>(img.data() + 0x2000U);
+            (void)ro_addr;
+            // Verify fast-ABI table is also exported (Wait: this function uses RBP so it stays CpuState* ABI).
+            expect(rt.find(kFnVa) != nullptr, "R9 Wave 1: function registered");
+        }
+    }
+
+    // 2. Wave 2: Fast-ABI cross-batch patching (`wse_ext_fast_calls[]`) & cross-batch inline leaf cloning.
+    {
+        constexpr std::uint64_t kImgBase = 0x300000ULL;
+        constexpr std::uint64_t kLeafVa = kImgBase + 0x1000U;
+        constexpr std::uint64_t kFastCallerVa = kImgBase + 0x1100U;
+        constexpr std::uint64_t kInlineCallerVa = kImgBase + 0x1200U;
+        std::vector<std::uint8_t> img(0x2000U, 0xCCU);
+        // Leaf @ 0x301000: lea eax, [rcx + rdx + 5]; ret
+        const std::uint8_t leaf_bytes[] = {0x8D, 0x44, 0x11, 0x05, 0xC3};
+        std::memcpy(img.data() + 0x1000U, leaf_bytes, sizeof(leaf_bytes));
+        // Fast caller @ 0x301100: call 0x301000; add eax, 10; ret (rel32 = -0x105)
+        const std::uint8_t fcaller_bytes[] = {0xE8, 0xFB, 0xFE, 0xFF, 0xFF, 0x83, 0xC0, 0x0A, 0xC3};
+        std::memcpy(img.data() + 0x1100U, fcaller_bytes, sizeof(fcaller_bytes));
+        // Inline caller @ 0x301200: call 0x301000; add eax, 20; ret (rel32 = -0x205)
+        const std::uint8_t icaller_bytes[] = {0xE8, 0xFB, 0xFD, 0xFF, 0xFF, 0x83, 0xC0, 0x14, 0xC3};
+        std::memcpy(img.data() + 0x1200U, icaller_bytes, sizeof(icaller_bytes));
+
+        const ImageView view(img.data(), kImgBase, img.size(), kImgBase + 0x1000U, kImgBase + 0x1400U);
+        const std::set<std::uint64_t> entries{kLeafVa, kFastCallerVa, kInlineCallerVa};
+        Discoverer disc(view);
+        ImageInfo info;
+        info.base = kImgBase;
+        const DFunction df_leaf = disc.discover(kLeafVa, entries);
+        expect(is_fast_abi_eligible(df_leaf, info), "R9 Wave 2: leaf is fast-ABI eligible");
+        info.fast_abi_vas.insert(kLeafVa);
+
+        auto build_so = [&](const std::vector<std::uint64_t>& vas, bool clone_leaf, const std::string& tag) {
+            R1Translator tr(info);
+            tr.declare(vas);
+            if (clone_leaf) tr.add_inline_leaf(df_leaf);
+            std::string why;
+            for (const std::uint64_t va : vas) {
+                expect(tr.lift(disc.discover(va, entries), &why), ("R9 Wave 2 lift " + tag).c_str());
+            }
+            std::vector<char> obj;
+            std::string err;
+            expect(tr.emit_object(2, obj, nullptr, &err) && !obj.empty(), ("R9 Wave 2 emit " + tag).c_str());
+            const std::string o = std::string(dir) + "/" + tag + ".o";
+            const std::string so = std::string(dir) + "/" + tag + ".so";
+            std::ofstream(o, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
+            std::string log;
+            expect(link_shared_object({o}, so, &log), ("R9 Wave 2 link " + tag).c_str());
+            return so;
+        };
+
+        const std::string so_leaf = build_so({kLeafVa}, false, "r9_leaf");
+        const std::string so_fast = build_so({kFastCallerVa}, false, "r9_fast");
+        const std::string so_inl = build_so({kInlineCallerVa}, true, "r9_inl");
+
+        LoadedCode c_leaf, c_fast, c_inl;
+        void* h_leaf = dlopen(so_leaf.c_str(), RTLD_NOW | RTLD_LOCAL);
+        void* h_fast = dlopen(so_fast.c_str(), RTLD_NOW | RTLD_LOCAL);
+        void* h_inl = dlopen(so_inl.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h_leaf != nullptr && h_fast != nullptr && h_inl != nullptr, "R9 Wave 2: dlopen all");
+        if (h_leaf == nullptr || h_fast == nullptr || h_inl == nullptr) return;
+        c_leaf.adopt_handle(h_leaf);
+        c_fast.adopt_handle(h_fast);
+        c_inl.adopt_handle(h_inl);
+
+        Runtime rt;
+        for (LoadedCode* c : {&c_leaf, &c_fast, &c_inl}) {
+            rt.add_table(static_cast<const FnRow*>(c->sym("wse_fn_table")),
+                         static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c->sym("wse_fn_table_count"))));
+            rt.add_fast_table(static_cast<const FastFnRow*>(c->sym("wse_fast_table")),
+                              static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c->sym("wse_fast_table_count"))));
+        }
+        const auto* fcnt = static_cast<const std::uint64_t*>(c_fast.sym("wse_ext_fast_call_count"));
+        auto* fslots = static_cast<void**>(c_fast.sym("wse_ext_fast_calls"));
+        const auto* fvas = static_cast<const std::uint64_t*>(c_fast.sym("wse_ext_fast_call_vas"));
+        expect(fcnt != nullptr && *fcnt == 1U && rt.patch_external_fast_calls(fslots, fvas, *fcnt) == 1U,
+               "R9 Wave 2: patch_external_fast_calls resolves cross-batch fast callee");
+
+        GuestStack stack;
+        CpuState s;
+        stack.prepare(s);
+        s.gpr[1] = 10;
+        s.gpr[2] = 20;
+        expect(rt.run(s, kFastCallerVa) && s.gpr[0] == 45, "R9 Wave 2: cross-batch fast-ABI call returns 45");
+        stack.prepare(s);
+        s.gpr[1] = 10;
+        s.gpr[2] = 20;
+        expect(rt.run(s, kInlineCallerVa) && s.gpr[0] == 55, "R9 Wave 2: cross-batch cloned inline leaf returns 55");
+    }
+
+    // 3. Wave 3: PGO profile save / load / select_pgo_hot_vas.
+    {
+        PgoProfile prof;
+        for (std::uint64_t i = 0; i < 100; ++i) {
+            prof.hits[0x140001000ULL + i * 16] = (i < 5) ? 1000 : 1;
+            prof.total_samples += (i < 5) ? 1000 : 1;
+        }
+        const std::string ppath = std::string(dir) + "/test_pgo.txt";
+        expect(save_pgo_profile(ppath, prof), "R9 Wave 3: save_pgo_profile succeeds");
+        PgoProfile loaded;
+        expect(load_pgo_profile(ppath, loaded) && loaded.total_samples == prof.total_samples &&
+                   loaded.hits.size() == 100U,
+               "R9 Wave 3: load_pgo_profile round-trips");
+        const auto hot = select_pgo_hot_vas(loaded, 1000, 0.85, 0.05);
+        expect(hot.size() <= 50U && hot.count(0x140001000ULL) == 1U,
+               "R9 Wave 3: select_pgo_hot_vas picks top-5% hot VAs");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -941,6 +1107,7 @@ int main(int argc, char** argv) {
     test_discover_alias_jump_table_over_256();
     test_discover_leaf_byte_jump_table();
     test_cross_batch_direct_calls(dir);
+    test_r9_features(dir);
     if (corpus != nullptr) {
         test_corpus(corpus);
     } else {

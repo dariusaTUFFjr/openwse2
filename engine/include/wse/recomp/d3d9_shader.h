@@ -62,6 +62,10 @@ struct Shader {
     std::vector<Semantic> inputs;   // vertex shader inputs (by register) / pixel shader varyings
     std::vector<Semantic> outputs;  // vertex shader varyings
     std::array<int, 16> samplers{};  // 0 none, 2 2D, 3 cube, 4 volume
+    std::uint32_t max_c_reg = 0U;    // highest accessed float constant register + 1 (0..256)
+    bool uses_rel_c = false;         // true if relative indexing into c[] is used
+    bool uses_int_c = false;         // true if any u.i[] register is read
+    bool uses_bool_c = false;        // true if any u.b[] register is read
     std::string glsl;
     std::string error;  // why translation failed
 };
@@ -281,10 +285,15 @@ private:
         case kConst4: {
             const std::uint32_t base = p.type == kConst ? 0 : p.type == kConst2 ? 2048 : p.type == kConst3 ? 4096 : 6144;
             if (p.relative) {
+                s_.uses_rel_c = true;
+                s_.max_c_reg = 256U;
                 const std::string idx = p.rel_type == kLoop ? loop_name() : "a0." + std::string(1, kComp[p.rel_comp]);
                 return "u.c[clamp(" + idx + " + " + std::to_string(base + p.num) + ", 0, 255)]";
             }
             if (base + p.num < 256 && !defs_[base + p.num].empty()) return defs_[base + p.num];
+            if (base + p.num < 256) {
+                s_.max_c_reg = std::max(s_.max_c_reg, std::min<std::uint32_t>(256U, base + p.num + 1U));
+            }
             return "u.c[" + std::to_string(base + p.num) + "]";
         }
         case kAddrOrTexture:
@@ -306,9 +315,13 @@ private:
             written_out_.insert(kDepthOut << 8);
             return "oDepth";
         case kConstInt:
-            return defi_[p.num % 16].empty() ? "u.i[" + n + "]" : defi_[p.num % 16];
+            if (!defi_[p.num % 16].empty()) return defi_[p.num % 16];
+            s_.uses_int_c = true;
+            return "u.i[" + n + "]";
         case kConstBool:
-            return defb_[p.num % 16].empty() ? "(u.b[" + n + "].x != 0)" : defb_[p.num % 16];
+            if (!defb_[p.num % 16].empty()) return defb_[p.num % 16];
+            s_.uses_bool_c = true;
+            return "(u.b[" + n + "].x != 0)";
         case kLoop:
             return loop_name();
         case kMisc:

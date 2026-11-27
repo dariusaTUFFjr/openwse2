@@ -349,6 +349,10 @@ data class AdvancedUiState(
     val pictureSharpen: Boolean = true,
     val pictureFxaa: Boolean = false,
     val customDriverSharedBuffers: Boolean = false,
+    val strictTso: Boolean = false,
+    val recordPgoProfile: Boolean = false,
+    val pgoProfileSummary: String = "None",
+    val crashReportText: String? = null,
     val statusLog: String = "Ready."
 )
 
@@ -394,6 +398,8 @@ sealed interface LauncherEvent {
         val sharpness: Float,
         val fxaa: Boolean,
         val customDriverSharedBuffers: Boolean = false,
-        val targetFps: Int = 60
+        val targetFps: Int = 60,
+        val strictTso: Boolean = false,
+        val recordPgoProfile: Boolean = false
     ) : LauncherEvent
 }

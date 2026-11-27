@@ -590,6 +590,10 @@ int main(int argc, char** argv) {
         else if (a == "--jobs" && i + 1 < argc) o.jobs = static_cast<unsigned>(std::max(1, std::atoi(argv[++i])));
         else if (a == "--reuse") o.reuse = true;
         else if (a == "--quiet") o.quiet = true;
+        else if (a == "--strict-tso") o.strict_tso = true;
+        else if (a == "--profile-in" && i + 1 < argc) o.profile_in = argv[++i];
+        else if (a == "--profile-out" && i + 1 < argc) o.profile_out = argv[++i];
+        else if (a == "--hot-opt" && i + 1 < argc) o.pgo_hot_opt = std::atoi(argv[++i]);
         else if (a == "--module" && i + 1 < argc) o.module = argv[++i];
         else if (a == "--frames" && i + 1 < argc) o.frame_limit = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--for-phone" && i + 1 < argc) for_phone = argv[++i];
@@ -643,6 +647,7 @@ int main(int argc, char** argv) {
     o.lua = read_file(find_ci(install, "lua5164.dll"));
     o.pdb = read_file(find_ci(install, "mb_warband_wse2_x64.pdb"));
     o.so_dir = (work / "so").string();
+    if (o.crash_report_path.empty()) o.crash_report_path = (work / "crash_report.txt").string();
     if (!for_phone.empty()) {
         wse::recomp::set_code_target(wse::recomp::portable_android_target());
         o.translate_only = true;

@@ -201,4 +201,15 @@ class Wave2To4UnitTest {
         assertEquals(85, loadedCtrl.hapticStrength)
         assertNotNull(UserStorage.moduleProfileDir(filesDir, "Prophesy of Pendor"))
     }
+
+    @Test
+    fun userStorage_pgoAndCrashReportPathsStayInsideUserDir() {
+        val filesDir = tmp.newFolder("diag_files")
+        val pgo = UserStorage.pgoProfileFile(filesDir)
+        val crash = UserStorage.crashReportFile(filesDir)
+        assertTrue(pgo.absolutePath.startsWith(UserStorage.userDir(filesDir).absolutePath))
+        assertTrue(crash.absolutePath.startsWith(UserStorage.userDir(filesDir).absolutePath))
+        assertEquals("wse_pgo.txt", pgo.name)
+        assertEquals("crash_report.txt", crash.name)
+    }
 }

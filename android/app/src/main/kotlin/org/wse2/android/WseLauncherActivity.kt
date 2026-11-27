@@ -259,6 +259,8 @@ class WseLauncherActivity : ComponentActivity() {
             putExtra(RecompGameActivity.EXTRA_FXAA, event.fxaa)
             putExtra(RecompGameActivity.EXTRA_CUSTOM_DRIVER_SHARED_BUFFERS, event.customDriverSharedBuffers)
             putExtra(RecompGameActivity.EXTRA_TARGET_FPS, event.targetFps)
+            putExtra(RecompGameActivity.EXTRA_STRICT_TSO, event.strictTso)
+            putExtra(RecompGameActivity.EXTRA_RECORD_PGO_PROFILE, event.recordPgoProfile)
         }
         recompVulkanLauncher.launch(intent)
     }
