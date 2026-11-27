@@ -1,5 +1,6 @@
 package org.wse2.android
 
+import org.wse2.android.launcher.UserStorage
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
