@@ -37,7 +37,8 @@ data class PreparedZipImportResult(
  */
 object PreparedZipVerifier {
     const val MANIFEST_NAME = "manifest.json"
-    private val PREPARED_PART = Regex("""(exe|lua5164)_w\d+\.(so|key)""")
+    const val PGO_PROFILE_NAME = "wse_pgo.txt"
+    private val PREPARED_PART = Regex("""(exe|lua5164)_(w|hot_)\d+\.(so|key)""")
     private val PREPARED_TEXTURE = Regex("""[0-9a-f]{16}\.etc2""")
 
     fun parseManifest(rawJson: String): PreparedZipManifest? {
@@ -87,7 +88,8 @@ object PreparedZipVerifier {
         soDir: File,
         texDir: File,
         isCancelled: () -> Boolean = { false },
-        onProgress: (parts: Int, textures: Int) -> Unit = { _, _ -> }
+        onProgress: (parts: Int, textures: Int) -> Unit = { _, _ -> },
+        pgoProfileDest: File? = null
     ): PreparedZipImportResult {
         soDir.mkdirs()
         texDir.mkdirs()
@@ -97,6 +99,7 @@ object PreparedZipVerifier {
         val stagedParts = HashMap<String, File>()
         val stagedKeys = HashMap<String, ByteArray>()
         val stagedTextures = HashMap<String, File>()
+        var stagedPgoBytes: ByteArray? = null
 
         try {
             ZipInputStream(zipStream.buffered(1 shl 16)).use { zip ->
@@ -112,6 +115,14 @@ object PreparedZipVerifier {
                         val raw = zip.readBytes().toString(Charsets.UTF_8)
                         manifest = parseManifest(raw)
                             ?: return PreparedZipImportResult(ok = false, error = "Invalid manifest.json in PC zip.")
+                        continue
+                    }
+                    if (name == PGO_PROFILE_NAME) {
+                        val pgoBytes = zip.readBytes()
+                        val md = MessageDigest.getInstance("SHA-256")
+                        md.update(pgoBytes)
+                        extractedHashes[name] = digestHex(md.digest())
+                        stagedPgoBytes = pgoBytes
                         continue
                     }
                     val isPart = PREPARED_PART.matches(name)
@@ -202,6 +213,15 @@ object PreparedZipVerifier {
                     if (stagedTex.renameTo(destTex) || run { stagedTex.copyTo(destTex, overwrite = true); true }) {
                         ++texturesCommitted
                     }
+                }
+            }
+            if (stagedPgoBytes != null && pgoProfileDest != null) {
+                pgoProfileDest.parentFile?.mkdirs()
+                val pgoTmp = File(pgoProfileDest.parentFile, "${pgoProfileDest.name}.import")
+                pgoTmp.writeBytes(stagedPgoBytes!!)
+                if (!pgoTmp.renameTo(pgoProfileDest)) {
+                    pgoTmp.copyTo(pgoProfileDest, overwrite = true)
+                    pgoTmp.delete()
                 }
             }
             onProgress(partsCommitted, texturesCommitted)

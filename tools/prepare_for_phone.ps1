@@ -135,8 +135,11 @@ import datetime, glob, hashlib, json, os, sys, zipfile
 files = sorted(
     glob.glob("exe_w*.so")
     + glob.glob("exe_w*.key")
+    + glob.glob("exe_hot_*.so")
+    + glob.glob("exe_hot_*.key")
     + glob.glob("lua5164_w*.so")
     + glob.glob("lua5164_w*.key")
+    + glob.glob("wse_pgo.txt")
     + glob.glob("texcache/*.etc2")
 )
 hashes = {}

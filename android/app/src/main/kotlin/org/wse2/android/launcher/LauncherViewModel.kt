@@ -636,6 +636,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                 val shouldLaunch = pendingLaunchAfterZip
                 pendingLaunchAfterZip = false
                 if (res.ok) {
+                    refreshDiagnostics()
                     val summary = "Verified & imported ${res.partsImported} code parts, ${res.texturesImported} textures."
                     _statusLog.value = summary
                     _events.trySend(LauncherEvent.ShowToast(summary))

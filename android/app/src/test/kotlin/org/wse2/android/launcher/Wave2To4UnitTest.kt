@@ -212,4 +212,69 @@ class Wave2To4UnitTest {
         assertEquals("wse_pgo.txt", pgo.name)
         assertEquals("crash_report.txt", crash.name)
     }
+
+    @Test
+    fun preparedZipVerifier_acceptsPgoHotBatchesAndProfile() {
+        fun buildZip(manifestPgoHashOverride: String? = null): ByteArray {
+            val soBytes = byteArrayOf(0x7F, 'E'.code.toByte(), 'L'.code.toByte(), 'F'.code.toByte())
+            val keyBytes = "lifter 961e7bb2d5a391e4\n".toByteArray(Charsets.UTF_8)
+            val pgoBytes = "# WSE2 PGO v1\n0x140001000 42\n".toByteArray(Charsets.UTF_8)
+            val filesObj = JSONObject()
+                .put("exe_hot_0.so", PreparedZipVerifier.sha256Hex(soBytes))
+                .put("exe_hot_0.key", PreparedZipVerifier.sha256Hex(keyBytes))
+                .put(
+                    PreparedZipVerifier.PGO_PROFILE_NAME,
+                    manifestPgoHashOverride ?: PreparedZipVerifier.sha256Hex(pgoBytes)
+                )
+            val manifestJson = JSONObject()
+                .put("format", 1)
+                .put("created_utc", "2026-11-27T00:00:00Z")
+                .put("translator_fingerprint", "lifter 961e7bb2d5a391e4")
+                .put("files", filesObj)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            val baos = ByteArrayOutputStream()
+            ZipOutputStream(baos).use { z ->
+                for ((name, bytes) in listOf(
+                    PreparedZipVerifier.MANIFEST_NAME to manifestJson,
+                    "exe_hot_0.so" to soBytes,
+                    "exe_hot_0.key" to keyBytes,
+                    PreparedZipVerifier.PGO_PROFILE_NAME to pgoBytes
+                )) {
+                    z.putNextEntry(ZipEntry(name))
+                    z.write(bytes)
+                    z.closeEntry()
+                }
+            }
+            return baos.toByteArray()
+        }
+
+        val root = tmp.newFolder("pgo_zip_ok")
+        val soDir = File(root, "so")
+        val texDir = File(root, "tex")
+        val pgoDest = File(root, "user/wse_pgo.txt")
+        val okRes = PreparedZipVerifier.verifyAndExtract(
+            zipStream = ByteArrayInputStream(buildZip()),
+            soDir = soDir,
+            texDir = texDir,
+            pgoProfileDest = pgoDest
+        )
+        assertTrue(okRes.error, okRes.ok)
+        assertEquals(1, okRes.partsImported)
+        assertTrue(File(soDir, "exe_hot_0.so").isFile)
+        assertTrue(File(soDir, "exe_hot_0.key").isFile)
+        assertTrue(pgoDest.isFile)
+        assertTrue(pgoDest.readText().contains("0x140001000 42"))
+
+        val badRoot = tmp.newFolder("pgo_zip_bad")
+        val badPgoDest = File(badRoot, "user/wse_pgo.txt")
+        val badRes = PreparedZipVerifier.verifyAndExtract(
+            zipStream = ByteArrayInputStream(buildZip("0".repeat(64))),
+            soDir = File(badRoot, "so"),
+            texDir = File(badRoot, "tex"),
+            pgoProfileDest = badPgoDest
+        )
+        assertFalse(badRes.ok)
+        assertFalse(badPgoDest.exists())
+    }
 }

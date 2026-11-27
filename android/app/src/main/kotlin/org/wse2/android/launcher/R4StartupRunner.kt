@@ -238,7 +238,8 @@ class R4StartupRunner private constructor(private val app: Application) {
                             main.post {
                                 onProgress("Verified & imported $parts code parts, $tex textures…")
                             }
-                        }
+                        },
+                        pgoProfileDest = UserStorage.pgoProfileFile(app.filesDir)
                     )
                 } ?: PreparedZipImportResult(ok = false, error = "Could not open ${zip.fileName}.")
             } catch (t: Throwable) {
@@ -592,7 +593,8 @@ class R4StartupRunner private constructor(private val app: Application) {
                 isCancelled = { stopRequested },
                 onProgress = { parts, _ ->
                     if (parts > 0) update(state.copy(status = "Verified & imported $parts parts from ${pending.fileName}…"))
-                }
+                },
+                pgoProfileDest = UserStorage.pgoProfileFile(app.filesDir)
             )
         } ?: PreparedZipImportResult(ok = false, error = "${pending.fileName} could not be opened.")
         if (!res.ok) {
