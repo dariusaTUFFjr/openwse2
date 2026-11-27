@@ -1136,7 +1136,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
 }
 
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeFinishReport(JNIEnv*, jclass) {
-    flush_pgo_profile_now();
+    wse::recomp::flush_pgo_profile_now();
     {
         const std::lock_guard<std::mutex> lock(g_pause_m);
         g_shutting_down = true;
