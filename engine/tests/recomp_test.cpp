@@ -52,6 +52,7 @@
 #include "wse/recomp/shim_strings.h"
 #include "wse/recomp/shim_system.h"
 #include "wse/recomp/shim_time.h"
+#include "wse/recomp/pgo_profile.h"
 #include "wse/recomp/shim_user32.h"
 #include "wse/recomp/teb.h"
 #include "wse/recomp/threadpool.h"
@@ -7333,10 +7334,32 @@ int run_recomp_suite(const char* fixture_path) {
             std::ofstream(lru_dir / ("tex_" + std::to_string(i) + ".etc2"), std::ios::binary)
                 << std::string(1024, 'x');
         }
+        // Under the cap nothing is removed and the measured size comes back (the Vulkan device
+        // keeps it as its running total, so it does not walk the directory on every write).
+        const auto under = wse::asset::prune_texture_cache_lru(lru_dir, 8192U);
+        expect(under.removed_files == 0U && under.remaining_bytes == 4096U,
+               "R9: prune_texture_cache_lru under the cap keeps every file and reports the size");
         const auto pr = wse::asset::prune_texture_cache_lru(lru_dir, 2048U);
         expect(pr.removed_files >= 2U && pr.remaining_bytes <= 2048U,
                "R9 Wave 4: prune_texture_cache_lru evicts oldest entries");
         fs::remove_all(lru_dir, ec);
+
+        // PGO recording adds a session to the profile already on disk.
+        {
+            PgoProfile base;
+            base.hits[0x140001000ULL] = 900;
+            base.hits[0x140002000ULL] = 100;
+            base.total_samples = 1000;
+            PgoProfile session;
+            session.hits[0x140002000ULL] = 50;
+            session.hits[0x140003000ULL] = 25;
+            session.hits[0] = 7;  // never a function: ignored
+            session.total_samples = 82;
+            merge_pgo_profile(base, session);
+            expect(base.hits.size() == 3U && base.hits[0x140001000ULL] == 900U && base.hits[0x140002000ULL] == 150U &&
+                       base.hits[0x140003000ULL] == 25U && base.total_samples == 1075U,
+                   "R9: merge_pgo_profile accumulates a session onto the saved profile");
+        }
 
         Runtime rt;
         shim::Modules mods(rt);

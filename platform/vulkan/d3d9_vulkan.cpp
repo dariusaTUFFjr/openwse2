@@ -1214,7 +1214,7 @@ struct VulkanD3d9Backend::Impl {
     } pending_draw;
 
     VulkanD3d9Backend::DrawStats draw_stats{};
-    std::uint32_t etc2_writes_since_prune = 0U;
+    std::uint64_t etc2_cache_bytes = 0U;  // size of texture_cache_dir as last measured + this run's writes
 
     void reset_bound_state() noexcept {
         bound_pipeline = VK_NULL_HANDLE;
@@ -1277,6 +1277,10 @@ struct VulkanD3d9Backend::Impl {
     double reported_cpu_ms = 0.0;
     bool has_last_present_tp = false;
     std::chrono::steady_clock::time_point last_present_tp{};
+    // When the previous present() returned: the game thread's CPU work for a frame is the time
+    // from there to the next present() call (waits for the GPU and the display are not work).
+    bool has_last_present_end = false;
+    std::chrono::steady_clock::time_point last_present_end_tp{};
 
     bool post_shaders_attempted = false;
     bool post_shaders_ok = false;
@@ -3652,8 +3656,9 @@ void main() {
         vk.cmd_draw_indexed(frame_cmd, static_cast<std::uint32_t>(valid_indices), 1U, 0U, 0, 0U);
         vk.cmd_end_render_pass(frame_cmd);
 
-        bound_pipeline = VK_NULL_HANDLE;
-        bound_sampler_set = VK_NULL_HANDLE;
+        // The overlay bound its own vertex/index buffers, viewport and scissor: forget every
+        // cached binding, not just the pipeline, or the next game draw would skip rebinding them.
+        reset_bound_state();
     }
 
     void run_postfx_passes_locked(VkImage& out_img, VkImageLayout& out_layout) {
@@ -3745,8 +3750,9 @@ void main() {
                     run_pass(post_zoom_pip, src_ds, bb_width, bb_height, zpc, sizeof(zpc));
                 }
 
-                bound_pipeline = VK_NULL_HANDLE;
-                bound_sampler_set = VK_NULL_HANDLE;
+                // Post passes bound descriptor set 0 with another layout (disturbing the game's
+                // UBO set), their viewport and scissor: forget every cached binding.
+                reset_bound_state();
                 out_img = src_img;
                 out_layout = src_layout;
             }
@@ -4258,8 +4264,11 @@ void main() {
     bool init(std::uint32_t w, std::uint32_t ht, std::string* err) {
         shutdown();
         report = D3d9DriverReport{};
+        etc2_cache_bytes = 0U;
         if (!config.texture_cache_dir.empty() && config.max_texture_cache_bytes > 0U) {
-            (void)wse::asset::prune_texture_cache_lru(config.texture_cache_dir, config.max_texture_cache_bytes);
+            etc2_cache_bytes =
+                wse::asset::prune_texture_cache_lru(config.texture_cache_dir, config.max_texture_cache_bytes)
+                    .remaining_bytes;
         }
         if (!loader || !vulkan_loader_extract_handles(*loader, h)) {
             report.ok = false;
@@ -4316,6 +4325,7 @@ void main() {
                                          : std::clamp(config.render_scale, 0.5F, 1.0F);
             active_scale.store(init_scale, std::memory_order_relaxed);
             has_last_present_tp = false;
+            has_last_present_end = false;
             last_gpu_frame_ms = -1.0;
         }
 
@@ -4755,8 +4765,9 @@ void main() {
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vk.begin_cmd_buffer(frame_cmd, &bi) != VK_SUCCESS) return false;
         frame_recording = true;
-        bound_pipeline = VK_NULL_HANDLE;
-        bound_sampler_set = VK_NULL_HANDLE;
+        // A fresh command buffer has nothing bound. A successful submit already reset the
+        // caches; a failed one (end or submit error) did not.
+        reset_bound_state();
         if (slots[cur_slot].query_pool != VK_NULL_HANDLE && !frame_has_start_ts &&
             vk.cmd_reset_query_pool != nullptr && vk.cmd_write_timestamp != nullptr) {
             vk.cmd_reset_query_pool(frame_cmd, slots[cur_slot].query_pool, 0U, 2U);
@@ -6061,8 +6072,14 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
                     etc_img.faces >= layers && etc_img.levels == out_levels &&
                     etc_img.data.size() == static_cast<std::size_t>(etc_img.faces) * etc_img.levels) {
                     from_cache = true;
+                    // LRU age: refresh the time of a file used again, at most once a day (a
+                    // metadata write for every texture of every load would cost more than it tells).
                     std::error_code touch_ec;
-                    fs::last_write_time(cache_path, fs::file_time_type::clock::now(), touch_ec);
+                    const auto now = fs::file_time_type::clock::now();
+                    const auto mt = fs::last_write_time(cache_path, touch_ec);
+                    if (!touch_ec && now - mt > std::chrono::hours(24)) {
+                        fs::last_write_time(cache_path, now, touch_ec);
+                    }
                 } else {
                     ++impl_->etc2_cache_read_failures;
                     etc_img = {};
@@ -6117,11 +6134,16 @@ void VulkanD3d9Backend::upload_texture_dds(std::uint64_t id, std::span<const std
                 }
                 if (!write_ok) {
                     ++impl_->etc2_cache_write_failures;
-                } else if (impl_->config.max_texture_cache_bytes > 0U &&
-                           ++impl_->etc2_writes_since_prune >= 32U) {
-                    impl_->etc2_writes_since_prune = 0U;
-                    (void)wse::asset::prune_texture_cache_lru(impl_->config.texture_cache_dir,
-                                                              impl_->config.max_texture_cache_bytes);
+                } else if (impl_->config.max_texture_cache_bytes > 0U) {
+                    // Count what this run adds; walk the directory (under the API lock) only when
+                    // the cap is actually passed, not every few writes.
+                    impl_->etc2_cache_bytes += encoded.size();
+                    if (impl_->etc2_cache_bytes > impl_->config.max_texture_cache_bytes) {
+                        impl_->etc2_cache_bytes =
+                            wse::asset::prune_texture_cache_lru(impl_->config.texture_cache_dir,
+                                                                impl_->config.max_texture_cache_bytes)
+                                .remaining_bytes;
+                    }
                 }
             }
         }
@@ -6549,6 +6571,7 @@ void VulkanD3d9Backend::draw_primitive(const D3d9DrawState& state, std::uint32_t
 
 bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
                                 std::uint32_t* out_width, std::uint32_t* out_height) {
+    const auto present_enter = std::chrono::steady_clock::now();
     std::uint64_t cb_frame = 0;
     double cb_inst_fps = 0.0;
     double cb_avg_fps = 0.0;
@@ -6660,7 +6683,13 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
             if (impl_->has_last_present_tp) {
                 wall_ms = std::chrono::duration<double, std::milli>(now - impl_->last_present_tp).count();
                 impl_->reported_frame_ms = wall_ms;
-                impl_->reported_cpu_ms = wall_ms;
+            }
+            if (impl_->has_last_present_end) {
+                // CPU work, not the frame interval: a capped or vsynced frame waits inside
+                // present(), and that wait must not count (ADPF tunes clocks from this number).
+                impl_->reported_cpu_ms =
+                    std::max(0.0, std::chrono::duration<double, std::milli>(present_enter - impl_->last_present_end_tp)
+                                      .count());
             }
             double frame_ms = 0.0;
             bool have_frame_ms = false;
@@ -6702,6 +6731,8 @@ bool VulkanD3d9Backend::present(std::vector<std::uint8_t>* out_rgba8,
             cb_path = impl_->report.presentation_path;
             fire_cb = static_cast<bool>(impl_->config.on_frame_presented);
         }
+        impl_->last_present_end_tp = std::chrono::steady_clock::now();
+        impl_->has_last_present_end = true;
     }
 
     if (fire_cb) {

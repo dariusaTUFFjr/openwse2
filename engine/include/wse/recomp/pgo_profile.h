@@ -22,6 +22,16 @@ struct PgoProfile {
     std::uint64_t total_samples = 0;
 };
 
+// Adds `add`'s samples to `into`. Recording appends a session to the profile already on disk, so
+// one short session (a menu, a load screen) does not replace what longer play measured.
+inline void merge_pgo_profile(PgoProfile& into, const PgoProfile& add) {
+    for (const auto& [va, count] : add.hits) {
+        if (va == 0 || count == 0) continue;
+        into.hits[va] += count;
+        into.total_samples += count;
+    }
+}
+
 [[nodiscard]] inline bool load_pgo_profile(const std::string& path, PgoProfile& out, std::string* err = nullptr) {
     out = PgoProfile{};
     std::ifstream in(path);

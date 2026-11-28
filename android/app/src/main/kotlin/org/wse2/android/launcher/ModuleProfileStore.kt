@@ -116,6 +116,10 @@ object ModuleProfileStore {
         return writeAtomicText(File(dir, CONTROLS_PREFS_FILE), obj.toString(2))
     }
 
+    /** Whether the module has its own picture settings (saved from the in-game drawer). */
+    fun hasPicturePrefs(filesDir: File, moduleName: String): Boolean =
+        File(UserStorage.moduleProfileDir(filesDir, moduleName), PICTURE_PREFS_FILE).isFile
+
     fun loadPicturePrefs(
         filesDir: File,
         moduleName: String,

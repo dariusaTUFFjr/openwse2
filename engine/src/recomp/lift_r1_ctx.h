@@ -94,6 +94,12 @@ public:
     bool fn_relaxed_tso = false;         // true when this function omits per-access TSO fences
     bool rbp_is_frame_ptr = false;       // true when `rbp` is a stable frame pointer in this function
     bool is_fast_abi = false;            // true when lifting a register-passing `wse_fast_<va>` body
+    // GPRs a register-passing body receives and returns: rax, rcx, rdx, rsp, r8-r11.
+    static constexpr std::uint16_t kFastGprMask = (1U << 0) | (1U << 1) | (1U << 2) | (1U << 4) | (1U << 8) |
+                                                  (1U << 9) | (1U << 10) | (1U << 11);
+    // Whether flush()/reload() carry this register (a fast body leaves the caller's others alone).
+    [[nodiscard]] bool owns_gpr(int r) const;
+    [[nodiscard]] bool owns_xmm(int r) const;
     std::uint16_t stack_reg_mask = (1U << 4);  // bitmask of GPRs currently holding stack-derived pointers
     // Operand `i` as an iN of its size (immediates are truncated/sign-extended per Zydis).
     llvm::Value* read(const DInsn& d, int i);

@@ -932,7 +932,10 @@ void test_r9_features(const char* dir) {
         ImageInfo info;
         info.base = kImgBase;
         info.readonly_ranges.push_back({kImgBase + 0x2000U, kImgBase + 0x3000U});
-        info.relaxed_tso = false;  // even under strict TSO, .rdata + rbp + lea stay plain!
+        // Strict TSO: `rsp` operands and .rdata loads stay plain; rbp/lea-derived pointers are only
+        // treated as stack when relaxation is on. This checks the function translates and links
+        // (its .rdata VA is not mapped here, so it is not run).
+        info.relaxed_tso = false;
         R1Translator tr(info);
         tr.declare({kFnVa});
         std::string why;
@@ -960,7 +963,7 @@ void test_r9_features(const char* dir) {
             stack.prepare(s);
             const std::uint64_t ro_addr = reinterpret_cast<std::uintptr_t>(img.data() + 0x2000U);
             (void)ro_addr;
-            // Verify fast-ABI table is also exported (Wait: this function uses RBP so it stays CpuState* ABI).
+            // It uses rbp, so it stays on the CpuState* ABI and is found in the ordinary table.
             expect(rt.find(kFnVa) != nullptr, "R9 Wave 1: function registered");
         }
     }
@@ -1110,6 +1113,62 @@ void test_r9_features(const char* dir) {
             s.gpr[2] = 0xDEADBEEFU;
             expect(rt2.run(s, kVoidLeafVa) && out_edx == 0xDEADBEEFU && s.gpr[0] == kRaxSentinel,
                    "R9 Wave 2: void fast-ABI callee preserves RAX via wse_fn_<va> thunk");
+        }
+
+        // Regression test: a fast-ABI leaf whose 128/64 `div` takes the runtime path
+        // (`RuntimeHooks::div128` flushes and reloads) must not write the registers the fast ABI
+        // does not pass. Through the `wse_fn_<va>` thunk the caller reloads the whole CpuState, so
+        // a flushed placeholder would zero the caller's rbx / rsi / xmm5.
+        constexpr std::uint64_t kDivBase = 0x400000ULL;
+        constexpr std::uint64_t kDivLeafVa = kDivBase + 0x1000U;
+        std::vector<std::uint8_t> img3(0x2000U, 0xCCU);
+        // 0x401000: mov rax, rcx; mov rdx, r8; div r9; ret
+        const std::uint8_t div_bytes[] = {0x48, 0x89, 0xC8, 0x4C, 0x89, 0xC2, 0x49, 0xF7, 0xF1, 0xC3};
+        std::memcpy(img3.data() + 0x1000U, div_bytes, sizeof(div_bytes));
+        const ImageView view3(img3.data(), kDivBase, img3.size(), kDivBase + 0x1000U, kDivBase + 0x1100U);
+        const std::set<std::uint64_t> entries3{kDivLeafVa};
+        Discoverer disc3(view3);
+        ImageInfo info3;
+        info3.base = kDivBase;
+        const DFunction df_div = disc3.discover(kDivLeafVa, entries3);
+        expect(is_fast_abi_eligible(df_div, info3), "R9 fast ABI: 128/64 div leaf is eligible");
+        info3.fast_abi_vas.insert(kDivLeafVa);
+        R1Translator tr3(info3);
+        tr3.declare({kDivLeafVa});
+        std::string why3;
+        expect(tr3.lift(df_div, &why3), "R9 fast ABI: lift div leaf");
+        std::vector<char> obj3;
+        std::string err3;
+        expect(tr3.emit_object(2, obj3, nullptr, &err3) && !obj3.empty(), "R9 fast ABI: emit div leaf");
+        const std::string o3 = std::string(dir) + "/r9_div_leaf.o";
+        const std::string so3 = std::string(dir) + "/r9_div_leaf.so";
+        std::ofstream(o3, std::ios::binary).write(obj3.data(), static_cast<std::streamsize>(obj3.size()));
+        std::string log3;
+        expect(link_shared_object({o3}, so3, &log3), "R9 fast ABI: link div leaf");
+        LoadedCode c_d;
+        void* h_d = dlopen(so3.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h_d != nullptr, "R9 fast ABI: dlopen div leaf");
+        if (h_d != nullptr) {
+            c_d.adopt_handle(h_d);
+            Runtime rt3;
+            rt3.add_table(static_cast<const FnRow*>(c_d.sym("wse_fn_table")),
+                          static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c_d.sym("wse_fn_table_count"))));
+            constexpr std::uint64_t kRbx = 0x0BADF00D0BADF00DULL;
+            constexpr std::uint64_t kRsi = 0x5151515151515151ULL;
+            stack.prepare(s);
+            s.gpr[1] = 0;  // low half of the dividend
+            s.gpr[8] = 1;  // high half: rdx:rax = 2^64, so the runtime divides
+            s.gpr[9] = 4;  // divisor
+            s.gpr[3] = kRbx;
+            s.gpr[6] = kRsi;
+            std::memset(s.xmm[5], 0x5A, sizeof(s.xmm[5]));
+            std::uint8_t want_xmm5[16];
+            std::memset(want_xmm5, 0x5A, sizeof(want_xmm5));
+            const bool ran = rt3.run(s, kDivLeafVa);
+            expect(ran && s.gpr[0] == (1ULL << 62) && s.gpr[2] == 0,
+                   "R9 fast ABI: 128/64 div through wse_fn_<va> gives 2^64 / 4");
+            expect(s.gpr[3] == kRbx && s.gpr[6] == kRsi && std::memcmp(s.xmm[5], want_xmm5, 16) == 0,
+                   "R9 fast ABI: div128 inside a fast leaf keeps the caller's rbx, rsi and xmm5");
         }
     }
 

@@ -840,9 +840,11 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
             const std::lock_guard<std::mutex> lock(g_vk_m);
             bk = g_vk_backend;
             if (g_adpf_session && bk) {
+                // ADPF wants the work duration, not the frame interval: a frame that waits for
+                // vsync or the frame cap would always look exactly on target.
                 const auto ft = bk->last_frame_timings();
-                if (ft.frame_ms > 0.0) {
-                    g_adpf_session->report_actual(static_cast<std::int64_t>(ft.frame_ms * 1e6));
+                if (ft.cpu_ms > 0.0) {
+                    g_adpf_session->report_actual(static_cast<std::int64_t>(ft.cpu_ms * 1e6));
                 }
             }
         }

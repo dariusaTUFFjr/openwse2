@@ -189,9 +189,8 @@ class R4StartupRunner private constructor(private val app: Application) {
                         val size = if (c.isNull(2)) -1L else c.getLong(2)
                         val mtime = if (c.isNull(3)) -1L else c.getLong(3)
                         val stamp = "$name/$size/$mtime"
-                        val pgoMissingHot = UserStorage.pgoProfileFile(app.filesDir).isFile &&
-                            !File(r4Dir, "so/exe_hot_0.so").isFile
-                        val alreadyImported = prefs.getString(PREF_IMPORTED, null) == stamp && !pgoMissingHot
+                        val wasImported = prefs.getString(PREF_IMPORTED, null) == stamp
+                        val alreadyImported = wasImported && !importedPgoPartsMissing()
                         val alreadyDeclined = prefs.getString(PREF_DECLINED_ZIP, null) == stamp
                         if (!alreadyImported && !alreadyDeclined) {
                             pending = PendingPreparedZip(
@@ -210,6 +209,34 @@ class R4StartupRunner private constructor(private val app: Application) {
         } catch (_: Throwable) {
             null
         }
+    }
+
+    // An imported zip is offered again only when its PGO parts are gone (a run without the
+    // profile removed them) while the profile on the phone is still the one that zip brought:
+    // that profile and those parts belong together. A profile recorded on the phone since then
+    // is never replaced by re-importing, and a zip without a profile is never offered again.
+    private fun importedPgoPartsMissing(): Boolean {
+        val importedSha = prefs.getString(PREF_IMPORTED_PGO_SHA, null).orEmpty()
+        if (importedSha.isEmpty()) return false
+        if (File(r4Dir, "so/exe_hot_0.so").isFile) return false
+        val profile = UserStorage.pgoProfileFile(app.filesDir)
+        if (!profile.isFile) return false
+        val currentSha = try {
+            PreparedZipVerifier.sha256Hex(profile.readBytes())
+        } catch (_: Throwable) {
+            return false
+        }
+        return currentSha.equals(importedSha, ignoreCase = true)
+    }
+
+    private fun rememberImportedZip(stamp: String, result: PreparedZipImportResult) {
+        val edit = prefs.edit().putString(PREF_IMPORTED, stamp).remove(PREF_DECLINED_ZIP)
+        if (result.pgoSha256.isNotEmpty()) {
+            edit.putString(PREF_IMPORTED_PGO_SHA, result.pgoSha256)
+        } else {
+            edit.remove(PREF_IMPORTED_PGO_SHA)
+        }
+        edit.apply()
     }
 
     fun declinePreparedZip(zip: PendingPreparedZip) {
@@ -248,7 +275,7 @@ class R4StartupRunner private constructor(private val app: Application) {
                 PreparedZipImportResult(ok = false, error = t.message ?: t.javaClass.simpleName)
             }
             if (result.ok) {
-                prefs.edit().putString(PREF_IMPORTED, zip.stamp).remove(PREF_DECLINED_ZIP).apply()
+                rememberImportedZip(zip.stamp, result)
                 importNote("Verified and imported ${result.partsImported} parts and ${result.texturesImported} textures from ${zip.fileName}.")
                 refreshAllStorageSizes()
             } else {
@@ -603,7 +630,7 @@ class R4StartupRunner private constructor(private val app: Application) {
             importNote("Refused ${pending.fileName}: ${res.error}")
             return 0
         }
-        prefs.edit().putString(PREF_IMPORTED, pending.stamp).remove(PREF_DECLINED_ZIP).apply()
+        rememberImportedZip(pending.stamp, res)
         importNote("Verified and imported ${res.partsImported} parts and ${res.texturesImported} converted textures from ${pending.fileName}.")
         return res.partsImported
     }
@@ -880,6 +907,7 @@ class R4StartupRunner private constructor(private val app: Application) {
         private const val PREVIOUS_REPORT = "report.previous.txt"
         private const val IMPORT_NOTE = "import.txt"
         private const val PREF_IMPORTED = "imported_zip"  // the last PC zip imported (name/size/time)
+        private const val PREF_IMPORTED_PGO_SHA = "imported_zip_pgo_sha256"  // its wse_pgo.txt, if any
         private const val PREF_DECLINED_ZIP = "declined_zip"
         private val PREPARED_ZIP = Regex("""(?i)wse2-prepared.*\.zip""")
         private val PREPARED_PART = Regex("""(exe|lua5164)_w\d+\.(so|key)""")

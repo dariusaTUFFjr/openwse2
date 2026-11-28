@@ -125,6 +125,31 @@ class Wave2To4UnitTest {
     }
 
     @Test
+    fun saveManager_deleteKeepsTheSaveRestorable() {
+        val filesDir = tmp.newFolder("saves_delete")
+        val target = File(SaveManager.primarySaveDir(filesDir, "Native"), "sg01.sav")
+        assertTrue(SaveManager.writeAtomicWithBackup(target, makeValidSaveBytes("Slot 2", "Ymira", 7, 3)))
+
+        assertTrue(SaveManager.deleteSlotKeepingBackup(target))
+        assertFalse(target.exists())
+
+        // The deleted slot is still listed, with its backup, so the player can bring it back.
+        val listed = SaveManager.listSaves(filesDir, "Native")
+        assertEquals(1, listed.size)
+        val slot = listed.first()
+        assertTrue(slot.deleted)
+        assertEquals("sg01.sav", slot.fileName)
+        assertEquals(1, slot.backups.size)
+        assertEquals("Ymira", slot.header.playerName)
+
+        val (ok, _) = SaveManager.restoreBackup(slot.backups.first().file, slot.file)
+        assertTrue(ok)
+        assertTrue(target.isFile)
+        assertEquals(7, SaveManager.inspectSaveFile(target).playerLevel)
+        assertFalse(SaveManager.listSaves(filesDir, "Native").first().deleted)
+    }
+
+    @Test
     fun preparedZipVerifier_acceptsValidAndRefusesMissingOrTamperedManifest() {
         val soDir = tmp.newFolder("so_dir")
         val texDir = tmp.newFolder("tex_dir")

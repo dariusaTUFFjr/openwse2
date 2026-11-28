@@ -206,7 +206,11 @@ llvm::Value* Ctx::state_ptr(std::size_t offset) {
 llvm::Value* Ctx::address(const DInsn& d, const ZydisDecodedOperand& o) {
     const bool no_seg = o.mem.segment != ZYDIS_REGISTER_FS && o.mem.segment != ZYDIS_REGISTER_GS;
     const int base_idx = gpr_index(o.mem.base);
-    last_address_stack = image.relaxed_tso && no_seg && base_idx >= 0 && (stack_reg_mask & (1U << base_idx)) != 0;
+    // `rsp`-based operands are the thread's own stack in every mode (as before R9); registers
+    // derived from it (`lea`/`mov` copies, a frame-pointer `rbp`) count too when relaxation is on.
+    last_address_stack =
+        no_seg && base_idx >= 0 &&
+        (base_idx == 4 || (image.relaxed_tso && (stack_reg_mask & (1U << base_idx)) != 0));
     last_address_readonly = false;
     if (no_seg && o.mem.base == ZYDIS_REGISTER_RIP && o.mem.index == ZYDIS_REGISTER_NONE) {
         const std::uint64_t target =
@@ -264,6 +268,10 @@ llvm::Value* Ctx::load(llvm::Value* addr64, unsigned bits_in, Mem kind) {
     if (kind != Mem::shared && (stack || is_ro || fn_relaxed_tso)) {
         llvm::LoadInst* l = B.CreateLoad(t, host_ptr(addr64));
         l->setAlignment(llvm::Align(1));
+        // A relaxed shared load is still a load the x86 code performs every time: volatile keeps
+        // LLVM from hoisting it out of a loop (a spin on a flag another thread sets would never
+        // end) while emitting the same plain LDR with no barrier.
+        if (!stack && !is_ro) l->setVolatile(true);
         return l;
     }
     if (bits_in == 8) {
@@ -311,6 +319,8 @@ llvm::Value* Ctx::load_vec128(llvm::Value* addr64, Mem kind) {
     l->setAlignment(llvm::Align(1));
     if (kind == Mem::shared || (!stack && !is_ro && !fn_relaxed_tso)) {
         B.CreateFence(llvm::AtomicOrdering::Acquire);
+    } else if (!stack && !is_ro) {
+        l->setVolatile(true);  // relaxed shared load: see `load()`
     }
     return l;
 }
@@ -323,6 +333,9 @@ void Ctx::store(llvm::Value* addr64, llvm::Value* v, Mem kind) {
     if (kind != Mem::shared && (stack || fn_relaxed_tso)) {
         llvm::StoreInst* s = B.CreateStore(v, host_ptr(addr64));
         s->setAlignment(llvm::Align(1));
+        // A relaxed shared store happens where the x86 code does it: volatile keeps LLVM from
+        // sinking it out of a loop (a progress counter another thread polls), no barrier added.
+        if (!stack) s->setVolatile(true);
         return;
     }
     if (!v->getType()->isIntegerTy()) {
@@ -430,11 +443,24 @@ void Ctx::write(const DInsn& d, int i, llvm::Value* v) {
     }
 }
 
+// A register-passing (`wse_fast_<va>`) body owns only the registers that ABI passes: rax, rcx,
+// rdx, rsp, r8-r11 and xmm0-xmm3 (`is_fast_abi_eligible` rejects any other). Its other slots are
+// placeholders, never the caller's values, so a flush inside it (`div128`, a fault) must not
+// write them: the caller's rbx/rsi/rdi/rbp/r12-r15/xmm4-15 may live in the CpuState and would be
+// clobbered for a caller that reloads the whole state (through the `wse_fn_<va>` thunk).
+bool Ctx::owns_gpr(int r) const { return !is_fast_abi || ((kFastGprMask >> r) & 1U) != 0U; }
+bool Ctx::owns_xmm(int r) const { return !is_fast_abi || r < 4; }
+
 void Ctx::flush() {
     for (int r = 0; r < 16; ++r) {
-        B.CreateStore(B.CreateLoad(B.getInt64Ty(), gpr_slot[r]), state_ptr(cpu_offset::gpr + 8U * r));
-        llvm::StoreInst* s = B.CreateStore(B.CreateLoad(v2i64(), xmm_slot[r]), state_ptr(cpu_offset::xmm + 16U * r));
-        s->setAlignment(llvm::Align(16));
+        if (owns_gpr(r)) {
+            B.CreateStore(B.CreateLoad(B.getInt64Ty(), gpr_slot[r]), state_ptr(cpu_offset::gpr + 8U * r));
+        }
+        if (owns_xmm(r)) {
+            llvm::StoreInst* s =
+                B.CreateStore(B.CreateLoad(v2i64(), xmm_slot[r]), state_ptr(cpu_offset::xmm + 16U * r));
+            s->setAlignment(llvm::Align(16));
+        }
     }
     for (int k = 0; k < kFlagCount; ++k) {
         B.CreateStore(B.CreateZExt(B.CreateLoad(B.getInt1Ty(), flag_slot[k]), B.getInt8Ty()),
@@ -444,10 +470,14 @@ void Ctx::flush() {
 
 void Ctx::reload() {
     for (int r = 0; r < 16; ++r) {
-        B.CreateStore(B.CreateLoad(B.getInt64Ty(), state_ptr(cpu_offset::gpr + 8U * r)), gpr_slot[r]);
-        llvm::LoadInst* x = B.CreateLoad(v2i64(), state_ptr(cpu_offset::xmm + 16U * r));
-        x->setAlignment(llvm::Align(16));
-        B.CreateStore(x, xmm_slot[r]);
+        if (owns_gpr(r)) {
+            B.CreateStore(B.CreateLoad(B.getInt64Ty(), state_ptr(cpu_offset::gpr + 8U * r)), gpr_slot[r]);
+        }
+        if (owns_xmm(r)) {
+            llvm::LoadInst* x = B.CreateLoad(v2i64(), state_ptr(cpu_offset::xmm + 16U * r));
+            x->setAlignment(llvm::Align(16));
+            B.CreateStore(x, xmm_slot[r]);
+        }
     }
     for (int k = 0; k < kFlagCount; ++k) {
         llvm::Value* byte = B.CreateLoad(B.getInt8Ty(), state_ptr(kFlagOffset[k]));
@@ -474,8 +504,13 @@ void Ctx::emit_unsupported(std::uint64_t va, const std::string& what) {
     llvm::Constant* text = B.CreateGlobalStringPtr(what, "why");
     call_hook(offsetof(RuntimeHooks, unsupported), {B.getInt64(va), text}, {B.getInt64Ty(), ptr()});
     if (is_fast_abi) {
-        llvm::Value* ret = llvm::ConstantAggregateZero::get(F->getReturnType());
-        ret = B.CreateInsertValue(ret, B.getInt64(va), {12});
+        // Hand back the registers as they are (a zeroed aggregate would set the caller's rsp to 0)
+        // and the rip the fault left (`kFaultRip`), so the caller's return check stays quiet.
+        static constexpr int kRet[8] = {0, 1, 2, 8, 9, 10, 11, 4};
+        llvm::Value* ret = llvm::UndefValue::get(F->getReturnType());
+        for (unsigned i = 0; i < 8U; ++i) ret = B.CreateInsertValue(ret, gpr64(kRet[i]), {i});
+        for (unsigned i = 0; i < 4U; ++i) ret = B.CreateInsertValue(ret, xmm_vec(static_cast<int>(i)), {8U + i});
+        ret = B.CreateInsertValue(ret, B.CreateLoad(B.getInt64Ty(), state_ptr(cpu_offset::rip)), {12U});
         B.CreateRet(ret);
     } else {
         B.CreateRetVoid();  // the hook does not return in practice; returning keeps the IR valid

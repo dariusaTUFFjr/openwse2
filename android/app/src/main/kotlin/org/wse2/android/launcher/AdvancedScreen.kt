@@ -85,6 +85,7 @@ fun AdvancedScreen(
         !state.scanState.inProgress
     var showLicencesDialog by remember { mutableStateOf(false) }
     var showCrashReportDialog by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf<ConfirmClear?>(null) }
 
     Box(
         modifier = modifier
@@ -376,7 +377,7 @@ fun AdvancedScreen(
                     },
                     showDivider = true,
                     enabled = clearCacheEnabled,
-                    onClick = onClearSoCache
+                    onClick = { confirmClear = ConfirmClear.TRANSLATED_CODE }
                 )
                 WseListRow(
                     title = "Converted textures",
@@ -432,7 +433,7 @@ fun AdvancedScreen(
                     },
                     showDivider = true,
                     enabled = clearCacheEnabled,
-                    onClick = onClearSaveBackups
+                    onClick = { confirmClear = ConfirmClear.SAVE_BACKUPS }
                 )
                 // Saves the report as a file the player picks, during a run too (the user's
                 // request, 2026-11-21: keep the phone's report when finishing on the PC).
@@ -660,7 +661,36 @@ fun AdvancedScreen(
             onDismissRequest = { showCrashReportDialog = false }
         )
     }
+
+    when (confirmClear) {
+        ConfirmClear.TRANSLATED_CODE -> WseDialog(
+            title = "Free up translated game code?",
+            text = "The game's code was translated for your phone, which can take a long time. " +
+                "If you free this space, it is translated again the next time you play " +
+                "(or imported again from a zip prepared on your PC).",
+            confirm = WseDialogAction("Free up") {
+                confirmClear = null
+                onClearSoCache()
+            },
+            dismiss = WseDialogAction("Keep") { confirmClear = null },
+            onDismissRequest = { confirmClear = null }
+        )
+        ConfirmClear.SAVE_BACKUPS -> WseDialog(
+            title = "Delete all save backups?",
+            text = "This permanently deletes the older copies of every save, including saves you " +
+                "deleted in the Save Manager. Your current saves stay.",
+            confirm = WseDialogAction("Delete backups") {
+                confirmClear = null
+                onClearSaveBackups()
+            },
+            dismiss = WseDialogAction("Keep") { confirmClear = null },
+            onDismissRequest = { confirmClear = null }
+        )
+        null -> Unit
+    }
 }
+
+private enum class ConfirmClear { TRANSLATED_CODE, SAVE_BACKUPS }
 
 @Composable
 private fun rememberFontLicencesText(): String {

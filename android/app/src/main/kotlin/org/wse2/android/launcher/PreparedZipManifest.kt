@@ -26,7 +26,9 @@ data class PreparedZipImportResult(
     val ok: Boolean,
     val partsImported: Int = 0,
     val texturesImported: Int = 0,
-    val error: String = ""
+    val error: String = "",
+    // SHA-256 of the `wse_pgo.txt` the zip installed ("" when it had none).
+    val pgoSha256: String = ""
 )
 
 /**
@@ -228,7 +230,12 @@ object PreparedZipVerifier {
             return PreparedZipImportResult(
                 ok = true,
                 partsImported = partsCommitted,
-                texturesImported = texturesCommitted
+                texturesImported = texturesCommitted,
+                pgoSha256 = if (stagedPgoBytes != null && pgoProfileDest != null) {
+                    extractedHashes[PGO_PROFILE_NAME].orEmpty()
+                } else {
+                    ""
+                }
             )
         } catch (t: Throwable) {
             return PreparedZipImportResult(ok = false, error = t.message ?: t.javaClass.simpleName)

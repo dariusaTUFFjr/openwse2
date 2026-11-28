@@ -106,11 +106,12 @@ data class RglConfigState(
     val extraEntries: Map<String, String> = emptyMap()
 ) {
     /**
-     * Approximate soldier count: Warband's standard 0.0..1.0 maps 30..150, and WSE2 extends
-     * `battle_size` above 1.0 up to 1,000+ troops (`docs/PLATFORM_PLAN.md` "P14").
+     * Approximate soldier count using Warband's standard 30..150 scale. WSE2's larger battles
+     * come from `iBattleSizeMax` in its own `rgl_config.ini` (with `fBattleSize` still 0..1), not
+     * from a `battle_size` above 1.0 here: WSE2 v1.1.5.6 does not read `rgl_config.txt`.
      */
     val battleSizeTroops: Int
-        get() = (30 + (battleSize.coerceIn(0f, 8.0834f) * 120f).roundToInt()).coerceIn(30, 1000)
+        get() = (30 + (battleSize.coerceIn(0f, 1f) * 120f).roundToInt()).coerceIn(30, 150)
 
     fun withQualityPreset(presetKey: String): RglConfigState = when (presetKey) {
         "low" -> copy(
@@ -340,7 +341,7 @@ object RglConfigCodec {
             ),
             verboseDamage = parseBool(parsed["verbose_damage"], defaults.verboseDamage),
             verboseShotDifficulty = parseBool(parsed["verbose_shot_difficulty"], defaults.verboseShotDifficulty),
-            battleSize = parseFloat(parsed["battle_size"], defaults.battleSize, 0f, 8.0834f),
+            battleSize = parseFloat(parsed["battle_size"], defaults.battleSize, 0f, 1f),
             attackDirectionControl = parseInt(parsed["attack_direction_control"], defaults.attackDirectionControl, 0, 3),
             defendDirectionControl = parseInt(parsed["defend_direction_control"], defaults.defendDirectionControl, 0, 3),
             lanceControl = parseInt(parsed["lance_control"], defaults.lanceControl, 0, 2),

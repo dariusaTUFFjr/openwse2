@@ -34,7 +34,9 @@ data class SaveSlotEntry(
     val sizeBytes: Long,
     val lastModifiedMs: Long,
     val header: SaveHeaderInfo,
-    val backups: List<SaveBackupEntry>
+    val backups: List<SaveBackupEntry>,
+    // The save itself is gone (deleted) but its backups are still there to restore.
+    val deleted: Boolean = false
 )
 
 /**
@@ -45,6 +47,16 @@ object SaveManager {
     private const val MIN_SAVE_VER = 802
     private const val MAX_SAVE_VER = 1174
     private const val MIRROR_PREFS = "wse2_save_mirror_sync"
+    private val BACKUP_NAME = Regex("""(.+\.sav)\.bak[1-3]""", RegexOption.IGNORE_CASE)
+
+    /**
+     * Forgets which saves were already copied to the mirror. Called when the mirror folder
+     * changes or is turned off: the remembered copies were made into the old folder, and a new
+     * folder must receive every save, not only the ones changed since.
+     */
+    fun resetMirrorSyncState(context: Context) {
+        context.getSharedPreferences(MIRROR_PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+    }
 
     fun savegameDirs(filesDir: File, moduleName: String): List<File> {
         UserStorage.migrateLegacyUserDirIfNeeded(filesDir)
@@ -160,8 +172,54 @@ object SaveManager {
                     backups = backups
                 )
             }
+            // A slot whose save was deleted keeps its backups: list it so they can be restored.
+            for (f in files) {
+                val m = BACKUP_NAME.matchEntire(f.name) ?: continue
+                val saveName = m.groupValues[1]
+                val lower = saveName.lowercase()
+                if (lower == "new_game.sav" || lower == "last_savegame_backup.sav") continue
+                if (seen.containsKey(lower)) continue
+                val backups = (1..3).mapNotNull { idx ->
+                    val bf = File(dir, "$saveName.bak$idx")
+                    if (bf.isFile) SaveBackupEntry(bf, idx, bf.length(), bf.lastModified()) else null
+                }
+                if (backups.isEmpty()) continue
+                val newest = backups.first()
+                seen[lower] = SaveSlotEntry(
+                    moduleName = mod,
+                    file = File(dir, saveName),
+                    fileName = saveName,
+                    sizeBytes = 0L,
+                    lastModifiedMs = backups.maxOf { it.lastModifiedMs },
+                    header = inspectSaveFile(newest.file),
+                    backups = backups,
+                    deleted = true
+                )
+            }
         }
         return seen.values.sortedByDescending { it.lastModifiedMs }
+    }
+
+    /**
+     * Deletes a save the way the game's own saves are replaced: the current file becomes `.bak1`
+     * (older backups move down, the oldest drops off), so a mistaken delete can be restored.
+     */
+    fun deleteSlotKeepingBackup(target: File): Boolean {
+        if (!target.isFile) return false
+        return try {
+            val b1 = File(target.parentFile, "${target.name}.bak1")
+            val b2 = File(target.parentFile, "${target.name}.bak2")
+            val b3 = File(target.parentFile, "${target.name}.bak3")
+            if (b3.exists()) b3.delete()
+            if (b2.exists()) b2.renameTo(b3)
+            if (b1.exists()) b1.renameTo(b2)
+            target.renameTo(b1) || run {
+                target.copyTo(b1, overwrite = true)
+                target.delete()
+            }
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     fun backupBytesUsed(filesDir: File): Long {

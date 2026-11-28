@@ -738,9 +738,15 @@ struct SampleRange {
 std::vector<SampleRange> g_pgo_ranges;
 std::unique_ptr<std::atomic<std::uint64_t>[]> g_pgo_hits;
 std::string g_pgo_out_path;
+PgoProfile g_pgo_baseline;  // what the output file held before this run (samples accumulate)
 
 void init_pgo_sampler(const Loaded& lx, const std::string& out_path) {
     if (out_path.empty()) return;
+    g_pgo_baseline = PgoProfile{};
+    if (std::error_code bec; fs::is_regular_file(out_path, bec)) {
+        PgoProfile prev;
+        if (load_pgo_profile(out_path, prev, nullptr)) g_pgo_baseline = std::move(prev);
+    }
     std::vector<SampleRange> ranges;
     auto index_tables = [&](const auto& tables) {
         for (const auto& [rows, n] : tables) {
@@ -807,15 +813,20 @@ std::mutex g_pgo_flush_m;
 void flush_pgo_profile() {
     const std::lock_guard<std::mutex> lock(g_pgo_flush_m);
     if (g_pgo_out_path.empty() || g_pgo_ranges.empty() || !g_pgo_hits) return;
-    PgoProfile prof;
+    PgoProfile session;
     for (std::size_t i = 0; i < g_pgo_ranges.size(); ++i) {
         const std::uint64_t c = g_pgo_hits[i].load(std::memory_order_relaxed);
         if (c > 0) {
-            prof.hits[g_pgo_ranges[i].va] += c;
-            prof.total_samples += c;
+            session.hits[g_pgo_ranges[i].va] += c;
+            session.total_samples += c;
         }
     }
-    if (prof.total_samples > 0) (void)save_pgo_profile(g_pgo_out_path, prof, nullptr);
+    if (session.total_samples == 0) return;
+    // This session's counts on top of the file as it was at start (flushes repeat, so the
+    // baseline is never the file just written).
+    PgoProfile prof = g_pgo_baseline;
+    merge_pgo_profile(prof, session);
+    (void)save_pgo_profile(g_pgo_out_path, prof, nullptr);
 }
 
 // The last calls, oldest first. Lock-free, so a crash handler can call it.

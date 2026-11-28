@@ -11,10 +11,15 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import org.wse2.android.launcher.theme.LocalWseColors
 import org.wse2.android.launcher.ui.WseContentDialog
+import org.wse2.android.launcher.ui.WseDialog
 import org.wse2.android.launcher.ui.WseDialogAction
 import org.wse2.android.launcher.ui.WseListRow
 import org.wse2.android.launcher.ui.WseTextButton
@@ -38,6 +43,7 @@ fun SaveManagerDialog(
 ) {
     val colors = LocalWseColors.current
     val dateFmt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+    var confirmDelete by remember { mutableStateOf<SaveSlotEntry?>(null) }
 
     WseContentDialog(
         title = "Save Manager ($moduleName)",
@@ -103,23 +109,31 @@ fun SaveManagerDialog(
                         } else {
                             slot.fileName
                         }
-                        val sub = "${slot.fileName} · ${slot.sizeBytes / 1024} KB · " +
-                            dateFmt.format(Date(slot.lastModifiedMs)) +
-                            if (slot.backups.isNotEmpty()) " · ${slot.backups.size} backup(s)" else ""
+                        val sub = if (slot.deleted) {
+                            "${slot.fileName} · deleted · ${slot.backups.size} backup(s) to restore"
+                        } else {
+                            "${slot.fileName} · ${slot.sizeBytes / 1024} KB · " +
+                                dateFmt.format(Date(slot.lastModifiedMs)) +
+                                if (slot.backups.isNotEmpty()) " · ${slot.backups.size} backup(s)" else ""
+                        }
                         WseListRow(
                             title = headline,
                             supporting = sub,
                             showDivider = false
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            WseTextButton(text = "Export", onClick = { onExportSave(slot) })
+                            if (!slot.deleted) {
+                                WseTextButton(text = "Export", onClick = { onExportSave(slot) })
+                            }
                             slot.backups.firstOrNull()?.let { latest ->
                                 WseTextButton(
                                     text = "Restore backup",
                                     onClick = { onRestoreBackup(slot, latest) }
                                 )
                             }
-                            WseTextButton(text = "Delete", onClick = { onDeleteSave(slot) })
+                            if (!slot.deleted) {
+                                WseTextButton(text = "Delete", onClick = { confirmDelete = slot })
+                            }
                         }
                         LauncherSectionDivider()
                     }
@@ -127,4 +141,19 @@ fun SaveManagerDialog(
             }
         }
     )
+
+    // After the Save Manager so it opens on top of it.
+    confirmDelete?.let { slot ->
+        WseDialog(
+            title = "Delete ${slot.fileName}?",
+            text = "The save is moved to its backups, so you can restore it here until you free up " +
+                "save backups in Advanced.",
+            confirm = WseDialogAction("Delete") {
+                confirmDelete = null
+                onDeleteSave(slot)
+            },
+            dismiss = WseDialogAction("Keep") { confirmDelete = null },
+            onDismissRequest = { confirmDelete = null }
+        )
+    }
 }

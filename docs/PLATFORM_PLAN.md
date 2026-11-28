@@ -387,9 +387,10 @@ screens into the player-facing shell for real gameplay on `arm64-v8a` phones (An
   newer WSE2 build hits an unshimmed import.
 - **Frame-time HUD & WSE2 battle-size limits:** Expand the optional FPS overlay to show per-frame
   CPU time, GPU time, and Android thermal tier (`PowerManager`) so R5/R8/R9 sustained targets can be
-  measured on device. Update the Settings `rgl_config.txt` / WSE2 battle-size editor so high-end
-  devices can configure WSE2's 1,000+ troop battle limits instead of clamping to vanilla's 150-troop
-  cap (`0.0..1.0`).
+  measured on device. Update the Settings battle-size editor so high-end devices can configure
+  WSE2's larger battles: WSE2 v1.1.5.6 reads `Documents/Mount&Blade Warband WSE2/rgl_config.ini`
+  (`fBattleSize` stays `0.0..1.0`; the troop range is `iBattleSizeMin` / `iBattleSizeMax`) and does
+  not read `rgl_config.txt`, so the editor must write the `.ini`.
 
 | Unit | What | Depends on | Done when |
 | --- | --- | --- | --- |

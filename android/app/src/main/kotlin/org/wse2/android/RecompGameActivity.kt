@@ -285,10 +285,11 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             addView(Button(this@RecompGameActivity).apply {
                 text = "Reset"
                 setOnClickListener {
+                    // Only the buttons on screen go back to the defaults: Save stores them,
+                    // Cancel brings back the layout from before editing (and its saved file).
                     if (R4Native.loadError == null) {
                         R4Native.nativeResetTouchLayout()
                     }
-                    ModuleProfileStore.clearTouchLayout(filesDir, activeModule)
                 }
             })
             addView(Button(this@RecompGameActivity).apply {

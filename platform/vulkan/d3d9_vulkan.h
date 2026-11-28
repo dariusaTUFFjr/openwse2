@@ -78,7 +78,10 @@ struct VulkanD3d9Config {
                        std::string_view presentation_path)>
         on_frame_presented{};
     std::string texture_cache_dir{};       // optional on-disk ETC2 cache directory (empty = no disk cache)
-    std::uint64_t max_texture_cache_bytes = 512ULL * 1024ULL * 1024ULL;  // LRU cap for texture_cache_dir (0 = uncapped)
+    // LRU cap for texture_cache_dir (0 = uncapped). The PC-prepared pack alone is ~620 MB for
+    // Native (every size cap) and larger mods convert more, so the cap must sit well above a
+    // module's working set or each start deletes textures the next load converts again.
+    std::uint64_t max_texture_cache_bytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
     bool prefer_etc2 = true;               // transcode DDS to ETC2 when BC is not used and ETC2 is supported
     bool simulate_etc2 = false;            // PC check: transcode to ETC2, decode back to RGBA8 and upload RGBA8
     unsigned etc2_threads = 0U;            // 0 = min(4, hardware_concurrency)

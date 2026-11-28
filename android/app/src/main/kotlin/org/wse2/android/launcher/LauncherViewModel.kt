@@ -556,6 +556,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     fun onSaveMirrorPicked(uri: Uri) {
         val label = quickTreeDisplayName(uri)
+        if (prefs().getString(KEY_SAVE_MIRROR_URI, null) != uri.toString()) {
+            SaveManager.resetMirrorSyncState(app)  // a new folder gets every save
+        }
         prefs().edit()
             .putString(KEY_SAVE_MIRROR_URI, uri.toString())
             .putString(KEY_SAVE_MIRROR_LABEL, label)
@@ -572,6 +575,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             .remove(KEY_SAVE_MIRROR_URI)
             .remove(KEY_SAVE_MIRROR_LABEL)
             .apply()
+        SaveManager.resetMirrorSyncState(app)
         refreshSaveManager(statusMessage = "Auto-sync save mirror turned off.")
     }
 
@@ -606,10 +610,15 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     fun deleteSaveSlot(slot: SaveSlotEntry) {
         executor.execute {
-            val ok = slot.file.delete()
+            // The save becomes its newest backup, so "Restore backup" can still bring it back.
+            val ok = SaveManager.deleteSlotKeepingBackup(slot.file)
             r4Runner.refreshAllStorageSizes()
             refreshSaveManager(
-                statusMessage = if (ok) "Deleted ${slot.fileName} (rolling backups kept)." else "Could not delete ${slot.fileName}."
+                statusMessage = if (ok) {
+                    "Deleted ${slot.fileName}. It is kept as a backup until you free up save backups."
+                } else {
+                    "Could not delete ${slot.fileName}."
+                }
             )
         }
     }
@@ -950,6 +959,22 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         commitSettingsChange(next, json, refreshGraphics = false)
         val mirroredFps = if (capHz <= 0) 240 else capHz.coerceIn(30, 240)
         updateRglConfig { it.copy(maxFramerate = mirroredFps) }
+        val targetFps = if (capHz <= 0) 120 else capHz.coerceIn(30, 120)
+        syncSelectedModulePicture { it.copy(targetFps = targetFps) }
+    }
+
+    // A module whose picture settings were changed in the in-game drawer keeps its own copy
+    // (`ModuleProfileStore`), which the next launch uses. A change made here is the player's
+    // latest choice for the selected module, so it goes into that copy too; otherwise the
+    // launcher's Picture settings would silently stop working for that module.
+    private fun syncSelectedModulePicture(update: (ModulePicturePrefs) -> ModulePicturePrefs) {
+        val mod = _modulesState.value.selectedModule?.folderName?.ifBlank { "Native" } ?: "Native"
+        val filesDir = app.filesDir
+        executor.execute {
+            if (!ModuleProfileStore.hasPicturePrefs(filesDir, mod)) return@execute
+            val current = ModuleProfileStore.loadPicturePrefs(filesDir, mod)
+            ModuleProfileStore.savePicturePrefs(filesDir, mod, update(current))
+        }
     }
 
     fun setPresentMode(presentModeKey: String) {
@@ -1966,18 +1991,21 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         if (_pictureResolutionIndex.value == clamped) return
         _pictureResolutionIndex.value = clamped
         prefs().edit().putInt(KEY_PICTURE_RESOLUTION_INDEX, clamped).apply()
+        syncSelectedModulePicture { it.copy(resolutionIndex = clamped) }
     }
 
     fun setPictureSharpen(enabled: Boolean) {
         if (_pictureSharpen.value == enabled) return
         _pictureSharpen.value = enabled
         prefs().edit().putBoolean(KEY_PICTURE_SHARPEN, enabled).apply()
+        syncSelectedModulePicture { it.copy(sharpen = enabled) }
     }
 
     fun setPictureFxaa(enabled: Boolean) {
         if (_pictureFxaa.value == enabled) return
         _pictureFxaa.value = enabled
         prefs().edit().putBoolean(KEY_PICTURE_FXAA, enabled).apply()
+        syncSelectedModulePicture { it.copy(fxaa = enabled) }
     }
 
     private fun prefs() = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
