@@ -23,8 +23,14 @@ data class ModuleChoice(
     val displayName: String,
     val hasScriptsTxt: Boolean,
     val loadResourceCount: Int,
-    val loadModResourceCount: Int
+    val loadModResourceCount: Int,
+    // `battle_size_min` / `battle_size_max` from module.ini; 0 when the module sets none.
+    val battleSizeMin: Int = 0,
+    val battleSizeMax: Int = 0
 ) {
+    val battleSizeRange: IntRange?
+        get() = moduleBattleSizeRange(battleSizeMin, battleSizeMax)
+
     override fun toString(): String =
         if (displayName == folderName) {
             folderName
@@ -296,7 +302,7 @@ data class SettingsUiState(
     val hasPhoneGyro: Boolean = false,
     val rglConfig: RglConfigState = RglConfigState(),
     val rglConfigReady: Boolean = false,
-    val rglConfigPath: String = "Documents/Mount&Blade Warband/rgl_config.txt"
+    val rglConfigPath: String = "Documents/Mount&Blade Warband WSE2/rgl_config.ini"
 )
 
 data class DriverUiState(

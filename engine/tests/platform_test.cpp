@@ -422,7 +422,9 @@ void test_saf_vfs() {
             "module_name = Prophesy_Sample\n"
             "load_resource = test_res\n"
             "load_mod_resource = custom_a\n"
-            "load_mod_resource = custom_b\n";
+            "load_mod_resource = custom_b\n"
+            "battle_size_min = 120\n"
+            "battle_size_max = 600 # a module's own battle range\n";
 
         expect(seed_vfs.write_text("Modules/CustomMod/module.ini", custom_ini), "seed custom mod");
         expect(seed_vfs.write_text("Modules/Native/module.ini", native_ini), "seed native ini");
@@ -450,11 +452,15 @@ void test_saf_vfs() {
             expect(modules[0].load_resource_count == 2 && modules[0].load_mod_resource_count == 1,
                    "Native resource counts");
             expect(modules[0].compatible_with_warband == "1", "Native compatibility flag");
+            expect(modules[0].battle_size_min == 0 && modules[0].battle_size_max == 0,
+                   "Native sets no battle range");
             expect(modules[1].folder_name == "CustomMod", "CustomMod sorted second");
             expect(modules[1].display_name == "Prophesy Sample", "CustomMod display_name cleaned");
             expect(!modules[1].has_scripts_txt, "CustomMod lacks scripts.txt");
             expect(modules[1].load_resource_count == 1 && modules[1].load_mod_resource_count == 2,
                    "CustomMod resource counts");
+            expect(modules[1].battle_size_min == 120 && modules[1].battle_size_max == 600,
+                   "CustomMod battle range from module.ini");
         }
 
         // Script verification through SafVfs.

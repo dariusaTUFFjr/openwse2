@@ -44,7 +44,7 @@ private val SettingsPlaceholderPerformance = PerformanceUiState.fromJson("{}")
 enum class SettingsCategory(val label: String) {
     PERFORMANCE("Performance"),
     GRAPHICS("Graphics"),
-    WORLD("World"),
+    WORLD("Battle"),
     GAMEPLAY("Gameplay"),
     AUDIO_INPUT("Audio & Input"),
     SYSTEM("System")
@@ -70,6 +70,7 @@ fun SettingsScreen(
     topContentPadding: Dp = 0.dp,
     onUpdateRglConfig: ((RglConfigState) -> RglConfigState) -> Unit = {},
     onResetRglConfig: () -> Unit = {},
+    selectedModule: ModuleChoice? = null,
     initialCategory: SettingsCategory = SettingsCategory.PERFORMANCE
 ) {
     val perf = state.performance ?: SettingsPlaceholderPerformance
@@ -105,7 +106,7 @@ fun SettingsScreen(
                 title = "Settings",
                 trailing = {
                     WseStatusDot(
-                        text = if (state.rglConfigReady) "rgl_config.txt" else "Defaults",
+                        text = if (state.rglConfigReady) "rgl_config.ini" else "Defaults",
                         tone = if (state.rglConfigReady) WseStatusTone.Ready else WseStatusTone.Neutral
                     )
                 }
@@ -138,8 +139,9 @@ fun SettingsScreen(
                     rgl = rgl,
                     onUpdate = onUpdateRglConfig
                 )
-                SettingsCategory.WORLD -> RglWorldSettingsSection(
+                SettingsCategory.WORLD -> RglBattleSettingsSection(
                     rgl = rgl,
+                    selectedModule = selectedModule,
                     onUpdate = onUpdateRglConfig
                 )
                 SettingsCategory.GAMEPLAY -> RglGameplaySettingsSection(
@@ -167,9 +169,10 @@ fun SettingsScreen(
 
     if (showResetDialog) {
         WseDialog(
-            title = "Reset rgl_config.txt?",
-            text = "Restores all Warband graphics, world, gameplay, audio and system settings " +
-                "in rgl_config.txt back to their default values.",
+            title = "Reset game settings?",
+            text = "Every setting in rgl_config.ini goes back to WSE2's own default the next " +
+                "time the game starts, including ones changed in the game's Options menu. " +
+                "The old file is kept as rgl_config.ini.before_reset.",
             confirm = WseDialogAction("Reset") {
                 showResetDialog = false
                 onResetRglConfig()
@@ -204,7 +207,7 @@ private fun PerformanceSettingsSection(
             .coerceAtLeast(0)
         TileGridListItem(
             headline = "Quality preset",
-            supporting = "Balances render scale, texture cap and rgl_config.txt quality",
+            supporting = "Sets render scale, texture size and the game's shadow and detail settings",
             options = LauncherDefaults.QUALITY_PRESET_LABELS,
             selectedIndex = presetIdx,
             columns = 4,
@@ -349,312 +352,29 @@ private fun RglGraphicsSettingsSection(
     rgl: RglConfigState,
     onUpdate: ((RglConfigState) -> RglConfigState) -> Unit
 ) {
-    LauncherSectionHeader(title = "Textures & shaders")
+    LauncherSectionHeader(title = "Picture")
     LauncherGroupedCard {
-        IntSliderListItem(
-            headline = "Texture detail",
-            supporting = "Scales texture mip sharpness",
-            persistedValue = rgl.textureDetail,
-            minValue = 10,
-            maxValue = 100,
-            step = 5,
-            enabled = true,
-            formatValue = { "$it%" },
-            onCommitValue = { v -> onUpdate { it.copy(textureDetail = v) } }
-        )
-        LauncherSectionDivider()
-        TileGridListItem(
-            headline = "Shader quality",
-            options = RglConfigOptions.SHADER_QUALITY_LABELS,
-            selectedIndex = rgl.shaderQuality.coerceIn(0, 2),
-            columns = 3,
-            enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(shaderQuality = idx) } }
-        )
-        LauncherSectionDivider()
-        val aaIdx = RglConfigOptions.ANTIALIASING_VALUES
-            .indexOf(rgl.antialiasing)
-            .coerceAtLeast(0)
-        TileGridListItem(
-            headline = "Antialiasing (MSAA)",
-            options = RglConfigOptions.ANTIALIASING_LABELS,
-            selectedIndex = aaIdx,
-            columns = 5,
-            enabled = true,
-            onSelected = { idx ->
-                onUpdate { it.copy(antialiasing = RglConfigOptions.ANTIALIASING_VALUES[idx]) }
-            }
-        )
-        LauncherSectionDivider()
-        IntSliderListItem(
-            headline = "Sample quality",
-            supporting = "Additional multisampling quality level",
-            persistedValue = rgl.sampleQuality,
-            minValue = 0,
-            maxValue = 4,
-            step = 1,
-            enabled = true,
-            formatValue = { "$it" },
-            onCommitValue = { v -> onUpdate { it.copy(sampleQuality = v) } }
-        )
-        LauncherSectionDivider()
-        IntSliderListItem(
-            headline = "Render buffer size",
-            supporting = "Vertex and texture staging buffer in MiB",
-            persistedValue = rgl.renderBufferSize,
-            minValue = 15,
-            maxValue = 512,
-            step = 5,
-            enabled = true,
-            formatValue = { "$it MB" },
-            onCommitValue = { v -> onUpdate { it.copy(renderBufferSize = v) } }
-        )
-        LauncherSectionDivider()
         SwitchListItem(
-            headline = "Anisotropic filtering",
-            supporting = "Sharper ground textures at oblique angles",
-            checked = rgl.anisotropicFiltering,
+            headline = "Shadows",
+            supporting = "Shadows from the sun on the scene",
+            checked = rgl.shadows,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(anisotropicFiltering = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Load textures on demand",
-            supporting = "Streams textures to reduce memory use",
-            checked = rgl.useOnDemandTextures,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(useOnDemandTextures = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Multithreaded on-demand textures",
-            checked = rgl.useOnDemandTexturesMt,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(useOnDemandTexturesMt = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Pixel shaders",
-            checked = rgl.usePixelShaders,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(usePixelShaders = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Vertex shaders",
-            checked = rgl.useVertexShaders,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(useVertexShaders = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Fake reflections",
-            supporting = "Lightweight water and metal reflections",
-            checked = rgl.fakeReflections,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(fakeReflections = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Hardware instancing",
-            supporting = "Batches repeated scene props and foliage",
-            checked = rgl.useInstancing,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(useInstancing = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Alpha to coverage",
-            supporting = "Smoother foliage edges with MSAA",
-            checked = rgl.alpha2Coverage,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(alpha2Coverage = v) } }
-        )
-    }
-
-    LauncherSectionHeader(title = "Post-processing")
-    LauncherGroupedCard {
-        TileGridListItem(
-            headline = "HDR mode",
-            options = RglConfigOptions.POSTFX_HDR_LABELS,
-            selectedIndex = rgl.postfxHdr.coerceIn(0, 2),
-            columns = 3,
-            enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(postfxHdr = idx) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Auto-exposure",
-            supporting = "Dynamic brightness adaptation",
-            checked = rgl.postfxAutoexp,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(postfxAutoexp = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Depth of field",
-            supporting = "Soft focus blur on distant scenery",
-            checked = rgl.postfxDof,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(postfxDof = v) } }
-        )
-        LauncherSectionDivider()
-        FloatSliderListItem(
-            headline = "Gamma",
-            persistedValue = rgl.gamma,
-            minValue = 1.0f,
-            maxValue = 3.0f,
-            step = 0.05f,
-            enabled = true,
-            formatValue = { String.format(Locale.US, "%.2f", it) },
-            onCommitValue = { v -> onUpdate { it.copy(gamma = v) } }
-        )
-    }
-
-    LauncherSectionHeader(title = "Video & display")
-    LauncherGroupedCard {
-        val currentResIdx = RglConfigOptions.RESOLUTION_PRESETS
-            .indexOfFirst { it.first == rgl.displayWidth && it.second == rgl.displayHeight }
-            .coerceAtLeast(0)
-        val resReadout = if (rgl.displayWidth == 0 && rgl.displayHeight == 0) {
-            "Auto"
-        } else {
-            "${rgl.displayWidth}x${rgl.displayHeight}"
-        }
-        TileGridListItem(
-            headline = "Display resolution",
-            supporting = "Auto matches the device display",
-            options = RglConfigOptions.RESOLUTION_LABELS,
-            selectedIndex = currentResIdx,
-            columns = 5,
-            valueReadout = resReadout,
-            enabled = true,
-            onSelected = { idx ->
-                val (w, h) = RglConfigOptions.RESOLUTION_PRESETS[idx]
-                onUpdate { it.copy(displayWidth = w, displayHeight = h) }
-            }
-        )
-        LauncherSectionDivider()
-        IntSliderListItem(
-            headline = "Max framerate",
-            persistedValue = rgl.maxFramerate,
-            minValue = 30,
-            maxValue = 240,
-            step = 10,
-            enabled = true,
-            formatValue = { "$it FPS" },
-            onCommitValue = { v -> onUpdate { it.copy(maxFramerate = v) } }
-        )
-        LauncherSectionDivider()
-        val bitsIdx = RglConfigOptions.DISPLAY_BITS_VALUES.indexOf(rgl.displayBits).coerceAtLeast(0)
-        SegmentedListItem(
-            headline = "Color depth",
-            options = RglConfigOptions.DISPLAY_BITS_LABELS,
-            selectedIndex = bitsIdx,
-            enabled = true,
-            showSelectedIcon = false,
-            onSelected = { idx ->
-                onUpdate { it.copy(displayBits = RglConfigOptions.DISPLAY_BITS_VALUES[idx]) }
-            }
-        )
-        LauncherSectionDivider()
-        SegmentedListItem(
-            headline = "Adapter format",
-            options = RglConfigOptions.ADAPTER_FORMAT_LABELS,
-            selectedIndex = rgl.adapterFormat.coerceIn(0, 2),
-            enabled = true,
-            showSelectedIcon = false,
-            onSelected = { idx -> onUpdate { it.copy(adapterFormat = idx) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Force vertical sync",
-            checked = rgl.forceVsync,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(forceVsync = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Start windowed",
-            checked = rgl.startWindowed,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(startWindowed = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Aspect ratio control",
-            checked = rgl.enableAspectRatioControl,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableAspectRatioControl = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Show in-game framerate",
-            checked = rgl.showFramerate,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(showFramerate = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Auto graphics quality",
-            checked = rgl.autoGfxQuality,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(autoGfxQuality = v) } }
-        )
-    }
-}
-
-@Composable
-private fun RglWorldSettingsSection(
-    rgl: RglConfigState,
-    onUpdate: ((RglConfigState) -> RglConfigState) -> Unit
-) {
-    LauncherSectionHeader(title = "Shadows & lighting")
-    LauncherGroupedCard {
-        TileGridListItem(
-            headline = "Shadow quality",
-            options = RglConfigOptions.SHADOWMAP_QUALITY_LABELS,
-            selectedIndex = rgl.shadowmapQuality.coerceIn(0, 2),
-            columns = 3,
-            enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(shadowmapQuality = idx) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Dynamic lighting",
-            checked = rgl.enableLighting,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableLighting = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(shadows = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
             headline = "Character shadows",
-            checked = rgl.enableCharacterShadows,
+            checked = rgl.characterShadows,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableCharacterShadows = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(characterShadows = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Accurate shadows",
-            checked = rgl.enableAccurateShadows,
+            headline = "Particle effects",
+            supporting = "Smoke, dust, sparks and weather",
+            checked = rgl.particles,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableAccurateShadows = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Environment shadows",
-            checked = rgl.enableEnvironmentShadows,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableEnvironmentShadows = v) } }
-        )
-        LauncherSectionDivider()
-        TileGridListItem(
-            headline = "Realistic shadows on plants",
-            options = RglConfigOptions.PLANT_SHADOW_LABELS,
-            selectedIndex = rgl.realisticShadowsOnPlants.coerceIn(0, 2),
-            columns = 3,
-            enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(realisticShadowsOnPlants = idx) } }
+            onCheckedChange = { v -> onUpdate { it.copy(particles = v) } }
         )
         LauncherSectionDivider()
         FloatSliderListItem(
@@ -669,117 +389,130 @@ private fun RglWorldSettingsSection(
         )
         LauncherSectionDivider()
         FloatSliderListItem(
-            headline = "Character shadow detail",
-            persistedValue = rgl.characterShadowDetail,
-            minValue = 0f,
-            maxValue = 1f,
-            step = 0.05f,
-            enabled = true,
-            formatValue = { "${(it * 100f).roundToInt()}%" },
-            onCommitValue = { v -> onUpdate { it.copy(characterShadowDetail = v) } }
-        )
-    }
-
-    LauncherSectionHeader(title = "Foliage & effects")
-    LauncherGroupedCard {
-        IntSliderListItem(
-            headline = "Grass density",
-            persistedValue = rgl.grassDensity,
-            minValue = 0,
-            maxValue = 100,
-            step = 5,
-            enabled = true,
-            formatValue = { "$it%" },
-            onCommitValue = { v -> onUpdate { it.copy(grassDensity = v) } }
-        )
-        LauncherSectionDivider()
-        TileGridListItem(
-            headline = "Tree & flora detail",
-            options = RglConfigOptions.FLORA_LOD_LABELS,
-            selectedIndex = rgl.floraLodDetail.coerceIn(0, 2),
-            columns = 3,
-            enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(floraLodDetail = idx) } }
-        )
-        LauncherSectionDivider()
-        FloatSliderListItem(
-            headline = "Tree degrade distance",
+            headline = "Tree detail distance",
+            supporting = "Beyond this, trees and plants are drawn simpler",
             persistedValue = rgl.floraDegradeDistance,
-            minValue = 40f,
-            maxValue = 200f,
-            step = 10f,
+            minValue = 20f,
+            maxValue = 300f,
+            step = 5f,
             enabled = true,
             formatValue = { "${it.roundToInt()} m" },
             onCommitValue = { v -> onUpdate { it.copy(floraDegradeDistance = v) } }
         )
         LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Particle systems",
-            supporting = "Smoke, dust, sparks and weather",
-            checked = rgl.enableParticles,
+        FloatSliderListItem(
+            headline = "Gamma",
+            persistedValue = rgl.gamma,
+            minValue = 1.0f,
+            maxValue = 3.0f,
+            step = 0.05f,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableParticles = v) } }
+            formatValue = { String.format(Locale.US, "%.2f", it) },
+            onCommitValue = { v -> onUpdate { it.copy(gamma = v) } }
+        )
+        LauncherSectionDivider()
+        SwitchListItem(
+            headline = "Load textures as needed",
+            supporting = "Uses less memory; a texture can show blurry for a moment",
+            checked = rgl.useOnDemandTextures,
+            enabled = true,
+            onCheckedChange = { v -> onUpdate { it.copy(useOnDemandTextures = v) } }
+        )
+        LauncherSectionDivider()
+        SwitchListItem(
+            headline = "Instancing",
+            supporting = "Draws repeated props and plants together",
+            checked = rgl.useInstancing,
+            enabled = true,
+            onCheckedChange = { v -> onUpdate { it.copy(useInstancing = v) } }
         )
     }
 
-    LauncherSectionHeader(title = "Battlefield")
+    LauncherSectionHeader(title = "Frame rate")
     LauncherGroupedCard {
+        IntSliderListItem(
+            headline = "Game frame-rate limit",
+            supporting = "Follows the frame-rate cap under Performance",
+            persistedValue = rgl.maxFramerate.coerceIn(30, 240),
+            minValue = 30,
+            maxValue = 240,
+            step = 10,
+            enabled = true,
+            formatValue = { "$it FPS" },
+            onCommitValue = { v -> onUpdate { it.copy(maxFramerate = v) } }
+        )
+        LauncherSectionDivider()
         SwitchListItem(
-            headline = "Show blood",
-            checked = rgl.enableBlood,
+            headline = "Vertical sync",
+            checked = rgl.forceVsync,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableBlood = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(forceVsync = v) } }
         )
         LauncherSectionDivider()
-        TileGridListItem(
-            headline = "Blood stains",
-            options = RglConfigOptions.BLOOD_STAINS_LABELS,
-            selectedIndex = rgl.bloodStains.coerceIn(0, 2),
-            columns = 3,
+        SwitchListItem(
+            headline = "Show the game's frame rate",
+            checked = rgl.showFramerate,
             enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(bloodStains = idx) } }
-        )
-        LauncherSectionDivider()
-        TileGridListItem(
-            headline = "Number of corpses",
-            options = RglConfigOptions.CORPSES_LABELS,
-            selectedIndex = rgl.numberOfCorpses.coerceIn(0, 6),
-            columns = 4,
-            enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(numberOfCorpses = idx) } }
-        )
-        LauncherSectionDivider()
-        TileGridListItem(
-            headline = "Number of ragdolls",
-            options = RglConfigOptions.RAGDOLLS_LABELS,
-            selectedIndex = rgl.numberOfRagdolls.coerceIn(0, 4),
-            columns = 5,
-            enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(numberOfRagdolls = idx) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showFramerate = v) } }
         )
     }
 }
 
 @Composable
-private fun RglGameplaySettingsSection(
+private fun RglBattleSettingsSection(
     rgl: RglConfigState,
+    selectedModule: ModuleChoice?,
     onUpdate: ((RglConfigState) -> RglConfigState) -> Unit
 ) {
-    LauncherSectionHeader(title = "Battle & difficulty")
+    val moduleRange = selectedModule?.battleSizeRange
+    val moduleName = selectedModule?.displayName?.ifBlank { null } ?: selectedModule?.folderName
+    LauncherSectionHeader(title = "Battle size")
     LauncherGroupedCard {
         FloatSliderListItem(
             headline = "Battle size",
-            supporting = "Maximum soldiers active in a battle at once",
+            supporting = if (moduleRange != null && moduleName != null) {
+                "$moduleName allows ${moduleRange.first} to ${moduleRange.last} soldiers"
+            } else {
+                "Soldiers on the field at once"
+            },
             persistedValue = rgl.battleSize,
             minValue = 0f,
             maxValue = 1f,
-            step = 0.025f,
+            step = 0.01f,
             enabled = true,
-            formatValue = { v ->
-                val troops = (30 + (v.coerceIn(0f, 1f) * 120f).roundToInt()).coerceIn(30, 150)
-                "$troops troops"
-            },
+            formatValue = { v -> "${rgl.copy(battleSize = v).battleSizeTroops(moduleRange)} soldiers" },
             onCommitValue = { v -> onUpdate { it.copy(battleSize = v) } }
+        )
+        LauncherSectionDivider()
+        // A value set in the file or the game itself (say 600) is shown as its own choice.
+        val maxValues = (RglConfigOptions.BATTLE_SIZE_MAX_VALUES + rgl.battleSizeMax).distinct().sorted()
+        val maxIdx = maxValues.indexOf(rgl.battleSizeMax)
+        TileGridListItem(
+            headline = "Largest battle",
+            supporting = if (moduleRange != null) {
+                "Used by modules that set no range of their own. Large battles are heavy on a phone."
+            } else {
+                "Large battles are heavy on a phone."
+            },
+            options = maxValues.map { it.toString() },
+            selectedIndex = maxIdx,
+            columns = 4,
+            valueReadout = "${rgl.battleSizeMax} soldiers",
+            enabled = true,
+            onSelected = { idx ->
+                val chosen = maxValues[idx]
+                onUpdate { it.copy(battleSizeMax = chosen, battleSizeMin = it.battleSizeMin.coerceAtMost(chosen)) }
+            }
+        )
+    }
+
+    LauncherSectionHeader(title = "Battle & difficulty")
+    LauncherGroupedCard {
+        SwitchListItem(
+            headline = "Blood",
+            checked = rgl.enableBlood,
+            enabled = true,
+            onCheckedChange = { v -> onUpdate { it.copy(enableBlood = v) } }
         )
         LauncherSectionDivider()
         TileGridListItem(
@@ -792,25 +525,25 @@ private fun RglGameplaySettingsSection(
         )
         LauncherSectionDivider()
         TileGridListItem(
-            headline = "Damage to player",
-            options = RglConfigOptions.DAMAGE_DIFFICULTY_LABELS,
-            selectedIndex = rgl.combatDifficulty.coerceIn(0, 2),
+            headline = "Damage to you",
+            options = RglConfigOptions.DAMAGE_LABELS,
+            selectedIndex = RglConfigOptions.nearestIndex(RglConfigOptions.DAMAGE_VALUES, rgl.damageToPlayer),
             columns = 3,
             enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(combatDifficulty = idx) } }
+            onSelected = { idx -> onUpdate { it.copy(damageToPlayer = RglConfigOptions.DAMAGE_VALUES[idx]) } }
         )
         LauncherSectionDivider()
         TileGridListItem(
-            headline = "Damage to friends",
-            options = RglConfigOptions.DAMAGE_DIFFICULTY_LABELS,
-            selectedIndex = rgl.friendCombatDifficulty.coerceIn(0, 2),
+            headline = "Damage to your troops",
+            options = RglConfigOptions.DAMAGE_LABELS,
+            selectedIndex = RglConfigOptions.nearestIndex(RglConfigOptions.DAMAGE_VALUES, rgl.damageToFriends),
             columns = 3,
             enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(friendCombatDifficulty = idx) } }
+            onSelected = { idx -> onUpdate { it.copy(damageToFriends = RglConfigOptions.DAMAGE_VALUES[idx]) } }
         )
         LauncherSectionDivider()
         TileGridListItem(
-            headline = "Combat AI",
+            headline = "Battle AI",
             options = RglConfigOptions.AI_LEVEL_LABELS,
             selectedIndex = rgl.reduceCombatAi.coerceIn(0, 2),
             columns = 3,
@@ -826,19 +559,18 @@ private fun RglGameplaySettingsSection(
             enabled = true,
             onSelected = { idx -> onUpdate { it.copy(reduceCampaignAi = idx) } }
         )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Realistic headshots",
-            checked = rgl.realisticHeadshots,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(realisticHeadshots = v) } }
-        )
     }
+}
 
+@Composable
+private fun RglGameplaySettingsSection(
+    rgl: RglConfigState,
+    onUpdate: ((RglConfigState) -> RglConfigState) -> Unit
+) {
     LauncherSectionHeader(title = "Combat controls")
     LauncherGroupedCard {
         ExposedDropdownListItem(
-            headline = "Attack direction control",
+            headline = "Attack direction",
             options = RglConfigOptions.ATTACK_CONTROL_LABELS,
             selectedIndex = rgl.attackDirectionControl.coerceIn(0, 3),
             enabled = true,
@@ -846,7 +578,7 @@ private fun RglGameplaySettingsSection(
         )
         LauncherSectionDivider()
         ExposedDropdownListItem(
-            headline = "Defend direction control",
+            headline = "Block direction",
             options = RglConfigOptions.DEFEND_CONTROL_LABELS,
             selectedIndex = rgl.defendDirectionControl.coerceIn(0, 3),
             enabled = true,
@@ -863,64 +595,64 @@ private fun RglGameplaySettingsSection(
         )
         LauncherSectionDivider()
         TileGridListItem(
-            headline = "Turn camera with horse (1st person)",
+            headline = "Turn camera with horse",
             options = RglConfigOptions.HORSE_CAMERA_LABELS,
-            selectedIndex = rgl.turnCameraWithHorseInFirstPerson.coerceIn(0, 2),
+            selectedIndex = rgl.horseCameraMode.coerceIn(0, 2),
             columns = 3,
             enabled = true,
-            onSelected = { idx -> onUpdate { it.copy(turnCameraWithHorseInFirstPerson = idx) } }
+            onSelected = { idx -> onUpdate { it.copy(horseCameraMode = idx) } }
         )
     }
 
-    LauncherSectionHeader(title = "HUD & combat log")
+    LauncherSectionHeader(title = "Screen & messages")
     LauncherGroupedCard {
         SwitchListItem(
-            headline = "Show banners on friendly troops",
-            checked = rgl.displayLabels,
+            headline = "Crosshair",
+            checked = rgl.showCrosshair,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(displayLabels = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showCrosshair = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Show targeting reticule",
-            checked = rgl.displayTargetingReticule,
+            headline = "Aiming reticle",
+            checked = rgl.showReticle,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(displayTargetingReticule = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showReticle = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Show attack direction indicator",
-            checked = rgl.displayAttackDirection,
+            headline = "Attack direction arrow",
+            checked = rgl.showAttackDirection,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(displayAttackDirection = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showAttackDirection = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Report damage",
-            checked = rgl.verboseDamage,
+            headline = "Damage messages",
+            checked = rgl.showDamage,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(verboseDamage = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showDamage = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Report shot difficulty",
-            checked = rgl.verboseShotDifficulty,
+            headline = "Shot difficulty messages",
+            checked = rgl.showShotDifficulty,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(verboseShotDifficulty = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showShotDifficulty = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Report casualties",
-            checked = rgl.verboseCasualties,
+            headline = "Casualty messages",
+            checked = rgl.showCasualties,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(verboseCasualties = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showCasualties = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Report experience",
-            checked = rgl.verboseExperience,
+            headline = "Experience messages",
+            checked = rgl.showExperienceGain,
             enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(verboseExperience = v) } }
+            onCheckedChange = { v -> onUpdate { it.copy(showExperienceGain = v) } }
         )
     }
 }
@@ -937,15 +669,29 @@ private fun AudioInputSettingsSection(
 ) {
     LauncherSectionHeader(title = "Audio")
     LauncherGroupedCard {
+        SwitchListItem(
+            headline = "Music",
+            checked = rgl.music,
+            enabled = true,
+            onCheckedChange = { v -> onUpdateRgl { it.copy(music = v) } }
+        )
+        LauncherSectionDivider()
         FloatSliderListItem(
             headline = "Music volume",
             persistedValue = rgl.musicVolume,
             minValue = 0f,
             maxValue = 1f,
             step = 0.05f,
-            enabled = !rgl.disableMusic,
+            enabled = rgl.music,
             formatValue = { "${(it * 100f).roundToInt()}%" },
             onCommitValue = { v -> onUpdateRgl { it.copy(musicVolume = v) } }
+        )
+        LauncherSectionDivider()
+        SwitchListItem(
+            headline = "Sound effects",
+            checked = rgl.sound,
+            enabled = true,
+            onCheckedChange = { v -> onUpdateRgl { it.copy(sound = v) } }
         )
         LauncherSectionDivider()
         FloatSliderListItem(
@@ -954,37 +700,17 @@ private fun AudioInputSettingsSection(
             minValue = 0f,
             maxValue = 1f,
             step = 0.05f,
-            enabled = !rgl.disableSound,
+            enabled = rgl.sound,
             formatValue = { "${(it * 100f).roundToInt()}%" },
             onCommitValue = { v -> onUpdateRgl { it.copy(soundVolume = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Disable music",
-            checked = rgl.disableMusic,
-            enabled = true,
-            onCheckedChange = { v -> onUpdateRgl { it.copy(disableMusic = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Disable sound",
-            checked = rgl.disableSound,
-            enabled = true,
-            onCheckedChange = { v -> onUpdateRgl { it.copy(disableSound = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Disable sound pitch variation",
+            headline = "Same pitch for every sound",
+            supporting = "Turns off the small pitch changes between repeats",
             checked = rgl.disableFrequencyVariation,
             enabled = true,
             onCheckedChange = { v -> onUpdateRgl { it.copy(disableFrequencyVariation = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Use WinMM audio backend",
-            checked = rgl.useWinmmAudio,
-            enabled = true,
-            onCheckedChange = { v -> onUpdateRgl { it.copy(useWinmmAudio = v) } }
         )
     }
 
@@ -1017,10 +743,10 @@ private fun AudioInputSettingsSection(
         )
         LauncherSectionDivider()
         FloatSliderListItem(
-            headline = "Mouse & look sensitivity",
+            headline = "Look sensitivity",
             persistedValue = rgl.mouseSensitivity,
-            minValue = 0.1f,
-            maxValue = 2.0f,
+            minValue = 0.05f,
+            maxValue = 3.0f,
             step = 0.05f,
             enabled = true,
             formatValue = { String.format(Locale.US, "%.2f", it) },
@@ -1028,21 +754,21 @@ private fun AudioInputSettingsSection(
         )
         LauncherSectionDivider()
         FloatSliderListItem(
-            headline = "Mouse vertical movement scale",
-            persistedValue = rgl.controlMouseMovementYScale,
-            minValue = 0.5f,
-            maxValue = 3.0f,
-            step = 0.1f,
+            headline = "Up-down look speed",
+            persistedValue = rgl.mouseYScale,
+            minValue = 0.25f,
+            maxValue = 4.0f,
+            step = 0.05f,
             enabled = true,
-            formatValue = { String.format(Locale.US, "%.1fx", it) },
-            onCommitValue = { v -> onUpdateRgl { it.copy(controlMouseMovementYScale = v) } }
+            formatValue = { String.format(Locale.US, "%.2fx", it) },
+            onCommitValue = { v -> onUpdateRgl { it.copy(mouseYScale = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Invert mouse Y-axis",
-            checked = rgl.invertMouse,
+            headline = "Invert up-down look",
+            checked = rgl.invertMouseY,
             enabled = true,
-            onCheckedChange = { v -> onUpdateRgl { it.copy(invertMouse = v) } }
+            onCheckedChange = { v -> onUpdateRgl { it.copy(invertMouseY = v) } }
         )
     }
 }
@@ -1055,81 +781,22 @@ private fun RglSystemSettingsSection(
     onRequestReset: () -> Unit
 ) {
     val colors = LocalWseColors.current
-    LauncherSectionHeader(title = "Engine & cheats")
+    LauncherSectionHeader(title = "Cheats & editing")
     LauncherGroupedCard {
         SwitchListItem(
-            headline = "Enable cheats",
-            supporting = "Unlocks Warband cheat shortcuts",
+            headline = "Cheats",
+            supporting = "Turns on Warband's cheat keys and the cheats menu",
             checked = rgl.cheatMode,
             enabled = true,
             onCheckedChange = { v -> onUpdate { it.copy(cheatMode = v) } }
         )
         LauncherSectionDivider()
         SwitchListItem(
-            headline = "Enable edit mode",
+            headline = "Edit mode",
             supporting = "Scene editing tools",
             checked = rgl.enableEditMode,
             enabled = true,
             onCheckedChange = { v -> onUpdate { it.copy(enableEditMode = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Debug mode",
-            supporting = "Verbose engine logs",
-            checked = rgl.debugMode,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(debugMode = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Force single threading",
-            supporting = "Compatibility fallback",
-            checked = rgl.forceSingleThreading,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(forceSingleThreading = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Check for game updates",
-            checked = rgl.enableVersionCheck,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(enableVersionCheck = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "First-time startup flag",
-            supporting = "Re-runs initial Warband setup when enabled",
-            checked = rgl.firstTime,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(firstTime = v) } }
-        )
-    }
-
-    LauncherSectionHeader(title = "Network")
-    LauncherGroupedCard {
-        IntSliderListItem(
-            headline = "Max connections",
-            persistedValue = rgl.maxNumberOfConnections,
-            minValue = 2,
-            maxValue = 200,
-            step = 2,
-            enabled = true,
-            formatValue = { "$it" },
-            onCommitValue = { v -> onUpdate { it.copy(maxNumberOfConnections = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Use secure connection",
-            checked = rgl.useSecureConnection,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(useSecureConnection = v) } }
-        )
-        LauncherSectionDivider()
-        SwitchListItem(
-            headline = "Look for server on this machine",
-            checked = rgl.lookForServerOnThisMachine,
-            enabled = true,
-            onCheckedChange = { v -> onUpdate { it.copy(lookForServerOnThisMachine = v) } }
         )
     }
 
@@ -1145,12 +812,12 @@ private fun RglSystemSettingsSection(
                 items = listOf(
                     WseMetricItem(
                         label = "Config status",
-                        value = if (state.rglConfigReady) "Ready" else "Default",
+                        value = if (state.rglConfigReady) "Ready" else "Made on first start",
                         accentValue = state.rglConfigReady
                     ),
                     WseMetricItem(
-                        label = "Properties",
-                        value = "${RglConfigCodec.KNOWN_KEYS.size + rgl.extraEntries.size} keys"
+                        label = "Settings",
+                        value = if (rgl.ini.keyCount > 0) "${rgl.ini.keyCount} in file" else "None yet"
                     )
                 ),
                 columns = 2
@@ -1161,7 +828,7 @@ private fun RglSystemSettingsSection(
                 color = colors.onSurfaceVariant
             )
             WseSecondaryButton(
-                text = "Reset rgl_config.txt to defaults",
+                text = "Reset game settings",
                 onClick = onRequestReset,
                 modifier = Modifier.fillMaxWidth()
             )

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <memory>
@@ -1026,6 +1027,10 @@ struct WarbandModuleInfo {
     std::size_t load_resource_count = 0;
     std::size_t load_mod_resource_count = 0;
     std::string compatible_with_warband{};
+    // The module's battle range, `battle_size_min` / `battle_size_max` (WSE2's exe pairs these
+    // module.ini names with its iBattleSizeMin / iBattleSizeMax); 0 when module.ini sets none.
+    int battle_size_min = 0;
+    int battle_size_max = 0;
 };
 
 // Discovers Warband modules under `Modules/*/module.ini` using any `Vfs`.
@@ -1083,6 +1088,20 @@ struct WarbandModuleInfo {
             info.display_name = entry.name;
         }
         info.compatible_with_warband = find_setting_ci(ini.settings, "compatible_with_warband");
+        auto setting_int = [&](std::string_view key) -> int {
+            const std::string raw = find_setting_ci(ini.settings, key);
+            if (raw.empty()) return 0;
+            char* end = nullptr;
+            const long v = std::strtol(raw.c_str(), &end, 10);
+            if (end == raw.c_str() || v <= 0 || v > 1000000) return 0;
+            return static_cast<int>(v);
+        };
+        info.battle_size_min = setting_int("battle_size_min");
+        info.battle_size_max = setting_int("battle_size_max");
+        if (info.battle_size_min == 0 || info.battle_size_max < info.battle_size_min) {
+            info.battle_size_min = 0;
+            info.battle_size_max = 0;
+        }
         modules.push_back(std::move(info));
     }
 

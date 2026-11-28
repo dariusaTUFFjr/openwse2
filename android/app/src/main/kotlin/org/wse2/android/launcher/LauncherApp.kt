@@ -501,7 +501,8 @@ fun LauncherAppContent(
                 onLanguageChange = onLanguageChange,
                 topContentPadding = topPadding,
                 onUpdateRglConfig = onUpdateRglConfig,
-                onResetRglConfig = onResetRglConfig
+                onResetRglConfig = onResetRglConfig,
+                selectedModule = modulesState.selectedModule
             )
             LauncherTab.ADVANCED -> AdvancedScreen(
                 state = advancedState,

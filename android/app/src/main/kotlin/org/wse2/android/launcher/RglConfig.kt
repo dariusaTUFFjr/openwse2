@@ -1,215 +1,213 @@
 package org.wse2.android.launcher
 
 import java.io.File
-import java.util.LinkedHashMap
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * Full typed model of Mount & Blade: Warband's `rgl_config.txt`.
+ * WSE2's `rgl_config.ini` as its lines, kept verbatim. WSE2 v1.1.5.6 reads
+ * `Documents/Mount&Blade Warband WSE2/rgl_config.ini` (`[Section]` headers, `key=value` lines,
+ * `b`/`i`/`f`/`s`/`u`/`v` type prefixes) and never the old Warband `rgl_config.txt`.
  *
- * Covers every property present in a retail `rgl_config.txt` and preserves any additional
- * user-defined keys verbatim in [extraEntries] when saving.
+ * The file holds some 700 keys; the launcher edits a few dozen of them ([RglConfigState]) and
+ * leaves every other line, its order and its line endings as WSE2 wrote them.
+ */
+data class RglIni(val lines: List<String> = emptyList(), val lineEnding: String = "\r\n") {
+
+    val keyCount: Int
+        get() = lines.count { line ->
+            val t = line.trim()
+            t.isNotEmpty() && !t.startsWith("[") && !t.startsWith(";") && !t.startsWith("#") && t.indexOf('=') > 0
+        }
+
+    fun get(section: String, key: String): String? {
+        var current = ""
+        for (line in lines) {
+            val t = line.trim()
+            val header = sectionName(t)
+            if (header != null) {
+                current = header
+                continue
+            }
+            if (!current.equals(section, ignoreCase = true)) continue
+            val eq = t.indexOf('=')
+            if (eq <= 0) continue
+            if (t.substring(0, eq).trim().equals(key, ignoreCase = true)) {
+                return t.substring(eq + 1).trim()
+            }
+        }
+        return null
+    }
+
+    // Replaces the key's line in place, or adds it at the end of its section (a new section at
+    // the end of the file when there is none).
+    fun with(section: String, key: String, value: String): RglIni {
+        val out = ArrayList<String>(lines.size + 2)
+        var current = ""
+        var sectionSeen = false
+        var lastLineOfSection = -1
+        var replaced = false
+        for (line in lines) {
+            val t = line.trim()
+            val header = sectionName(t)
+            if (header != null) {
+                current = header
+                if (header.equals(section, ignoreCase = true)) {
+                    sectionSeen = true
+                    lastLineOfSection = out.size
+                }
+                out.add(line)
+                continue
+            }
+            if (current.equals(section, ignoreCase = true)) {
+                val eq = t.indexOf('=')
+                if (!replaced && eq > 0 && t.substring(0, eq).trim().equals(key, ignoreCase = true)) {
+                    out.add("${t.substring(0, eq).trim()}=$value")
+                    replaced = true
+                    lastLineOfSection = out.size - 1
+                    continue
+                }
+                if (t.isNotEmpty()) lastLineOfSection = out.size
+            }
+            out.add(line)
+        }
+        if (!replaced) {
+            if (sectionSeen) {
+                out.add(lastLineOfSection + 1, "$key=$value")
+            } else {
+                while (out.isNotEmpty() && out.last().isBlank()) out.removeAt(out.size - 1)
+                out.add("[$section]")
+                out.add("$key=$value")
+            }
+        }
+        return copy(lines = out)
+    }
+
+    fun serialize(): String {
+        if (lines.isEmpty()) return ""
+        return lines.joinToString(lineEnding, postfix = lineEnding)
+    }
+
+    companion object {
+        private fun sectionName(trimmed: String): String? =
+            if (trimmed.startsWith("[") && trimmed.endsWith("]") && trimmed.length > 2) {
+                trimmed.substring(1, trimmed.length - 1).trim()
+            } else {
+                null
+            }
+
+        fun parse(text: String): RglIni {
+            val ending = if (text.contains("\r\n")) "\r\n" else if (text.contains('\n')) "\n" else "\r\n"
+            val body = text.removePrefix("\uFEFF")
+            val lines = body.split("\r\n", "\n").toMutableList()
+            if (lines.isNotEmpty() && lines.last().isEmpty()) lines.removeAt(lines.size - 1)
+            return RglIni(lines, ending)
+        }
+    }
+}
+
+/**
+ * The `rgl_config.ini` settings the launcher shows. Each field is one WSE2 key ([RglConfigCodec]).
+ * The defaults (the values in a WSE2 v1.1.5.6 file on a Windows PC) are shown only until WSE2 has
+ * written the file, and are never written for a key the player did not change. [ini] is the file
+ * as read, so a save changes only the keys the player changed.
  */
 data class RglConfigState(
-    // Video & rendering
-    val textureDetail: Int = 100,
-    val renderBufferSize: Int = 15,
-    val maxFramerate: Int = 60,
-    val startWindowed: Boolean = false,
-    val usePixelShaders: Boolean = true,
-    val useVertexShaders: Boolean = true,
-    val fakeReflections: Boolean = true,
-    val showFramerate: Boolean = false,
-    val useOnDemandTextures: Boolean = true,
-    val useOnDemandTexturesMt: Boolean = true,
-    val displayWidth: Int = 0,
-    val displayHeight: Int = 0,
-    val displayBits: Int = 32,
-    val antialiasing: Int = 1,
-    val sampleQuality: Int = 0,
-    val alpha2Coverage: Boolean = false,
-    val forceVsync: Boolean = true,
-    val shaderQuality: Int = 2,
-    val postfxDof: Boolean = false,
-    val postfxHdr: Int = 0,
-    val postfxAutoexp: Boolean = false,
-    val useInstancing: Boolean = false,
-    val anisotropicFiltering: Boolean = true,
-    val adapterFormat: Int = 0,
-    val gamma: Float = 2.2f,
-    val enableAspectRatioControl: Boolean = true,
-    val autoGfxQuality: Boolean = false,
-
-    // Shadows, flora & world
-    val shadowmapQuality: Int = 1,
-    val enableLighting: Boolean = true,
-    val enableParticles: Boolean = true,
-    val enableBlood: Boolean = true,
-    val bloodStains: Int = 1,
-    val enableCharacterShadows: Boolean = true,
-    val enableAccurateShadows: Boolean = true,
-    val enableEnvironmentShadows: Boolean = true,
-    val realisticShadowsOnPlants: Int = 2,
-    val numberOfCorpses: Int = 3,
-    val numberOfRagdolls: Int = 3,
-    val grassDensity: Int = 50,
-    val floraDegradeDistance: Float = 100.0f,
-    val floraLodDetail: Int = 0,
+    // Graphics
+    val shadows: Boolean = false,
+    val characterShadows: Boolean = false,
+    val particles: Boolean = false,
     val characterDetail: Float = 0.5f,
-    val characterShadowDetail: Float = 0.5f,
+    val floraDegradeDistance: Float = 75f,
+    val useOnDemandTextures: Boolean = true,
+    val useInstancing: Boolean = false,
+    val gamma: Float = 2.2f,
+    val maxFramerate: Int = 60,
+    val forceVsync: Boolean = false,
+    val showFramerate: Boolean = false,
 
-    // Gameplay, combat & HUD
-    val battleSize: Float = 0.3422f,
+    // Battle
+    val battleSize: Float = 1.0f,
+    val battleSizeMin: Int = 30,
+    val battleSizeMax: Int = 150,
+    val enableBlood: Boolean = true,
     val combatSpeed: Int = 2,
-    val combatDifficulty: Int = 0,
-    val friendCombatDifficulty: Int = 0,
+    val damageToPlayer: Float = 0.5f,
+    val damageToFriends: Float = 1.0f,
     val reduceCombatAi: Int = 2,
     val reduceCampaignAi: Int = 2,
     val attackDirectionControl: Int = 2,
     val defendDirectionControl: Int = 0,
     val lanceControl: Int = 0,
-    val turnCameraWithHorseInFirstPerson: Int = 2,
-    val displayLabels: Boolean = true,
-    val displayTargetingReticule: Boolean = true,
-    val displayAttackDirection: Boolean = false,
-    val verboseDamage: Boolean = true,
-    val verboseShotDifficulty: Boolean = true,
-    val verboseCasualties: Boolean = true,
-    val verboseExperience: Boolean = true,
-    val realisticHeadshots: Boolean = false,
+    val horseCameraMode: Int = 2,
+    val showCrosshair: Boolean = true,
+    val showReticle: Boolean = true,
+    val showAttackDirection: Boolean = true,
+    val showDamage: Boolean = true,
+    val showShotDifficulty: Boolean = true,
+    val showCasualties: Boolean = true,
+    val showExperienceGain: Boolean = true,
 
-    // Audio & input
+    // Audio and input
     val musicVolume: Float = 0.4f,
     val soundVolume: Float = 1.0f,
-    val disableMusic: Boolean = false,
-    val disableSound: Boolean = false,
+    val music: Boolean = true,
+    val sound: Boolean = true,
     val disableFrequencyVariation: Boolean = false,
-    val useWinmmAudio: Boolean = false,
     val mouseSensitivity: Float = 0.5f,
-    val invertMouse: Boolean = false,
-    val controlMouseMovementYScale: Float = 1.5f,
+    val invertMouseY: Boolean = false,
+    val mouseYScale: Float = 1.5f,
     val enableGamepadVibration: Boolean = true,
 
-    // System, engine & network
-    val firstTime: Boolean = false,
+    // System
     val cheatMode: Boolean = false,
     val enableEditMode: Boolean = false,
-    val forceSingleThreading: Boolean = false,
-    val debugMode: Boolean = false,
-    val useSecureConnection: Boolean = false,
-    val maxNumberOfConnections: Int = 16,
-    val lookForServerOnThisMachine: Boolean = false,
-    val enableVersionCheck: Boolean = true,
 
-    // Unrecognized properties preserved verbatim on round-trip
-    val extraEntries: Map<String, String> = emptyMap()
+    val ini: RglIni = RglIni()
 ) {
     /**
-     * Approximate soldier count using Warband's standard 30..150 scale. WSE2's larger battles
-     * come from `iBattleSizeMax` in its own `rgl_config.ini` (with `fBattleSize` still 0..1), not
-     * from a `battle_size` above 1.0 here: WSE2 v1.1.5.6 does not read `rgl_config.txt`.
+     * Soldiers on the field at the chosen battle size. A module can set its own range in its
+     * `module.ini` (`battle_size_min` / `battle_size_max`, for example 120 to 600); otherwise WSE2
+     * uses `iBattleSizeMin` / `iBattleSizeMax` from this file.
      */
-    val battleSizeTroops: Int
-        get() = (30 + (battleSize.coerceIn(0f, 1f) * 120f).roundToInt()).coerceIn(30, 150)
+    fun battleSizeTroops(moduleRange: IntRange? = null): Int {
+        val lo = moduleRange?.first ?: battleSizeMin
+        val hi = (moduleRange?.last ?: battleSizeMax).coerceAtLeast(lo)
+        return lo + (battleSize.coerceIn(0f, 1f) * (hi - lo)).roundToInt()
+    }
 
+    // Graphics only: a picture preset never changes the size of the armies.
     fun withQualityPreset(presetKey: String): RglConfigState = when (presetKey) {
         "low" -> copy(
-            textureDetail = 50,
-            shaderQuality = 0,
-            antialiasing = 0,
-            anisotropicFiltering = false,
-            shadowmapQuality = 0,
-            enableCharacterShadows = false,
-            enableAccurateShadows = false,
-            enableEnvironmentShadows = false,
-            realisticShadowsOnPlants = 0,
-            postfxHdr = 0,
-            postfxDof = false,
-            postfxAutoexp = false,
-            grassDensity = 20,
-            floraLodDetail = 2,
-            floraDegradeDistance = 60.0f,
+            shadows = false,
+            characterShadows = false,
+            particles = false,
             characterDetail = 0.35f,
-            characterShadowDetail = 0.25f,
-            numberOfCorpses = 1,
-            numberOfRagdolls = 1,
-            battleSize = 0.25f
+            floraDegradeDistance = 60f
         )
         "medium" -> copy(
-            textureDetail = 80,
-            shaderQuality = 1,
-            antialiasing = 1,
-            anisotropicFiltering = true,
-            shadowmapQuality = 1,
-            enableCharacterShadows = true,
-            enableAccurateShadows = false,
-            enableEnvironmentShadows = true,
-            realisticShadowsOnPlants = 1,
-            postfxHdr = 0,
-            postfxDof = false,
-            postfxAutoexp = false,
-            grassDensity = 50,
-            floraLodDetail = 1,
-            floraDegradeDistance = 100.0f,
+            shadows = true,
+            characterShadows = false,
+            particles = true,
             characterDetail = 0.5f,
-            characterShadowDetail = 0.5f,
-            numberOfCorpses = 3,
-            numberOfRagdolls = 2,
-            battleSize = 0.5f
+            floraDegradeDistance = 100f
         )
         "high" -> copy(
-            textureDetail = 100,
-            shaderQuality = 2,
-            antialiasing = 2,
-            anisotropicFiltering = true,
-            shadowmapQuality = 2,
-            enableCharacterShadows = true,
-            enableAccurateShadows = true,
-            enableEnvironmentShadows = true,
-            realisticShadowsOnPlants = 2,
-            postfxHdr = 1,
-            postfxDof = false,
-            postfxAutoexp = true,
-            grassDensity = 80,
-            floraLodDetail = 0,
-            floraDegradeDistance = 150.0f,
+            shadows = true,
+            characterShadows = true,
+            particles = true,
             characterDetail = 1.0f,
-            characterShadowDetail = 1.0f,
-            numberOfCorpses = 5,
-            numberOfRagdolls = 4,
-            battleSize = 1.0f
+            floraDegradeDistance = 150f
         )
         else -> this
     }
 }
 
 object RglConfigOptions {
-    val SHADER_QUALITY_LABELS = listOf("Low", "Medium", "High")
-    val SHADOWMAP_QUALITY_LABELS = listOf("Low", "High", "Ultra")
-    val ANTIALIASING_VALUES = listOf(0, 1, 2, 4, 8)
-    val ANTIALIASING_LABELS = listOf("Off", "1x", "2x", "4x", "8x")
-    val POSTFX_HDR_LABELS = listOf("Off", "Low", "High")
-    val ADAPTER_FORMAT_LABELS = listOf("Default", "16-bit", "32-bit")
-    val DISPLAY_BITS_VALUES = listOf(16, 32)
-    val DISPLAY_BITS_LABELS = listOf("16-bit", "32-bit")
-    val RESOLUTION_PRESETS = listOf(
-        0 to 0,
-        1280 to 720,
-        1600 to 900,
-        1920 to 1080,
-        2560 to 1440
-    )
-    val RESOLUTION_LABELS = listOf("Auto", "720p", "900p", "1080p", "1440p")
-
-    val PLANT_SHADOW_LABELS = listOf("None", "Quick", "Full")
-    val FLORA_LOD_LABELS = listOf("High", "Medium", "Low")
-    val BLOOD_STAINS_LABELS = listOf("Off", "Near", "All")
-    val CORPSES_LABELS = listOf("None", "5", "10", "20", "40", "100", "Unlimited")
-    val RAGDOLLS_LABELS = listOf("None", "3", "5", "10", "Unlimited")
-
     val COMBAT_SPEED_LABELS = listOf("Slowest", "Slower", "Normal", "Faster", "Fastest")
-    val DAMAGE_DIFFICULTY_LABELS = listOf("1/4", "1/2", "Normal")
+    val DAMAGE_VALUES = listOf(0.25f, 0.5f, 1.0f)
+    val DAMAGE_LABELS = listOf("1/4", "1/2", "Full")
     val AI_LEVEL_LABELS = listOf("Good", "Average", "Poor")
     val ATTACK_CONTROL_LABELS = listOf(
         "Mouse movement",
@@ -225,15 +223,19 @@ object RglConfigOptions {
     )
     val LANCE_CONTROL_LABELS = listOf("Automatic", "Manual (Easy)", "Manual (Hard)")
     val HORSE_CAMERA_LABELS = listOf("Never", "On horse", "Always")
+    val BATTLE_SIZE_MAX_VALUES = listOf(150, 300, 500, 1000, 2000, 4000, 6000)
+
+    fun nearestIndex(values: List<Float>, v: Float): Int =
+        values.indices.minByOrNull { abs(values[it] - v) } ?: 0
 }
 
 object RglConfigCodec {
     private fun parseBool(raw: String?, default: Boolean): Boolean {
-        val v = raw?.trim() ?: return default
-        return when (v.lowercase(Locale.US)) {
-            "1", "true", "yes" -> true
-            "0", "false", "no" -> false
-            else -> v.toIntOrNull()?.let { it != 0 } ?: default
+        val v = raw?.trim()?.lowercase(Locale.US) ?: return default
+        return when (v) {
+            "true", "1", "yes" -> true
+            "false", "0", "no" -> false
+            else -> default
         }
     }
 
@@ -248,323 +250,138 @@ object RglConfigCodec {
         return v.coerceIn(min, max)
     }
 
-    private fun b(v: Boolean): String = if (v) "1" else "0"
+    // WSE2's own formats: `true`/`false`, integers, six-decimal floats.
+    private fun b(v: Boolean): String = if (v) "true" else "false"
+    private fun f(v: Float): String = String.format(Locale.US, "%.6f", v)
 
-    private fun f(v: Float): String = String.format(Locale.US, "%.4f", v)
-
-    fun parse(text: String): RglConfigState {
-        val defaults = RglConfigState()
-        val parsed = LinkedHashMap<String, String>()
-        for (rawLine in text.lineSequence()) {
-            val line = rawLine.trim()
-            if (line.isEmpty() || line.startsWith("#") || line.startsWith("//") || line.startsWith(";")) {
-                continue
-            }
-            val eq = line.indexOf('=')
-            if (eq <= 0) continue
-            val key = line.substring(0, eq).trim()
-            val value = line.substring(eq + 1).trim()
-            if (key.isNotEmpty()) {
-                parsed[key] = value
-            }
-        }
-
-        val extras = LinkedHashMap<String, String>()
-        for ((k, v) in parsed) {
-            if (k !in KNOWN_KEYS) {
-                extras[k] = v
-            }
-        }
-
-        return RglConfigState(
-            firstTime = parseBool(parsed["first_time"], defaults.firstTime),
-            textureDetail = parseInt(parsed["texture_detail"], defaults.textureDetail, 10, 100),
-            renderBufferSize = parseInt(parsed["render_buffer_size"], defaults.renderBufferSize, 15, 512),
-            maxFramerate = parseInt(parsed["max_framerate"], defaults.maxFramerate, 30, 240),
-            startWindowed = parseBool(parsed["start_windowed"], defaults.startWindowed),
-            usePixelShaders = parseBool(parsed["use_pixel_shaders"], defaults.usePixelShaders),
-            useVertexShaders = parseBool(parsed["use_vertex_shaders"], defaults.useVertexShaders),
-            fakeReflections = parseBool(parsed["fake_reflections"], defaults.fakeReflections),
-            showFramerate = parseBool(parsed["show_framerate"], defaults.showFramerate),
-            useOnDemandTextures = parseBool(parsed["use_ondemand_textures_"], defaults.useOnDemandTextures),
-            useOnDemandTexturesMt = parseBool(parsed["use_ondemand_textures_mt"], defaults.useOnDemandTexturesMt),
-            disableMusic = parseBool(parsed["disable_music"], defaults.disableMusic),
-            disableSound = parseBool(parsed["disable_sound"], defaults.disableSound),
-            disableFrequencyVariation = parseBool(parsed["disable_frequency_variation"], defaults.disableFrequencyVariation),
-            cheatMode = parseBool(parsed["cheat_mode"], defaults.cheatMode),
-            enableBlood = parseBool(parsed["enable_blood"], defaults.enableBlood),
-            enableEditMode = parseBool(parsed["enable_edit_mode"], defaults.enableEditMode),
-            forceSingleThreading = parseBool(parsed["force_single_threading"], defaults.forceSingleThreading),
-            debugMode = parseBool(parsed["debug_mode"], defaults.debugMode),
-            displayWidth = parseInt(parsed["display_width"], defaults.displayWidth, 0, 7680),
-            displayHeight = parseInt(parsed["display_height"], defaults.displayHeight, 0, 4320),
-            displayBits = parseInt(parsed["display_bits"], defaults.displayBits, 16, 32),
-            antialiasing = parseInt(parsed["antialiasing"], defaults.antialiasing, 0, 8),
-            sampleQuality = parseInt(parsed["sample_quality"], defaults.sampleQuality, 0, 4),
-            alpha2Coverage = parseBool(parsed["alpha2coverage"], defaults.alpha2Coverage),
-            forceVsync = parseBool(parsed["force_vsync"], defaults.forceVsync),
-            shadowmapQuality = parseInt(parsed["shadowmap_quality"], defaults.shadowmapQuality, 0, 2),
-            shaderQuality = parseInt(parsed["shader_quality"], defaults.shaderQuality, 0, 2),
-            postfxDof = parseBool(parsed["postfx_dof"], defaults.postfxDof),
-            postfxHdr = parseInt(parsed["postfx_hdr"], defaults.postfxHdr, 0, 2),
-            postfxAutoexp = parseBool(parsed["postfx_autoexp"], defaults.postfxAutoexp),
-            floraDegradeDistance = parseFloat(parsed["flora_degrade_distance"], defaults.floraDegradeDistance, 40f, 200f),
-            floraLodDetail = parseInt(parsed["flora_lod_detail"], defaults.floraLodDetail, 0, 2),
-            useInstancing = parseBool(parsed["use_instancing"], defaults.useInstancing),
-            useSecureConnection = parseBool(parsed["use_secure_connection"], defaults.useSecureConnection),
-            maxNumberOfConnections = parseInt(parsed["max_number_of_connections"], defaults.maxNumberOfConnections, 2, 200),
-            lookForServerOnThisMachine = parseBool(parsed["look_for_server_on_this_machine"], defaults.lookForServerOnThisMachine),
-            musicVolume = parseFloat(parsed["music_volume"], defaults.musicVolume, 0f, 1f),
-            soundVolume = parseFloat(parsed["sound_volume"], defaults.soundVolume, 0f, 1f),
-            mouseSensitivity = parseFloat(parsed["mouse_sensitivity"], defaults.mouseSensitivity, 0.1f, 2.0f),
-            invertMouse = parseBool(parsed["invert_mouse"], defaults.invertMouse),
-            enableLighting = parseBool(parsed["enable_lighting"], defaults.enableLighting),
-            enableParticles = parseBool(parsed["enable_particles"], defaults.enableParticles),
-            enableCharacterShadows = parseBool(parsed["enable_character_shadows"], defaults.enableCharacterShadows),
-            enableAccurateShadows = parseBool(parsed["enable_accurate_shadows"], defaults.enableAccurateShadows),
-            numberOfCorpses = parseInt(parsed["number_of_corpses"], defaults.numberOfCorpses, 0, 6),
-            grassDensity = parseInt(parsed["grass_density"], defaults.grassDensity, 0, 100),
-            combatSpeed = parseInt(parsed["combat_speed"], defaults.combatSpeed, 0, 4),
-            friendCombatDifficulty = parseInt(parsed["friend_combat_difficulty"], defaults.friendCombatDifficulty, 0, 2),
-            adapterFormat = parseInt(parsed["adapter_format"], defaults.adapterFormat, 0, 2),
-            reduceCombatAi = parseInt(parsed["reduce_combat_ai"], defaults.reduceCombatAi, 0, 2),
-            reduceCampaignAi = parseInt(parsed["reduce_campaign_ai"], defaults.reduceCampaignAi, 0, 2),
-            combatDifficulty = parseInt(parsed["combat_difficulty"], defaults.combatDifficulty, 0, 2),
-            displayLabels = parseBool(parsed["display_labels"], defaults.displayLabels),
-            displayTargetingReticule = parseBool(parsed["display_targeting_reticule"], defaults.displayTargetingReticule),
-            displayAttackDirection = parseBool(parsed["display_attack_direction"], defaults.displayAttackDirection),
-            turnCameraWithHorseInFirstPerson = parseInt(
-                parsed["turn_camera_with_horse_in_first_person"],
-                defaults.turnCameraWithHorseInFirstPerson,
-                0,
-                2
-            ),
-            verboseDamage = parseBool(parsed["verbose_damage"], defaults.verboseDamage),
-            verboseShotDifficulty = parseBool(parsed["verbose_shot_difficulty"], defaults.verboseShotDifficulty),
-            battleSize = parseFloat(parsed["battle_size"], defaults.battleSize, 0f, 1f),
-            attackDirectionControl = parseInt(parsed["attack_direction_control"], defaults.attackDirectionControl, 0, 3),
-            defendDirectionControl = parseInt(parsed["defend_direction_control"], defaults.defendDirectionControl, 0, 3),
-            lanceControl = parseInt(parsed["lance_control"], defaults.lanceControl, 0, 2),
-            anisotropicFiltering = parseBool(parsed["anisotropic_filtering"], defaults.anisotropicFiltering),
-            enableEnvironmentShadows = parseBool(parsed["enable_environment_shadows"], defaults.enableEnvironmentShadows),
-            verboseCasualties = parseBool(parsed["verbose_casualties"], defaults.verboseCasualties),
-            verboseExperience = parseBool(parsed["verbose_experience"], defaults.verboseExperience),
-            realisticShadowsOnPlants = parseInt(parsed["realistic_shadows_on_plants"], defaults.realisticShadowsOnPlants, 0, 2),
-            numberOfRagdolls = parseInt(parsed["number_of_ragdolls"], defaults.numberOfRagdolls, 0, 4),
-            gamma = parseFloat(parsed["gamma"], defaults.gamma, 1.0f, 3.0f),
-            characterDetail = parseFloat(parsed["character_detail"], defaults.characterDetail, 0f, 1f),
-            characterShadowDetail = parseFloat(parsed["character_shadow_detail"], defaults.characterShadowDetail, 0f, 1f),
-            controlMouseMovementYScale = parseFloat(
-                parsed["control_mouse_movement_y_scale"],
-                defaults.controlMouseMovementYScale,
-                0.5f,
-                3.0f
-            ),
-            bloodStains = parseInt(parsed["blood_stains"], defaults.bloodStains, 0, 2),
-            useWinmmAudio = parseBool(parsed["use_winmm_audio"], defaults.useWinmmAudio),
-            enableVersionCheck = parseBool(parsed["enable_version_check"], defaults.enableVersionCheck),
-            enableAspectRatioControl = parseBool(parsed["enable_aspect_ratio_control"], defaults.enableAspectRatioControl),
-            realisticHeadshots = parseBool(parsed["realistic_headshots"], defaults.realisticHeadshots),
-            autoGfxQuality = parseBool(parsed["auto_gfx_quality"], defaults.autoGfxQuality),
-            enableGamepadVibration = parseBool(parsed["enable_gamepad_vibration"], defaults.enableGamepadVibration),
-            extraEntries = extras
-        )
+    private class Key<T>(
+        val section: String,
+        val key: String,
+        val parse: (String?) -> T,
+        val get: (RglConfigState) -> T,
+        val set: (RglConfigState, T) -> RglConfigState,
+        val format: (T) -> String
+    ) {
+        fun read(ini: RglIni, into: RglConfigState): RglConfigState = set(into, parse(ini.get(section, key)))
+        fun changed(a: RglConfigState, b: RglConfigState): Boolean = get(a) != get(b)
+        fun write(ini: RglIni, from: RglConfigState): RglIni = ini.with(section, key, format(get(from)))
     }
 
-    fun serialize(state: RglConfigState): String {
-        val entries = listOf(
-            "first_time" to b(state.firstTime),
-            "texture_detail" to state.textureDetail.toString(),
-            "render_buffer_size" to state.renderBufferSize.toString(),
-            "max_framerate" to state.maxFramerate.toString(),
-            "start_windowed" to b(state.startWindowed),
-            "use_pixel_shaders" to b(state.usePixelShaders),
-            "use_vertex_shaders" to b(state.useVertexShaders),
-            "fake_reflections" to b(state.fakeReflections),
-            "show_framerate" to b(state.showFramerate),
-            "use_ondemand_textures_" to b(state.useOnDemandTextures),
-            "use_ondemand_textures_mt" to b(state.useOnDemandTexturesMt),
-            "disable_music" to b(state.disableMusic),
-            "disable_sound" to b(state.disableSound),
-            "disable_frequency_variation" to b(state.disableFrequencyVariation),
-            "cheat_mode" to b(state.cheatMode),
-            "enable_blood" to b(state.enableBlood),
-            "enable_edit_mode" to b(state.enableEditMode),
-            "force_single_threading" to b(state.forceSingleThreading),
-            "debug_mode" to b(state.debugMode),
-            "display_width" to state.displayWidth.toString(),
-            "display_height" to state.displayHeight.toString(),
-            "display_bits" to state.displayBits.toString(),
-            "antialiasing" to state.antialiasing.toString(),
-            "sample_quality" to state.sampleQuality.toString(),
-            "alpha2coverage" to b(state.alpha2Coverage),
-            "force_vsync" to b(state.forceVsync),
-            "shadowmap_quality" to state.shadowmapQuality.toString(),
-            "shader_quality" to state.shaderQuality.toString(),
-            "postfx_dof" to b(state.postfxDof),
-            "postfx_hdr" to state.postfxHdr.toString(),
-            "postfx_autoexp" to b(state.postfxAutoexp),
-            "flora_degrade_distance" to f(state.floraDegradeDistance),
-            "flora_lod_detail" to state.floraLodDetail.toString(),
-            "use_instancing" to b(state.useInstancing),
-            "use_secure_connection" to b(state.useSecureConnection),
-            "max_number_of_connections" to state.maxNumberOfConnections.toString(),
-            "look_for_server_on_this_machine" to b(state.lookForServerOnThisMachine),
-            "music_volume" to f(state.musicVolume),
-            "sound_volume" to f(state.soundVolume),
-            "mouse_sensitivity" to f(state.mouseSensitivity),
-            "invert_mouse" to b(state.invertMouse),
-            "enable_lighting" to b(state.enableLighting),
-            "enable_particles" to b(state.enableParticles),
-            "enable_character_shadows" to b(state.enableCharacterShadows),
-            "enable_accurate_shadows" to b(state.enableAccurateShadows),
-            "number_of_corpses" to state.numberOfCorpses.toString(),
-            "grass_density" to state.grassDensity.toString(),
-            "combat_speed" to state.combatSpeed.toString(),
-            "friend_combat_difficulty" to state.friendCombatDifficulty.toString(),
-            "adapter_format" to state.adapterFormat.toString(),
-            "reduce_combat_ai" to state.reduceCombatAi.toString(),
-            "reduce_campaign_ai" to state.reduceCampaignAi.toString(),
-            "combat_difficulty" to state.combatDifficulty.toString(),
-            "display_labels" to b(state.displayLabels),
-            "display_targeting_reticule" to b(state.displayTargetingReticule),
-            "display_attack_direction" to b(state.displayAttackDirection),
-            "turn_camera_with_horse_in_first_person" to state.turnCameraWithHorseInFirstPerson.toString(),
-            "verbose_damage" to b(state.verboseDamage),
-            "verbose_shot_difficulty" to b(state.verboseShotDifficulty),
-            "battle_size" to f(state.battleSize),
-            "attack_direction_control" to state.attackDirectionControl.toString(),
-            "defend_direction_control" to state.defendDirectionControl.toString(),
-            "lance_control" to state.lanceControl.toString(),
-            "anisotropic_filtering" to b(state.anisotropicFiltering),
-            "enable_environment_shadows" to b(state.enableEnvironmentShadows),
-            "verbose_casualties" to b(state.verboseCasualties),
-            "verbose_experience" to b(state.verboseExperience),
-            "realistic_shadows_on_plants" to state.realisticShadowsOnPlants.toString(),
-            "number_of_ragdolls" to state.numberOfRagdolls.toString(),
-            "gamma" to f(state.gamma),
-            "character_detail" to f(state.characterDetail),
-            "character_shadow_detail" to f(state.characterShadowDetail),
-            "control_mouse_movement_y_scale" to f(state.controlMouseMovementYScale),
-            "blood_stains" to state.bloodStains.toString(),
-            "use_winmm_audio" to b(state.useWinmmAudio),
-            "enable_version_check" to b(state.enableVersionCheck),
-            "enable_aspect_ratio_control" to b(state.enableAspectRatioControl),
-            "realistic_headshots" to b(state.realisticHeadshots),
-            "auto_gfx_quality" to b(state.autoGfxQuality),
-            "enable_gamepad_vibration" to b(state.enableGamepadVibration)
-        )
+    private val D = RglConfigState()
 
-        val sb = StringBuilder(2200)
-        for ((k, v) in entries) {
-            sb.append(k).append(" = ").append(v).append("\n\n")
-        }
-        for ((k, v) in state.extraEntries) {
-            sb.append(k).append(" = ").append(v).append("\n\n")
-        }
-        return sb.toString()
-    }
+    private fun bool(
+        section: String,
+        key: String,
+        get: (RglConfigState) -> Boolean,
+        set: (RglConfigState, Boolean) -> RglConfigState
+    ) = Key(section, key, { parseBool(it, get(D)) }, get, set, ::b)
 
-    val KNOWN_KEYS: Set<String> = setOf(
-        "first_time",
-        "texture_detail",
-        "render_buffer_size",
-        "max_framerate",
-        "start_windowed",
-        "use_pixel_shaders",
-        "use_vertex_shaders",
-        "fake_reflections",
-        "show_framerate",
-        "use_ondemand_textures_",
-        "use_ondemand_textures_mt",
-        "disable_music",
-        "disable_sound",
-        "disable_frequency_variation",
-        "cheat_mode",
-        "enable_blood",
-        "enable_edit_mode",
-        "force_single_threading",
-        "debug_mode",
-        "display_width",
-        "display_height",
-        "display_bits",
-        "antialiasing",
-        "sample_quality",
-        "alpha2coverage",
-        "force_vsync",
-        "shadowmap_quality",
-        "shader_quality",
-        "postfx_dof",
-        "postfx_hdr",
-        "postfx_autoexp",
-        "flora_degrade_distance",
-        "flora_lod_detail",
-        "use_instancing",
-        "use_secure_connection",
-        "max_number_of_connections",
-        "look_for_server_on_this_machine",
-        "music_volume",
-        "sound_volume",
-        "mouse_sensitivity",
-        "invert_mouse",
-        "enable_lighting",
-        "enable_particles",
-        "enable_character_shadows",
-        "enable_accurate_shadows",
-        "number_of_corpses",
-        "grass_density",
-        "combat_speed",
-        "friend_combat_difficulty",
-        "adapter_format",
-        "reduce_combat_ai",
-        "reduce_campaign_ai",
-        "combat_difficulty",
-        "display_labels",
-        "display_targeting_reticule",
-        "display_attack_direction",
-        "turn_camera_with_horse_in_first_person",
-        "verbose_damage",
-        "verbose_shot_difficulty",
-        "battle_size",
-        "attack_direction_control",
-        "defend_direction_control",
-        "lance_control",
-        "anisotropic_filtering",
-        "enable_environment_shadows",
-        "verbose_casualties",
-        "verbose_experience",
-        "realistic_shadows_on_plants",
-        "number_of_ragdolls",
-        "gamma",
-        "character_detail",
-        "character_shadow_detail",
-        "control_mouse_movement_y_scale",
-        "blood_stains",
-        "use_winmm_audio",
-        "enable_version_check",
-        "enable_aspect_ratio_control",
-        "realistic_headshots",
-        "auto_gfx_quality",
-        "enable_gamepad_vibration"
+    private fun int(
+        section: String,
+        key: String,
+        min: Int,
+        max: Int,
+        get: (RglConfigState) -> Int,
+        set: (RglConfigState, Int) -> RglConfigState
+    ) = Key(section, key, { parseInt(it, get(D), min, max) }, get, set) { it.toString() }
+
+    private fun float(
+        section: String,
+        key: String,
+        min: Float,
+        max: Float,
+        get: (RglConfigState) -> Float,
+        set: (RglConfigState, Float) -> RglConfigState
+    ) = Key(section, key, { parseFloat(it, get(D), min, max) }, get, set, ::f)
+
+    // One entry per edited key. `bMusic` / `bSound` are "on" switches in the file.
+    private val KEYS: List<Key<*>> = listOf(
+        bool("ShadowMap", "bShadowMap", { it.shadows }) { s, v -> s.copy(shadows = v) },
+        bool("FakeCharacterShadows", "bFakeCharacterShadows", { it.characterShadows }) { s, v -> s.copy(characterShadows = v) },
+        bool("ParticleSystems", "bParticleSystems", { it.particles }) { s, v -> s.copy(particles = v) },
+        float("Scene", "fCharacterDetail", 0f, 1f, { it.characterDetail }) { s, v -> s.copy(characterDetail = v) },
+        float("Flora", "fFloraDegradeDistance", 20f, 300f, { it.floraDegradeDistance }) { s, v -> s.copy(floraDegradeDistance = v) },
+        bool("Graphics", "bOnDemandTextures", { it.useOnDemandTextures }) { s, v -> s.copy(useOnDemandTextures = v) },
+        bool("Graphics", "bInstancing", { it.useInstancing }) { s, v -> s.copy(useInstancing = v) },
+        float("Graphics", "fGamma", 1.0f, 3.0f, { it.gamma }) { s, v -> s.copy(gamma = v) },
+        int("General", "iMaxFrameRate", 0, 1000, { it.maxFramerate }) { s, v -> s.copy(maxFramerate = v) },
+        bool("Graphics", "bForceVSync", { it.forceVsync }) { s, v -> s.copy(forceVsync = v) },
+        bool("General", "bShowFrameRate", { it.showFramerate }) { s, v -> s.copy(showFramerate = v) },
+
+        float("Battle", "fBattleSize", 0f, 1f, { it.battleSize }) { s, v -> s.copy(battleSize = v) },
+        int("Battle", "iBattleSizeMin", 1, 100000, { it.battleSizeMin }) { s, v -> s.copy(battleSizeMin = v) },
+        int("Battle", "iBattleSizeMax", 1, 100000, { it.battleSizeMax }) { s, v -> s.copy(battleSizeMax = v) },
+        bool("Battle", "bBlood", { it.enableBlood }) { s, v -> s.copy(enableBlood = v) },
+        int("Battle", "iCombatSpeed", 0, 4, { it.combatSpeed }) { s, v -> s.copy(combatSpeed = v) },
+        float("Battle", "fDamageToSelf", 0f, 1f, { it.damageToPlayer }) { s, v -> s.copy(damageToPlayer = v) },
+        float("Battle", "fDamageToFriends", 0f, 1f, { it.damageToFriends }) { s, v -> s.copy(damageToFriends = v) },
+        int("BattleAi", "iReduceBattleAi", 0, 2, { it.reduceCombatAi }) { s, v -> s.copy(reduceCombatAi = v) },
+        int("CampaignAi", "iReduceCampaignAi", 0, 2, { it.reduceCampaignAi }) { s, v -> s.copy(reduceCampaignAi = v) },
+        int("Battle", "iAttackControl", 0, 3, { it.attackDirectionControl }) { s, v -> s.copy(attackDirectionControl = v) },
+        int("Battle", "iDefendControl", 0, 3, { it.defendDirectionControl }) { s, v -> s.copy(defendDirectionControl = v) },
+        int("Battle", "iLanceControl", 0, 2, { it.lanceControl }) { s, v -> s.copy(lanceControl = v) },
+        int("Battle", "iHorseCameraMode", 0, 2, { it.horseCameraMode }) { s, v -> s.copy(horseCameraMode = v) },
+        bool("Battle", "bShowCrosshair", { it.showCrosshair }) { s, v -> s.copy(showCrosshair = v) },
+        bool("Battle", "bShowReticle", { it.showReticle }) { s, v -> s.copy(showReticle = v) },
+        bool("Battle", "bShowAttackDirection", { it.showAttackDirection }) { s, v -> s.copy(showAttackDirection = v) },
+        bool("Messages", "bShowDamage", { it.showDamage }) { s, v -> s.copy(showDamage = v) },
+        bool("Messages", "bShowShotDifficulty", { it.showShotDifficulty }) { s, v -> s.copy(showShotDifficulty = v) },
+        bool("Messages", "bShowCasualties", { it.showCasualties }) { s, v -> s.copy(showCasualties = v) },
+        bool("Messages", "bShowExperienceGain", { it.showExperienceGain }) { s, v -> s.copy(showExperienceGain = v) },
+
+        float("Sound", "fMusicVolume", 0f, 1f, { it.musicVolume }) { s, v -> s.copy(musicVolume = v) },
+        float("Sound", "fSoundVolume", 0f, 1f, { it.soundVolume }) { s, v -> s.copy(soundVolume = v) },
+        bool("Sound", "bMusic", { it.music }) { s, v -> s.copy(music = v) },
+        bool("Sound", "bSound", { it.sound }) { s, v -> s.copy(sound = v) },
+        bool("Sound", "bDisableFrequencyVariation", { it.disableFrequencyVariation }) { s, v -> s.copy(disableFrequencyVariation = v) },
+        float("Input", "fMouseSensitivity", 0.05f, 3f, { it.mouseSensitivity }) { s, v -> s.copy(mouseSensitivity = v) },
+        bool("Input", "bInvertMouseY", { it.invertMouseY }) { s, v -> s.copy(invertMouseY = v) },
+        float("Input", "fMouseYScale", 0.25f, 4f, { it.mouseYScale }) { s, v -> s.copy(mouseYScale = v) },
+        bool("Input", "bEnableGamepadVibration", { it.enableGamepadVibration }) { s, v -> s.copy(enableGamepadVibration = v) },
+
+        bool("General", "bCheatMode", { it.cheatMode }) { s, v -> s.copy(cheatMode = v) },
+        bool("General", "bEditMode", { it.enableEditMode }) { s, v -> s.copy(enableEditMode = v) }
     )
+
+    /** `Section.key` of every key the launcher edits, in the file's own spelling. */
+    val EDITED_KEYS: List<String> get() = KEYS.map { "${it.section}.${it.key}" }
+
+    fun parse(text: String): RglConfigState = fromIni(RglIni.parse(text))
+
+    fun fromIni(ini: RglIni): RglConfigState =
+        KEYS.fold(RglConfigState(ini = ini)) { state, key -> key.read(ini, state) }
+
+    // The file as read, with only the settings that differ from it rewritten. A key the file
+    // does not have yet is added only when the player changed it, so WSE2 keeps choosing the rest.
+    fun toIni(state: RglConfigState): RglIni {
+        val before = fromIni(state.ini)
+        var ini = state.ini
+        for (key in KEYS) {
+            if (key.changed(state, before)) ini = key.write(ini, state)
+        }
+        return ini
+    }
+
+    fun serialize(state: RglConfigState): String = toIni(state).serialize()
 }
 
-/**
- * Reads and writes `rgl_config.txt` in the recompiled game's user profile Documents folder
- * (`filesDir/recomp/r4/user/Documents/Mount&Blade Warband/rgl_config.txt`).
- */
+/** `battle_size_min` / `battle_size_max` from a module's `module.ini`, or null when it sets none. */
+fun moduleBattleSizeRange(min: Int, max: Int): IntRange? =
+    if (min > 0 && max >= min) min..max else null
+
 // Where the R4 run's exe reads its config: the writable `user` layer maps C:\Users\Player, and
 // SHGetFolderPath(CSIDL_PERSONAL) returns its Documents (engine/include/wse/recomp/shim_files.h).
 //
-// The launcher never writes the file just because it opened: with no file, the exe makes its own
-// on first start, as on Windows, and the Settings screen shows the defaults it would pick. The
-// file is written only when the user changes a setting. A file that exists but cannot be read is
-// never overwritten: `save` first moves it to `rgl_config.txt.unreadable`, and refuses if it cannot.
+// The launcher never writes the file just because it opened: with no file, WSE2 makes its own on
+// first start, as on Windows, and the Settings screen shows the defaults it would pick. The file
+// is written only when the player changes a setting. A file that exists but cannot be read is
+// never overwritten: `save` first moves it to `rgl_config.ini.unreadable`, and refuses if it cannot.
 internal enum class RglConfigSource { MISSING, LOADED, UNREADABLE }
 
 internal object RglConfigStore {
-    private const val RELATIVE_PATH = "wse2/user/Documents/Mount&Blade Warband/rgl_config.txt"
+    private const val RELATIVE_PATH = "wse2/user/Documents/Mount&Blade Warband WSE2/rgl_config.ini"
     private const val UNREADABLE_SUFFIX = ".unreadable"
+    private const val RESET_SUFFIX = ".before_reset"
 
     fun configFile(filesDir: File): File = File(filesDir, RELATIVE_PATH)
 
@@ -587,7 +404,7 @@ internal object RglConfigStore {
             file.parentFile?.mkdirs()
             if (file.exists() && !readable(file)) {
                 val kept = File(file.parentFile, file.name + UNREADABLE_SUFFIX)
-                if (kept.exists() && !kept.delete()) return false
+                if (kept.exists() && !kept.deleteRecursively()) return false
                 if (!file.renameTo(kept)) return false
             }
             val tmp = File(file.parentFile, "${file.name}.tmp")
@@ -597,6 +414,21 @@ internal object RglConfigStore {
                 tmp.delete()
             }
             true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    // WSE2 writes a complete file of its own defaults when none exists, so a reset moves the file
+    // aside (`rgl_config.ini.before_reset`, replacing an older one) instead of guessing defaults.
+    fun reset(filesDir: File): Boolean {
+        UserStorage.migrateLegacyUserDirIfNeeded(filesDir)
+        return try {
+            val file = configFile(filesDir)
+            if (!file.exists()) return true
+            val kept = File(file.parentFile, file.name + RESET_SUFFIX)
+            if (kept.exists() && !kept.deleteRecursively()) return false
+            file.renameTo(kept)
         } catch (_: Throwable) {
             false
         }

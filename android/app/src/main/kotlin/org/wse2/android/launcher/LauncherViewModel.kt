@@ -65,7 +65,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     private val app: Application = application
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val settingsExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    // rgl_config.txt changes run on settingsExecutor against `rglOnDisk`, the state last read from
+    // rgl_config.ini changes run on settingsExecutor against `rglOnDisk`, the state last read from
     // or written to the file (executor thread only), so a change made before the file was read
     // never writes defaults over it. The screen updates at once when the file is already read.
     // Declared before `init`, which queues the file's first read.
@@ -1137,20 +1137,31 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             val base = rglOnDisk ?: RglConfigStore.load(filesDir).first
             val updated = transform(base)
             if (updated == base) return@execute
-            writeRglConfig(filesDir, updated, okToast = null, failToast = "Could not save rgl_config.txt.")
+            writeRglConfig(filesDir, updated, okToast = null, failToast = "Could not save the game settings.")
         }
     }
 
     fun resetRglConfigToDefaults() {
         val filesDir = app.filesDir
         settingsExecutor.execute {
-            val base = rglOnDisk ?: RglConfigStore.load(filesDir).first
-            writeRglConfig(
-                filesDir,
-                RglConfigState(extraEntries = base.extraEntries),
-                okToast = "rgl_config.txt restored to defaults.",
-                failToast = "Could not reset rgl_config.txt."
-            )
+            // WSE2 writes its own defaults when the file is missing; the old file is kept aside.
+            val ok = RglConfigStore.reset(filesDir)
+            if (ok) rglOnDisk = null
+            mainHandler.post {
+                if (isCleared.get()) return@post
+                if (ok) {
+                    _settingsState.value = _settingsState.value.copy(
+                        rglConfig = RglConfigState(),
+                        rglConfigReady = false
+                    )
+                }
+                _events.trySend(
+                    LauncherEvent.ShowToast(
+                        if (ok) "Game settings go back to defaults on the next start."
+                        else "Could not reset the game settings."
+                    )
+                )
+            }
         }
     }
 
@@ -1509,7 +1520,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                     displayName = m.optString("display_name", ""),
                     hasScriptsTxt = m.optBoolean("has_scripts_txt", false),
                     loadResourceCount = m.optInt("load_resource_count", 0),
-                    loadModResourceCount = m.optInt("load_mod_resource_count", 0)
+                    loadModResourceCount = m.optInt("load_mod_resource_count", 0),
+                    battleSizeMin = m.optInt("battle_size_min", 0),
+                    battleSizeMax = m.optInt("battle_size_max", 0)
                 )
                 parsedModules.add(mod)
                 installStatuses[mod.modulePath] = ModuleInstallStatus(InstallCheckState.CHECKING)

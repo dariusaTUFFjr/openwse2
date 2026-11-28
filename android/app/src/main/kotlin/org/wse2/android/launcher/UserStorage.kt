@@ -5,7 +5,7 @@ import java.io.File
 /**
  * Permanent app-private user storage layout (`docs/PLATFORM_PLAN.md` "P14.3").
  *
- * Keeps saves, `rgl_config.txt`, and per-module profiles under `filesDir/wse2/user/`
+ * Keeps saves, `rgl_config.ini`, and per-module profiles under `filesDir/wse2/user/`
  * (separate from `filesDir/recomp/r4/` caches) and migrates any existing legacy
  * `filesDir/recomp/r4/user/` tree once without overwriting newer files.
  */

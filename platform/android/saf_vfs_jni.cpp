@@ -509,6 +509,10 @@ Java_org_wse2_android_WseSafBridge_nativeScanTree(JNIEnv* env, jobject thiz) {
         json.append(std::to_string(m.load_mod_resource_count));
         json.append(",\"compatible_with_warband\":");
         wse::core::wse_append_json_string(json, m.compatible_with_warband);
+        json.append(",\"battle_size_min\":");
+        json.append(std::to_string(m.battle_size_min));
+        json.append(",\"battle_size_max\":");
+        json.append(std::to_string(m.battle_size_max));
         json.push_back('}');
     }
     json.append("],\"languages\":[");

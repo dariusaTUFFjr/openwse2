@@ -334,13 +334,19 @@ yet):
   `ModuleArtGraphic` uses unbounded blur behind an opaque dark offscreen base and 6% overscan,
   removing the thin bright line along the hero's top edge in portrait and landscape.
 - Settings and Advanced: editorial headers; three long Advanced button labels shortened.
-- Settings edits `rgl_config.txt` (`RglConfig.kt`): every key of a Warband config, grouped in six
-  categories, unknown keys kept as written, and the quality preset, frame-rate cap and present
-  mode mirrored into it. The file is the one the R4 run's exe reads (`filesDir/recomp/r4/user/
-  Documents/Mount&Blade Warband/`). Opening the app writes nothing: with no file the exe makes its
-  own, as on Windows, and the screen shows defaults. The first change writes it; a change made
-  before the file was read applies to the file's contents, never to defaults. A file that cannot
-  be read is moved to `rgl_config.txt.unreadable` before a write, never overwritten.
+- Settings edits WSE2's `rgl_config.ini` (`RglConfig.kt`; until 2026-11-28 it wrote the old
+  Warband `rgl_config.txt`, which WSE2 v1.1.5.6 never reads): 42 keys under Graphics, Battle,
+  Gameplay, Audio & Input and System, each a key WSE2 itself writes (`[Battle] fBattleSize`,
+  `[ShadowMap] bShadowMap`, `[Sound] fMusicVolume`, ...). Every other line of the file (some 700
+  keys), its order and its CRLF endings are kept; a change rewrites only its own line, and a key
+  the file lacks is added only when the player changes it. The quality preset (picture keys only),
+  frame-rate cap and present mode are mirrored into it. The file is
+  `filesDir/wse2/user/Documents/Mount&Blade Warband WSE2/rgl_config.ini`, where the R4 run's exe
+  looks. Opening the app writes nothing: with no file WSE2 makes its own, as on Windows. A file
+  that cannot be read is moved to `rgl_config.ini.unreadable` before a write, never overwritten;
+  "Reset game settings" moves the file to `rgl_config.ini.before_reset` so WSE2 writes its own
+  defaults. Keys whose values could not be checked against WSE2 (texture and shader quality,
+  MSAA, corpses and ragdolls, grass) are left to the game's own Options menu.
 
 ## P14 — Phase 5 launcher, save manager, and in-game touch QoL (planned, 2026-11-21)
 
@@ -387,10 +393,10 @@ screens into the player-facing shell for real gameplay on `arm64-v8a` phones (An
   newer WSE2 build hits an unshimmed import.
 - **Frame-time HUD & WSE2 battle-size limits:** Expand the optional FPS overlay to show per-frame
   CPU time, GPU time, and Android thermal tier (`PowerManager`) so R5/R8/R9 sustained targets can be
-  measured on device. Update the Settings battle-size editor so high-end devices can configure
-  WSE2's larger battles: WSE2 v1.1.5.6 reads `Documents/Mount&Blade Warband WSE2/rgl_config.ini`
-  (`fBattleSize` stays `0.0..1.0`; the troop range is `iBattleSizeMin` / `iBattleSizeMax`) and does
-  not read `rgl_config.txt`, so the editor must write the `.ini`.
+  measured on device. Battle size (done 2026-11-28): the editor writes `rgl_config.ini`
+  (`fBattleSize` `0.0..1.0` between `iBattleSizeMin` and `iBattleSizeMax`, "Largest battle" up to
+  6,000). A module's own `battle_size_min` / `battle_size_max` in `module.ini` (108 Heroes Test:
+  120 to 600) comes from the module scan and sets the troop count the slider shows.
 
 | Unit | What | Depends on | Done when |
 | --- | --- | --- | --- |
