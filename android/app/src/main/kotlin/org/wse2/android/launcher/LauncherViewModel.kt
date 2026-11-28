@@ -419,6 +419,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     fun onRecompActivityReturned() {
         r4Runner.refreshAllStorageSizes()
         refreshDiagnostics()
+        restoreRglConfig()
         syncSaveMirrorNow(silentIfUnset = true)
         val reportFile = File(app.filesDir, "recomp/r4/report.txt")
         val text = try {
@@ -1168,7 +1169,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     // Executor thread only.
     private fun writeRglConfig(filesDir: File, next: RglConfigState, okToast: String?, failToast: String) {
         val saved = RglConfigStore.save(filesDir, next)
-        if (saved) rglOnDisk = next
+        if (saved) rglOnDisk = next.copy(ini = RglConfigCodec.toIni(next))
         val shown = rglOnDisk ?: RglConfigState()
         mainHandler.post {
             if (isCleared.get()) return@post
@@ -1280,7 +1281,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             val (cfg, source) = RglConfigStore.load(filesDir)
             // Defaults for a missing file are what the exe would write; an unreadable file is kept
             // (save moves it aside) and is not taken as the state on disk.
-            if (source == RglConfigSource.LOADED) rglOnDisk = cfg
+            rglOnDisk = if (source == RglConfigSource.LOADED) cfg else null
             mainHandler.post {
                 if (isCleared.get()) return@post
                 rglLoaded = true

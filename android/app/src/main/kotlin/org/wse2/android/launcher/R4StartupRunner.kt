@@ -910,8 +910,6 @@ class R4StartupRunner private constructor(private val app: Application) {
         private const val PREF_IMPORTED_PGO_SHA = "imported_zip_pgo_sha256"  // its wse_pgo.txt, if any
         private const val PREF_DECLINED_ZIP = "declined_zip"
         private val PREPARED_ZIP = Regex("""(?i)wse2-prepared.*\.zip""")
-        private val PREPARED_PART = Regex("""(exe|lua5164)_w\d+\.(so|key)""")
-        private val PREPARED_TEXTURE = Regex("""[0-9a-f]{16}\.etc2""")
         // Kept across launcher restarts, so a run Android keeps killing whole still slows down and
         // gives up: the cached batch count when the worker was last bound, the deaths in a row
         // without a new batch, and the resumes so far.
