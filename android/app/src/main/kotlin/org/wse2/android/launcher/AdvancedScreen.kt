@@ -63,6 +63,15 @@ fun AdvancedScreen(
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onClearInstallCache: () -> Unit = {},
     onClearTextureCache: () -> Unit = {},
+    onClearSoCache: () -> Unit = {},
+    onClearShaderCache: () -> Unit = {},
+    onClearSaveBackups: () -> Unit = {},
+    onOpenSaveManager: () -> Unit = {},
+    onCustomDriverSharedBuffersChange: (Boolean) -> Unit = {},
+    onStrictTsoChange: (Boolean) -> Unit = {},
+    onRecordPgoProfileChange: (Boolean) -> Unit = {},
+    onClearPgoProfile: () -> Unit = {},
+    onClearCrashReport: () -> Unit = {},
     onDismissR4Report: () -> Unit = {},
     onPictureResolutionChange: (Int) -> Unit = {},
     onPictureSharpenChange: (Boolean) -> Unit = {},
@@ -75,6 +84,8 @@ fun AdvancedScreen(
         treeUri != null &&
         !state.scanState.inProgress
     var showLicencesDialog by remember { mutableStateOf(false) }
+    var showCrashReportDialog by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf<ConfirmClear?>(null) }
 
     Box(
         modifier = modifier
@@ -158,6 +169,15 @@ fun AdvancedScreen(
                     checked = state.driverState.allowMockFallback,
                     enabled = true,
                     onCheckedChange = onAllowMockFallbackChange
+                )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Custom driver zero-copy buffers",
+                    supporting = "Experimental AHardwareBuffer bridge for PanVK/Turnip (off uses reliable CPU upload)",
+                    checked = state.customDriverSharedBuffers,
+                    enabled = true,
+                    onCheckedChange = onCustomDriverSharedBuffersChange
                 )
                 LauncherSectionDivider()
 
@@ -325,46 +345,95 @@ fun AdvancedScreen(
                     enabled = liveVulkanEnabled,
                     onClick = onLaunchRecompVulkan
                 )
-                val cacheMb = r4State.installCacheBytes / (1024L * 1024L)
                 val clearCacheEnabled = !r4State.running && !r0State.running
+                val soMb = r4State.soCacheBytes / (1024L * 1024L)
+                val texCacheMb = r4State.textureCacheBytes / (1024L * 1024L)
+                val shaderMb = r4State.shaderCacheBytes / (1024L * 1024L)
+                val cacheMb = r4State.installCacheBytes / (1024L * 1024L)
+                val backupsMb = r4State.saveBackupsBytes / (1024L * 1024L)
+
                 WseListRow(
-                    title = "Copied game files",
-                    supporting = "$cacheMb MB kept in the app so the game loads faster. Free " +
-                        "this space if you need it; the game copies files again as it reads them.",
+                    title = "Manage saved games",
+                    supporting = "Inspect, import/export .sav files, restore backups, and configure auto-sync mirror.",
+                    trailing = {
+                        Text(
+                            text = "Open",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = colors.primary
+                        )
+                    },
+                    showDivider = true,
+                    onClick = onOpenSaveManager
+                )
+                WseListRow(
+                    title = "Translated game code",
+                    supporting = "$soMb MB of prepared arm64 code batches. Freeing this requires translating again or re-importing a PC zip.",
                     trailing = {
                         Text(
                             text = "Free up",
                             style = MaterialTheme.typography.labelLarge,
-                            color = if (clearCacheEnabled) {
-                                colors.primary
-                            } else {
-                                colors.onSurfaceVariant.copy(alpha = 0.45f)
-                            }
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = { confirmClear = ConfirmClear.TRANSLATED_CODE }
+                )
+                WseListRow(
+                    title = "Converted textures",
+                    supporting = "$texCacheMb MB. Textures converted for your phone's graphics chip. Cleared files are converted again on the next load.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = onClearTextureCache
+                )
+                WseListRow(
+                    title = "Vulkan shader cache",
+                    supporting = "$shaderMb MB of compiled graphics shaders. Rebuilds automatically if cleared.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
+                        )
+                    },
+                    showDivider = true,
+                    enabled = clearCacheEnabled,
+                    onClick = onClearShaderCache
+                )
+                WseListRow(
+                    title = "Copied game files",
+                    supporting = "$cacheMb MB kept in the app so the game loads faster. Free this space if you need it; the game copies files again as it reads them.",
+                    trailing = {
+                        Text(
+                            text = "Free up",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
                         )
                     },
                     showDivider = true,
                     enabled = clearCacheEnabled,
                     onClick = onClearInstallCache
                 )
-                val texCacheMb = r4State.textureCacheBytes / (1024L * 1024L)
                 WseListRow(
-                    title = "Converted textures",
-                    supporting = "$texCacheMb MB. Textures converted for your phone's graphics chip. " +
-                        "Cleared files are converted again on the next load.",
+                    title = "Savegame rolling backups",
+                    supporting = "$backupsMb MB of automatic .bak1-.bak3 save backups. Live saves are untouched.",
                     trailing = {
                         Text(
                             text = "Free up",
                             style = MaterialTheme.typography.labelLarge,
-                            color = if (clearCacheEnabled) {
-                                colors.primary
-                            } else {
-                                colors.onSurfaceVariant.copy(alpha = 0.45f)
-                            }
+                            color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
                         )
                     },
                     showDivider = true,
                     enabled = clearCacheEnabled,
-                    onClick = onClearTextureCache
+                    onClick = { confirmClear = ConfirmClear.SAVE_BACKUPS }
                 )
                 // Saves the report as a file the player picks, during a run too (the user's
                 // request, 2026-11-21: keep the phone's report when finishing on the PC).
@@ -423,6 +492,74 @@ fun AdvancedScreen(
                     enabled = !r4State.running,
                     onCheckedChange = onR4UseCopyChange
                 )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Strict memory ordering (TSO)",
+                    supporting = "Slower safe fallback for mods with lock-free thread races (re-translates on change).",
+                    checked = state.strictTso,
+                    enabled = !r4State.running,
+                    onCheckedChange = onStrictTsoChange
+                )
+                LauncherSectionDivider()
+
+                SwitchListItem(
+                    headline = "Record performance profile (PGO)",
+                    supporting = "Samples hot game loops during play (${state.pgoProfileSummary}) to speed up future runs.",
+                    checked = state.recordPgoProfile,
+                    enabled = !r4State.running,
+                    onCheckedChange = onRecordPgoProfileChange
+                )
+                if (state.pgoProfileSummary != "None") {
+                    LauncherSectionDivider()
+                    WseListRow(
+                        title = "Clear performance profile",
+                        supporting = state.pgoProfileSummary,
+                        trailing = {
+                            Text(
+                                text = "Clear",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.primary
+                            )
+                        },
+                        showDivider = false,
+                        enabled = !r4State.running,
+                        onClick = onClearPgoProfile
+                    )
+                }
+            }
+
+            state.crashReportText?.let { crashText ->
+                LauncherSectionHeader(title = "Diagnostics")
+                LauncherGroupedCard {
+                    WseListRow(
+                        title = "Last crash report",
+                        supporting = crashText.lineSequence().firstOrNull { it.isNotBlank() } ?: "Crash report available",
+                        trailing = {
+                            Text(
+                                text = "View",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.primary
+                            )
+                        },
+                        showDivider = true,
+                        onClick = { showCrashReportDialog = true }
+                    )
+                    WseListRow(
+                        title = "Clear crash report",
+                        supporting = "Removes the saved crash_report.txt diagnostic log.",
+                        enabled = !r4State.running,
+                        trailing = {
+                            Text(
+                                text = "Clear",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.primary
+                            )
+                        },
+                        showDivider = false,
+                        onClick = onClearCrashReport
+                    )
+                }
             }
 
             LauncherSectionHeader(title = "Status Log")
@@ -508,7 +645,52 @@ fun AdvancedScreen(
             onDismissRequest = { showLicencesDialog = false }
         )
     }
+
+    if (showCrashReportDialog && state.crashReportText != null) {
+        val context = LocalContext.current
+        WseDialog(
+            title = "Last crash report",
+            text = state.crashReportText,
+            confirm = WseDialogAction("Copy") {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("WSE2 crash report", state.crashReportText))
+                Toast.makeText(context, "Crash report copied.", Toast.LENGTH_SHORT).show()
+                showCrashReportDialog = false
+            },
+            dismiss = WseDialogAction("Close") { showCrashReportDialog = false },
+            onDismissRequest = { showCrashReportDialog = false }
+        )
+    }
+
+    when (confirmClear) {
+        ConfirmClear.TRANSLATED_CODE -> WseDialog(
+            title = "Free up translated game code?",
+            text = "The game's code was translated for your phone, which can take a long time. " +
+                "If you free this space, it is translated again the next time you play " +
+                "(or imported again from a zip prepared on your PC).",
+            confirm = WseDialogAction("Free up") {
+                confirmClear = null
+                onClearSoCache()
+            },
+            dismiss = WseDialogAction("Keep") { confirmClear = null },
+            onDismissRequest = { confirmClear = null }
+        )
+        ConfirmClear.SAVE_BACKUPS -> WseDialog(
+            title = "Delete all save backups?",
+            text = "This permanently deletes the older copies of every save, including saves you " +
+                "deleted in the Save Manager. Your current saves stay.",
+            confirm = WseDialogAction("Delete backups") {
+                confirmClear = null
+                onClearSaveBackups()
+            },
+            dismiss = WseDialogAction("Keep") { confirmClear = null },
+            onDismissRequest = { confirmClear = null }
+        )
+        null -> Unit
+    }
 }
+
+private enum class ConfirmClear { TRANSLATED_CODE, SAVE_BACKUPS }
 
 @Composable
 private fun rememberFontLicencesText(): String {

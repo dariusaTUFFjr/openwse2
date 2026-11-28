@@ -120,6 +120,8 @@ public:
 
     // Where system DLLs report living (GetModuleFileName).
     std::string system_dir = "C:\\Windows\\System32\\";
+    // Optional callback when LoadLibrary* cannot find/load a DLL (requested spelling, canonical name).
+    std::function<void(const std::string& requested, const std::string& canonical)> on_missing_library;
 
     // Registers a translated image mapped at `img.image_base` (relocated already, if it moved),
     // `path` being the Windows path it was loaded from. The exe comes first. Reads its exports and
@@ -584,6 +586,9 @@ private:
         }
         Module* m = find(name, true);
         if (m == nullptr) {
+            if (on_missing_library) {
+                on_missing_library(name, canonical_module_name(name));
+            }
             return fail(s, kErrorModNotFound);
         }
         {

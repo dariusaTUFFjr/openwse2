@@ -675,6 +675,7 @@ if(WSE_ENABLE_LLVM)
         engine/src/recomp/llvm_common.h engine/src/recomp/recomp_llvm.h engine/src/recomp/r4_startup.cpp
         engine/include/wse/recomp/cpu_state.h engine/include/wse/recomp/x86_decode.h
         engine/include/wse/recomp/x86_interp.h engine/include/wse/recomp/pe_image.h
+        engine/include/wse/recomp/pgo_profile.h
         engine/include/wse/recomp/runtime.h engine/include/wse/recomp/seh.h)
     set(_wse_lifter_text "")
     foreach(_f IN LISTS _wse_lifter_sources)
@@ -819,7 +820,7 @@ if(WSE_ENABLE_LLVM)
     if(WSE_BUILD_ANDROID_APP)
         # The translator on the phone: Advanced > "R0 spikes" (`r0_jni.cpp`), "R4 startup run",
         # and R5a live Vulkan run (`r4_jni.cpp`, run in the isolated `:recomp` process).
-        add_library(wse_r0 SHARED platform/android/r0_jni.cpp platform/android/r4_jni.cpp)
+        add_library(wse_r0 SHARED platform/android/r0_jni.cpp platform/android/r4_jni.cpp platform/android/perf_hint.cpp)
         target_link_libraries(wse_r0 PRIVATE wse_recomp wse_vulkan wse_audio android aaudio log)
         target_link_options(wse_r0 PRIVATE "-Wl,--gc-sections" "-Wl,--exclude-libs,ALL")
         wse_apply_strict_warnings(wse_r0)

@@ -78,6 +78,10 @@ struct VulkanD3d9Config {
                        std::string_view presentation_path)>
         on_frame_presented{};
     std::string texture_cache_dir{};       // optional on-disk ETC2 cache directory (empty = no disk cache)
+    // LRU cap for texture_cache_dir (0 = uncapped). The PC-prepared pack alone is ~620 MB for
+    // Native (every size cap) and larger mods convert more, so the cap must sit well above a
+    // module's working set or each start deletes textures the next load converts again.
+    std::uint64_t max_texture_cache_bytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
     bool prefer_etc2 = true;               // transcode DDS to ETC2 when BC is not used and ETC2 is supported
     bool simulate_etc2 = false;            // PC check: transcode to ETC2, decode back to RGBA8 and upload RGBA8
     unsigned etc2_threads = 0U;            // 0 = min(4, hardware_concurrency)
@@ -156,6 +160,28 @@ public:
     void set_thermal_status(ThermalStatus status) noexcept;
     // Active render scale in [0.5, 1.0] for the current/next frame.
     [[nodiscard]] float current_render_scale() const noexcept;
+    // P14.2 live in-game quick-settings drawer update (thread-safe, applies on next frame).
+    void set_graphics_options(float render_scale, bool auto_resolution, float sharpness,
+                              bool fxaa, float target_fps) noexcept;
+    // P14.4 per-frame CPU/GPU/thermal telemetry snapshot.
+    struct FrameTimings {
+        double frame_ms = 0.0;
+        double cpu_ms = 0.0;
+        double gpu_ms = -1.0;  // <0 when VkQueryPool timestamps are unavailable
+        float render_scale = 1.0F;
+        ThermalStatus thermal = ThermalStatus::None;
+    };
+    [[nodiscard]] FrameTimings last_frame_timings() const noexcept;
+    struct DrawStats {
+        std::uint64_t draws = 0;
+        std::uint64_t merged_draws = 0;
+        std::uint64_t ubo_uploads_vs = 0;
+        std::uint64_t ubo_uploads_ps = 0;
+        std::uint64_t ubo_reused_vs = 0;
+        std::uint64_t ubo_reused_ps = 0;
+        std::uint64_t state_binds_skipped = 0;
+    };
+    [[nodiscard]] DrawStats draw_stats() const noexcept;
     // Persists VkPipelineCache to `config.pipeline_cache_path` (safe to call before process exit).
     void flush_pipeline_cache() noexcept;
     [[nodiscard]] std::string active_presentation_path() const;

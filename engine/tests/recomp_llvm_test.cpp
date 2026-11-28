@@ -19,12 +19,14 @@
 #include <string>
 #include <vector>
 
+#include "../src/recomp/code_loader.h"
 #include "../src/recomp/discover.h"
 #include "../src/recomp/lift_r1.h"
 #include "../src/recomp/r0_spikes.h"
 #include "../src/recomp/recomp_llvm.h"
 #include "wse/recomp/pe_image.h"
 #include "wse/recomp/r0_inputs.h"
+#include "wse/recomp/pgo_profile.h"
 #include "wse/recomp/runtime.h"
 #include "wse/recomp/seh.h"
 #include "wse/platform/vfs.h"
@@ -782,6 +784,413 @@ void test_discover_leaf_byte_jump_table() {
            "R7 discover: leaf byte-table jump table with no .pdata bounds entries to [entry, table)");
 }
 
+void test_cross_batch_direct_calls(const char* dir) {
+    // R8: direct cross-batch `call` and tail `jmp` lower through writable `wse_ext_calls[]`.
+    // Before patching, calls fall back cleanly to `Runtime::hook_dispatch`; after
+    // `Runtime::patch_external_calls`, both `dlopen` and `LoadedCode::load_own` jump straight to
+    // the callee without touching `Runtime::hook_dispatch`.
+    constexpr std::uint64_t kImgBase = 0x100000ULL;
+    constexpr std::uint64_t kCalleeVa = kImgBase + 0x1000U;
+    constexpr std::uint64_t kCallerVa = kImgBase + 0x1100U;
+    constexpr std::uint64_t kTailVa = kImgBase + 0x1200U;
+    std::vector<std::uint8_t> img(0x2000U, 0xCCU);
+    // Callee @ 0x101000: mov rax, rcx; add rax, 7; ret
+    const std::uint8_t callee_bytes[] = {0x48, 0x89, 0xC8, 0x48, 0x83, 0xC0, 0x07, 0xC3};
+    std::memcpy(img.data() + 0x1000U, callee_bytes, sizeof(callee_bytes));
+    // Caller @ 0x101100: call 0x101000; add rax, 3; ret (rel32 = 0x101000 - 0x101105 = -0x105)
+    const std::uint8_t caller_bytes[] = {0xE8, 0xFB, 0xFE, 0xFF, 0xFF, 0x48, 0x83, 0xC0, 0x03, 0xC3};
+    std::memcpy(img.data() + 0x1100U, caller_bytes, sizeof(caller_bytes));
+    // Tail @ 0x101200: add rcx, 10; jmp 0x101000 (rel32 = 0x101000 - 0x101209 = -0x209)
+    const std::uint8_t tail_bytes[] = {0x48, 0x83, 0xC1, 0x0A, 0xE9, 0xF7, 0xFD, 0xFF, 0xFF};
+    std::memcpy(img.data() + 0x1200U, tail_bytes, sizeof(tail_bytes));
+
+    const ImageView view(img.data(), kImgBase, img.size(), kImgBase + 0x1000U, kImgBase + 0x1400U);
+    const std::set<std::uint64_t> entries{kCalleeVa, kCallerVa, kTailVa};
+    Discoverer disc(view);
+    ImageInfo info;
+    info.base = kImgBase;
+
+    auto emit_batch = [&](const std::vector<std::uint64_t>& vas, const std::string& tag) -> std::string {
+        R1Translator tr(info);
+        tr.declare(vas);
+        std::string why;
+        for (const std::uint64_t va : vas) {
+            expect(tr.lift(disc.discover(va, entries), &why), ("R8 cross-batch lift " + tag).c_str());
+        }
+        std::vector<char> obj;
+        std::string err;
+        expect(tr.emit_object(2, obj, nullptr, &err) && !obj.empty(), ("R8 cross-batch emit " + tag).c_str());
+        const std::string o = std::string(dir) + "/" + tag + ".o";
+        const std::string so = std::string(dir) + "/" + tag + ".so";
+        std::ofstream(o, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
+        std::string log;
+        expect(link_shared_object({o}, so, &log), ("R8 cross-batch link " + tag).c_str());
+        return so;
+    };
+
+    const std::string so_b = emit_batch({kCalleeVa}, "r8_batch_b");
+    const std::string so_a = emit_batch({kCallerVa, kTailVa}, "r8_batch_a");
+
+    auto run_with_loader = [&](bool own_loader) {
+        auto load = [&](const std::string& path, LoadedCode& out) {
+            std::string err;
+            if (own_loader) {
+                std::ifstream in(path, std::ios::binary);
+                std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                return out.load_own(bytes, &err);
+            }
+            void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (h == nullptr) return false;
+            out.adopt_handle(h);
+            return true;
+        };
+        LoadedCode code_a;
+        LoadedCode code_b;
+        expect(load(so_a, code_a) && load(so_b, code_b),
+               own_loader ? "R8 cross-batch: load_own loads both batches" : "R8 cross-batch: dlopen loads both batches");
+        Runtime rt;
+        rt.add_table(static_cast<const FnRow*>(code_a.sym("wse_fn_table")),
+                     static_cast<std::size_t>(*static_cast<const std::uint64_t*>(code_a.sym("wse_fn_table_count"))));
+        rt.add_table(static_cast<const FnRow*>(code_b.sym("wse_fn_table")),
+                     static_cast<std::size_t>(*static_cast<const std::uint64_t*>(code_b.sym("wse_fn_table_count"))));
+
+        // Unpatched fallback works through `Runtime::hook_dispatch`.
+        {
+            GuestStack stack;
+            CpuState s;
+            stack.prepare(s);
+            s.gpr[1] = 32;
+            expect(rt.run(s, kCallerVa) && s.gpr[0] == 42, "R8 cross-batch: unpatched direct call works");
+            stack.prepare(s);
+            s.gpr[1] = 32;
+            expect(rt.run(s, kTailVa) && s.gpr[0] == 49, "R8 cross-batch: unpatched direct tail-call works");
+        }
+
+        // Patch `wse_ext_calls[]` and prove direct calls bypass `hooks->dispatch` completely.
+        const auto* cnt = static_cast<const std::uint64_t*>(code_a.sym("wse_ext_call_count"));
+        auto* slots = static_cast<GuestFn*>(code_a.sym("wse_ext_calls"));
+        const auto* vas = static_cast<const std::uint64_t*>(code_a.sym("wse_ext_call_vas"));
+        expect(cnt != nullptr && *cnt == 1U && slots != nullptr && vas != nullptr && vas[0] == kCalleeVa,
+               "R8 cross-batch: batch A exports 1 external call slot for callee");
+        expect(rt.patch_external_calls(slots, vas, static_cast<std::size_t>(*cnt)) == 1U,
+               "R8 cross-batch: patch_external_calls resolves callee");
+
+        static int dispatch_hits = 0;
+        dispatch_hits = 0;
+        RuntimeHooks trap_hooks = *rt.hooks();
+        trap_hooks.dispatch = [](CpuState*, std::uint64_t) { ++dispatch_hits; };
+        {
+            GuestStack stack;
+            CpuState s;
+            stack.prepare(s);
+            s.hooks = &trap_hooks;
+            s.gpr[1] = 100;
+            rt.find(kCallerVa)(&s);
+            expect(s.gpr[0] == 110 && dispatch_hits == 0,
+                   own_loader ? "R8 cross-batch (load_own): patched call skips dispatch"
+                              : "R8 cross-batch (dlopen): patched call skips dispatch");
+            stack.prepare(s);
+            s.hooks = &trap_hooks;
+            s.gpr[1] = 100;
+            rt.find(kTailVa)(&s);
+            expect(s.gpr[0] == 117 && dispatch_hits == 0,
+                   own_loader ? "R8 cross-batch (load_own): patched tail-call skips dispatch"
+                              : "R8 cross-batch (dlopen): patched tail-call skips dispatch");
+        }
+    };
+
+    run_with_loader(false);
+    run_with_loader(true);
+}
+
+void test_r9_features(const char* dir) {
+    // 1. Wave 1: .rdata RIP-relative load + rbp/lea stack tracking + selective TSO relaxation.
+    {
+        constexpr std::uint64_t kImgBase = 0x200000ULL;
+        constexpr std::uint64_t kFnVa = kImgBase + 0x1000U;
+        std::vector<std::uint8_t> img(0x3000U, 0xCCU);
+        // Function @ 0x201000:
+        //   push rbp; mov rbp, rsp; sub rsp, 16
+        //   lea rdx, [rbp - 8]; mov dword [rdx], 42
+        //   mov eax, dword [rip + 0x0FE0]  ; -> 0x202000 (.rdata)
+        //   add eax, dword [rdx]
+        //   add rsp, 16; pop rbp; ret
+        const std::uint8_t fn_bytes[] = {
+            0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x10,
+            0x48, 0x8D, 0x55, 0xF8, 0xC7, 0x02, 0x2A, 0x00, 0x00, 0x00,
+            0x8B, 0x05, 0xEA, 0x0F, 0x00, 0x00,
+            0x03, 0x02,
+            0x48, 0x83, 0xC4, 0x10, 0x5D, 0xC3,
+        };
+        std::memcpy(img.data() + 0x1000U, fn_bytes, sizeof(fn_bytes));
+        const std::uint32_t ro_val = 100U;
+        std::memcpy(img.data() + 0x2000U, &ro_val, 4);
+
+        const ImageView view(img.data(), kImgBase, img.size(), kImgBase + 0x1000U, kImgBase + 0x1400U);
+        const std::set<std::uint64_t> entries{kFnVa};
+        Discoverer disc(view);
+        ImageInfo info;
+        info.base = kImgBase;
+        info.readonly_ranges.push_back({kImgBase + 0x2000U, kImgBase + 0x3000U});
+        // Strict TSO: `rsp` operands and .rdata loads stay plain; rbp/lea-derived pointers are only
+        // treated as stack when relaxation is on. This checks the function translates and links
+        // (its .rdata VA is not mapped here, so it is not run).
+        info.relaxed_tso = false;
+        R1Translator tr(info);
+        tr.declare({kFnVa});
+        std::string why;
+        const DFunction fn = disc.discover(kFnVa, entries);
+        expect(!is_fast_abi_eligible(fn, info), "R9 Wave 1: RBP-frame function stays on CpuState* ABI");
+        expect(tr.lift(fn, &why), "R9 Wave 1: stack+rdata function lifts");
+        std::vector<char> obj;
+        std::string err;
+        expect(tr.emit_object(2, obj, nullptr, &err) && !obj.empty(), "R9 Wave 1: emit_object succeeds");
+        const std::string o = std::string(dir) + "/r9_w1.o";
+        const std::string so = std::string(dir) + "/r9_w1.so";
+        std::ofstream(o, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
+        std::string log;
+        expect(link_shared_object({o}, so, &log), "R9 Wave 1: link succeeds");
+        LoadedCode code;
+        void* h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h != nullptr, "R9 Wave 1: dlopen succeeds");
+        if (h != nullptr) {
+            code.adopt_handle(h);
+            Runtime rt;
+            rt.add_table(static_cast<const FnRow*>(code.sym("wse_fn_table")),
+                         static_cast<std::size_t>(*static_cast<const std::uint64_t*>(code.sym("wse_fn_table_count"))));
+            GuestStack stack;
+            CpuState s;
+            stack.prepare(s);
+            const std::uint64_t ro_addr = reinterpret_cast<std::uintptr_t>(img.data() + 0x2000U);
+            (void)ro_addr;
+            // It uses rbp, so it stays on the CpuState* ABI and is found in the ordinary table.
+            expect(rt.find(kFnVa) != nullptr, "R9 Wave 1: function registered");
+        }
+    }
+
+    // 2. Wave 2: Fast-ABI cross-batch patching (`wse_ext_fast_calls[]`) & cross-batch inline leaf cloning.
+    {
+        constexpr std::uint64_t kImgBase = 0x300000ULL;
+        constexpr std::uint64_t kLeafVa = kImgBase + 0x1000U;
+        constexpr std::uint64_t kFastCallerVa = kImgBase + 0x1100U;
+        constexpr std::uint64_t kInlineCallerVa = kImgBase + 0x1200U;
+        std::vector<std::uint8_t> img(0x2000U, 0xCCU);
+        // Leaf @ 0x301000: lea eax, [rcx + rdx + 5]; ret
+        const std::uint8_t leaf_bytes[] = {0x8D, 0x44, 0x11, 0x05, 0xC3};
+        std::memcpy(img.data() + 0x1000U, leaf_bytes, sizeof(leaf_bytes));
+        // Fast caller @ 0x301100: call 0x301000; add eax, 10; ret (rel32 = -0x105)
+        const std::uint8_t fcaller_bytes[] = {0xE8, 0xFB, 0xFE, 0xFF, 0xFF, 0x83, 0xC0, 0x0A, 0xC3};
+        std::memcpy(img.data() + 0x1100U, fcaller_bytes, sizeof(fcaller_bytes));
+        // Inline caller @ 0x301200: call 0x301000; add eax, 20; ret (rel32 = -0x205)
+        const std::uint8_t icaller_bytes[] = {0xE8, 0xFB, 0xFD, 0xFF, 0xFF, 0x83, 0xC0, 0x14, 0xC3};
+        std::memcpy(img.data() + 0x1200U, icaller_bytes, sizeof(icaller_bytes));
+
+        const ImageView view(img.data(), kImgBase, img.size(), kImgBase + 0x1000U, kImgBase + 0x1400U);
+        const std::set<std::uint64_t> entries{kLeafVa, kFastCallerVa, kInlineCallerVa};
+        Discoverer disc(view);
+        ImageInfo info;
+        info.base = kImgBase;
+        const DFunction df_leaf = disc.discover(kLeafVa, entries);
+        expect(is_fast_abi_eligible(df_leaf, info), "R9 Wave 2: leaf is fast-ABI eligible");
+        info.fast_abi_vas.insert(kLeafVa);
+
+        auto build_so = [&](const std::vector<std::uint64_t>& vas, bool clone_leaf, const std::string& tag) {
+            R1Translator tr(info);
+            tr.declare(vas);
+            if (clone_leaf) tr.add_inline_leaf(df_leaf);
+            std::string why;
+            for (const std::uint64_t va : vas) {
+                expect(tr.lift(disc.discover(va, entries), &why), ("R9 Wave 2 lift " + tag).c_str());
+            }
+            std::vector<char> obj;
+            std::string err;
+            expect(tr.emit_object(2, obj, nullptr, &err) && !obj.empty(), ("R9 Wave 2 emit " + tag).c_str());
+            const std::string o = std::string(dir) + "/" + tag + ".o";
+            const std::string so = std::string(dir) + "/" + tag + ".so";
+            std::ofstream(o, std::ios::binary).write(obj.data(), static_cast<std::streamsize>(obj.size()));
+            std::string log;
+            expect(link_shared_object({o}, so, &log), ("R9 Wave 2 link " + tag).c_str());
+            return so;
+        };
+
+        const std::string so_leaf = build_so({kLeafVa}, false, "r9_leaf");
+        const std::string so_fast = build_so({kFastCallerVa}, false, "r9_fast");
+        const std::string so_inl = build_so({kInlineCallerVa}, true, "r9_inl");
+
+        LoadedCode c_leaf, c_fast, c_inl;
+        void* h_leaf = dlopen(so_leaf.c_str(), RTLD_NOW | RTLD_LOCAL);
+        void* h_fast = dlopen(so_fast.c_str(), RTLD_NOW | RTLD_LOCAL);
+        void* h_inl = dlopen(so_inl.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h_leaf != nullptr && h_fast != nullptr && h_inl != nullptr, "R9 Wave 2: dlopen all");
+        if (h_leaf == nullptr || h_fast == nullptr || h_inl == nullptr) return;
+        c_leaf.adopt_handle(h_leaf);
+        c_fast.adopt_handle(h_fast);
+        c_inl.adopt_handle(h_inl);
+
+        Runtime rt;
+        for (LoadedCode* c : {&c_leaf, &c_fast, &c_inl}) {
+            rt.add_table(static_cast<const FnRow*>(c->sym("wse_fn_table")),
+                         static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c->sym("wse_fn_table_count"))));
+            rt.add_fast_table(static_cast<const FastFnRow*>(c->sym("wse_fast_table")),
+                              static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c->sym("wse_fast_table_count"))));
+        }
+        const auto* fcnt = static_cast<const std::uint64_t*>(c_fast.sym("wse_ext_fast_call_count"));
+        auto* fslots = static_cast<void**>(c_fast.sym("wse_ext_fast_calls"));
+        const auto* fvas = static_cast<const std::uint64_t*>(c_fast.sym("wse_ext_fast_call_vas"));
+        expect(fcnt != nullptr && *fcnt == 1U && rt.patch_external_fast_calls(fslots, fvas, *fcnt) == 1U,
+               "R9 Wave 2: patch_external_fast_calls resolves cross-batch fast callee");
+
+        GuestStack stack;
+        CpuState s;
+        stack.prepare(s);
+        s.gpr[1] = 10;
+        s.gpr[2] = 20;
+        expect(rt.run(s, kFastCallerVa) && s.gpr[0] == 45, "R9 Wave 2: cross-batch fast-ABI call returns 45");
+        stack.prepare(s);
+        s.gpr[1] = 10;
+        s.gpr[2] = 20;
+        expect(rt.run(s, kInlineCallerVa) && s.gpr[0] == 55, "R9 Wave 2: cross-batch cloned inline leaf returns 55");
+
+        // Regression test: void fast-ABI leaf that does NOT modify RAX must preserve caller's RAX.
+        constexpr std::uint64_t kVoidLeafVa = kImgBase + 0x1300U;
+        constexpr std::uint64_t kVoidCallerVa = kImgBase + 0x1400U;
+        std::vector<std::uint8_t> img2(0x2000U, 0xCCU);
+        // 0x301300: mov [rcx], edx; ret
+        const std::uint8_t vleaf_bytes[] = {0x89, 0x11, 0xC3};
+        std::memcpy(img2.data() + 0x1300U, vleaf_bytes, sizeof(vleaf_bytes));
+        // 0x301400: call 0x301300; mov [r8], rax; ret  (rel32 = -0x105)
+        const std::uint8_t vcaller_bytes[] = {0xE8, 0xFB, 0xFE, 0xFF, 0xFF, 0x49, 0x89, 0x00, 0xC3};
+        std::memcpy(img2.data() + 0x1400U, vcaller_bytes, sizeof(vcaller_bytes));
+
+        const ImageView view2(img2.data(), kImgBase, img2.size(), kImgBase + 0x1300U, kImgBase + 0x1500U);
+        const std::set<std::uint64_t> entries2{kVoidLeafVa, kVoidCallerVa};
+        Discoverer disc2(view2);
+        ImageInfo info2;
+        info2.base = kImgBase;
+        const DFunction df_vleaf = disc2.discover(kVoidLeafVa, entries2);
+        expect(is_fast_abi_eligible(df_vleaf, info2), "R9 Wave 2: void leaf is fast-ABI eligible");
+        info2.fast_abi_vas.insert(kVoidLeafVa);
+        R1Translator tr2(info2);
+        tr2.declare({kVoidLeafVa, kVoidCallerVa});
+        std::string why2;
+        expect(tr2.lift(df_vleaf, &why2) && tr2.lift(disc2.discover(kVoidCallerVa, entries2), &why2),
+               "R9 Wave 2: lift void leaf + caller");
+        std::vector<char> obj2;
+        std::string err2;
+        expect(tr2.emit_object(2, obj2, nullptr, &err2) && !obj2.empty(), "R9 Wave 2: emit void leaf obj");
+        const std::string o2 = std::string(dir) + "/r9_void_rax.o";
+        const std::string so2 = std::string(dir) + "/r9_void_rax.so";
+        std::ofstream(o2, std::ios::binary).write(obj2.data(), static_cast<std::streamsize>(obj2.size()));
+        std::string log2;
+        expect(link_shared_object({o2}, so2, &log2), "R9 Wave 2: link void leaf so");
+        LoadedCode c_v;
+        void* h_v = dlopen(so2.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h_v != nullptr, "R9 Wave 2: dlopen void leaf");
+        if (h_v != nullptr) {
+            c_v.adopt_handle(h_v);
+            Runtime rt2;
+            rt2.add_table(static_cast<const FnRow*>(c_v.sym("wse_fn_table")),
+                          static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c_v.sym("wse_fn_table_count"))));
+            rt2.add_fast_table(
+                static_cast<const FastFnRow*>(c_v.sym("wse_fast_table")),
+                static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c_v.sym("wse_fast_table_count"))));
+            std::uint32_t out_edx = 0;
+            std::uint64_t out_rax = 0;
+            constexpr std::uint64_t kRaxSentinel = 0x123456789ABCDEF0ULL;
+            stack.prepare(s);
+            s.gpr[0] = kRaxSentinel;
+            s.gpr[1] = reinterpret_cast<std::uintptr_t>(&out_edx);
+            s.gpr[2] = 0xCAFEBABEU;
+            s.gpr[8] = reinterpret_cast<std::uintptr_t>(&out_rax);
+            expect(rt2.run(s, kVoidCallerVa) && out_edx == 0xCAFEBABEU && out_rax == kRaxSentinel &&
+                       s.gpr[0] == kRaxSentinel,
+                   "R9 Wave 2: void fast-ABI callee preserves RAX via wse_fast_<va>");
+
+            out_edx = 0;
+            stack.prepare(s);
+            s.gpr[0] = kRaxSentinel;
+            s.gpr[1] = reinterpret_cast<std::uintptr_t>(&out_edx);
+            s.gpr[2] = 0xDEADBEEFU;
+            expect(rt2.run(s, kVoidLeafVa) && out_edx == 0xDEADBEEFU && s.gpr[0] == kRaxSentinel,
+                   "R9 Wave 2: void fast-ABI callee preserves RAX via wse_fn_<va> thunk");
+        }
+
+        // Regression test: a fast-ABI leaf whose 128/64 `div` takes the runtime path
+        // (`RuntimeHooks::div128` flushes and reloads) must not write the registers the fast ABI
+        // does not pass. Through the `wse_fn_<va>` thunk the caller reloads the whole CpuState, so
+        // a flushed placeholder would zero the caller's rbx / rsi / xmm5.
+        constexpr std::uint64_t kDivBase = 0x400000ULL;
+        constexpr std::uint64_t kDivLeafVa = kDivBase + 0x1000U;
+        std::vector<std::uint8_t> img3(0x2000U, 0xCCU);
+        // 0x401000: mov rax, rcx; mov rdx, r8; div r9; ret
+        const std::uint8_t div_bytes[] = {0x48, 0x89, 0xC8, 0x4C, 0x89, 0xC2, 0x49, 0xF7, 0xF1, 0xC3};
+        std::memcpy(img3.data() + 0x1000U, div_bytes, sizeof(div_bytes));
+        const ImageView view3(img3.data(), kDivBase, img3.size(), kDivBase + 0x1000U, kDivBase + 0x1100U);
+        const std::set<std::uint64_t> entries3{kDivLeafVa};
+        Discoverer disc3(view3);
+        ImageInfo info3;
+        info3.base = kDivBase;
+        const DFunction df_div = disc3.discover(kDivLeafVa, entries3);
+        expect(is_fast_abi_eligible(df_div, info3), "R9 fast ABI: 128/64 div leaf is eligible");
+        info3.fast_abi_vas.insert(kDivLeafVa);
+        R1Translator tr3(info3);
+        tr3.declare({kDivLeafVa});
+        std::string why3;
+        expect(tr3.lift(df_div, &why3), "R9 fast ABI: lift div leaf");
+        std::vector<char> obj3;
+        std::string err3;
+        expect(tr3.emit_object(2, obj3, nullptr, &err3) && !obj3.empty(), "R9 fast ABI: emit div leaf");
+        const std::string o3 = std::string(dir) + "/r9_div_leaf.o";
+        const std::string so3 = std::string(dir) + "/r9_div_leaf.so";
+        std::ofstream(o3, std::ios::binary).write(obj3.data(), static_cast<std::streamsize>(obj3.size()));
+        std::string log3;
+        expect(link_shared_object({o3}, so3, &log3), "R9 fast ABI: link div leaf");
+        LoadedCode c_d;
+        void* h_d = dlopen(so3.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h_d != nullptr, "R9 fast ABI: dlopen div leaf");
+        if (h_d != nullptr) {
+            c_d.adopt_handle(h_d);
+            Runtime rt3;
+            rt3.add_table(static_cast<const FnRow*>(c_d.sym("wse_fn_table")),
+                          static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c_d.sym("wse_fn_table_count"))));
+            constexpr std::uint64_t kRbx = 0x0BADF00D0BADF00DULL;
+            constexpr std::uint64_t kRsi = 0x5151515151515151ULL;
+            stack.prepare(s);
+            s.gpr[1] = 0;  // low half of the dividend
+            s.gpr[8] = 1;  // high half: rdx:rax = 2^64, so the runtime divides
+            s.gpr[9] = 4;  // divisor
+            s.gpr[3] = kRbx;
+            s.gpr[6] = kRsi;
+            std::memset(s.xmm[5], 0x5A, sizeof(s.xmm[5]));
+            std::uint8_t want_xmm5[16];
+            std::memset(want_xmm5, 0x5A, sizeof(want_xmm5));
+            const bool ran = rt3.run(s, kDivLeafVa);
+            expect(ran && s.gpr[0] == (1ULL << 62) && s.gpr[2] == 0,
+                   "R9 fast ABI: 128/64 div through wse_fn_<va> gives 2^64 / 4");
+            expect(s.gpr[3] == kRbx && s.gpr[6] == kRsi && std::memcmp(s.xmm[5], want_xmm5, 16) == 0,
+                   "R9 fast ABI: div128 inside a fast leaf keeps the caller's rbx, rsi and xmm5");
+        }
+    }
+
+    // 3. Wave 3: PGO profile save / load / select_pgo_hot_vas.
+    {
+        PgoProfile prof;
+        for (std::uint64_t i = 0; i < 100; ++i) {
+            prof.hits[0x140001000ULL + i * 16] = (i < 5) ? 1000 : 1;
+            prof.total_samples += (i < 5) ? 1000 : 1;
+        }
+        const std::string ppath = std::string(dir) + "/test_pgo.txt";
+        expect(save_pgo_profile(ppath, prof), "R9 Wave 3: save_pgo_profile succeeds");
+        PgoProfile loaded;
+        expect(load_pgo_profile(ppath, loaded) && loaded.total_samples == prof.total_samples &&
+                   loaded.hits.size() == 100U,
+               "R9 Wave 3: load_pgo_profile round-trips");
+        const auto hot = select_pgo_hot_vas(loaded, 1000, 0.85, 0.05);
+        expect(hot.size() <= 50U && hot.count(0x140001000ULL) == 1U,
+               "R9 Wave 3: select_pgo_hot_vas picks top-5% hot VAs");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -820,6 +1229,8 @@ int main(int argc, char** argv) {
     test_translate_small_functions(dir);
     test_discover_alias_jump_table_over_256();
     test_discover_leaf_byte_jump_table();
+    test_cross_batch_direct_calls(dir);
+    test_r9_features(dir);
     if (corpus != nullptr) {
         test_corpus(corpus);
     } else {

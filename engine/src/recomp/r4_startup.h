@@ -36,11 +36,17 @@ struct StartupOptions {
     bool translate_only = false;
     std::string module = "Native";  // seeded as last_module_warband, and passed as --module
     unsigned jobs = 2;               // translation worker threads
-    int opt = 2;                     // LLVM optimization level
+    int opt = 2;                     // LLVM optimization level for hot batches
+    int cold_opt = 1;                // LLVM optimization level for cold batches (-O1 cuts first-run phone time)
+    int pgo_hot_opt = 3;             // LLVM optimization level for PGO-promoted top-5% hot batches
     std::size_t batch_kib = 64;      // KiB of .text per translated batch
     bool retranslate = false;        // ignore every cached batch
     bool reuse = false;              // keep cached batches whatever their key (never their functions)
     bool quiet = false;              // no per-import / per-method first-call lines
+    bool strict_tso = false;         // force strict TSO memory ordering (disables R9 relaxation)
+    std::string profile_in;          // optional PGO guest-VA profile path (drives hot-5% -O3 / cold-95% -O1)
+    std::string profile_out;         // optional PGO sampling output path (1 kHz SIGPROF)
+    std::string crash_report_path;   // optional file path for PDB-symbolized fault/signal reports
     std::uint64_t frame_limit = 0;   // end the run after this many frames (0: until the exe exits)
     unsigned heartbeat_s = 20;       // a status line this often while the exe runs
     // Every line of the report (text may hold several lines). Default: stdout.
@@ -61,5 +67,6 @@ inline constexpr int kStartupReturned = 5;    // the entry point returned
 // started; otherwise it never returns and ends the process with one of the codes above, the last
 // report line saying which.
 int run_startup(const StartupOptions& options);
+void flush_pgo_profile_now();
 
 }  // namespace wse::recomp

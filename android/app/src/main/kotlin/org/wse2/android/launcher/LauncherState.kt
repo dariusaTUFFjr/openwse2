@@ -23,8 +23,14 @@ data class ModuleChoice(
     val displayName: String,
     val hasScriptsTxt: Boolean,
     val loadResourceCount: Int,
-    val loadModResourceCount: Int
+    val loadModResourceCount: Int,
+    // `battle_size_min` / `battle_size_max` from module.ini; 0 when the module sets none.
+    val battleSizeMin: Int = 0,
+    val battleSizeMax: Int = 0
 ) {
+    val battleSizeRange: IntRange?
+        get() = moduleBattleSizeRange(battleSizeMin, battleSizeMax)
+
     override fun toString(): String =
         if (displayName == folderName) {
             folderName
@@ -296,7 +302,7 @@ data class SettingsUiState(
     val hasPhoneGyro: Boolean = false,
     val rglConfig: RglConfigState = RglConfigState(),
     val rglConfigReady: Boolean = false,
-    val rglConfigPath: String = "Documents/Mount&Blade Warband/rgl_config.txt"
+    val rglConfigPath: String = "Documents/Mount&Blade Warband WSE2/rgl_config.ini"
 )
 
 data class DriverUiState(
@@ -325,7 +331,18 @@ data class R4UiState(
     val status: String = "",
     val report: String? = null,
     val installCacheBytes: Long = 0L,
-    val textureCacheBytes: Long = 0L
+    val textureCacheBytes: Long = 0L,
+    val soCacheBytes: Long = 0L,
+    val shaderCacheBytes: Long = 0L,
+    val saveBackupsBytes: Long = 0L
+)
+
+data class SaveManagerUiState(
+    val visible: Boolean = false,
+    val moduleName: String = "Native",
+    val saves: List<SaveSlotEntry> = emptyList(),
+    val mirrorFolderLabel: String? = null,
+    val statusMessage: String? = null
 )
 
 data class AdvancedUiState(
@@ -337,6 +354,11 @@ data class AdvancedUiState(
     val pictureResolutionIndex: Int = 0,
     val pictureSharpen: Boolean = true,
     val pictureFxaa: Boolean = false,
+    val customDriverSharedBuffers: Boolean = false,
+    val strictTso: Boolean = false,
+    val recordPgoProfile: Boolean = false,
+    val pgoProfileSummary: String = "None",
+    val crashReportText: String? = null,
     val statusLog: String = "Ready."
 )
 
@@ -351,6 +373,12 @@ sealed interface LauncherEvent {
     data class ShowWarbandFilesNotFound(val reason: String) : LauncherEvent
 
     data class ShowToast(val message: String) : LauncherEvent
+
+    data class ExportSaveRequested(val slot: SaveSlotEntry) : LauncherEvent
+
+    data object ImportSaveRequested : LauncherEvent
+
+    data object PickSaveMirrorRequested : LauncherEvent
 
     data class LaunchGame(
         val runModule: Boolean,
@@ -374,6 +402,10 @@ sealed interface LauncherEvent {
         val renderScale: Float,
         val autoResolution: Boolean,
         val sharpness: Float,
-        val fxaa: Boolean
+        val fxaa: Boolean,
+        val customDriverSharedBuffers: Boolean = false,
+        val targetFps: Int = 60,
+        val strictTso: Boolean = false,
+        val recordPgoProfile: Boolean = false
     ) : LauncherEvent
 }

@@ -58,6 +58,7 @@
 #include "wse/recomp/pe_image.h"
 #include "wse/recomp/screen.h"
 #include "wse/recomp/scripted_input.h"
+#include "wse/recomp/session_replay.h"
 #include "wse/recomp/shim_d3d9.h"
 #include "wse/recomp/shim_fmod_steam.h"
 #include "wse/recomp/shim_system.h"
@@ -565,6 +566,7 @@ int main(int argc, char** argv) {
     fs::path work = "/root/wse/r4";
     wse::recomp::StartupOptions o;
     fs::path for_phone;
+    bool no_texcache = false;
     std::string capture;
     std::uint64_t capture_frames = 60;
     bool want_vulkan = false;
@@ -572,6 +574,8 @@ int main(int argc, char** argv) {
     std::string icd_arg = "auto";
     std::string audio_arg;
     std::string script_path;
+    std::string record_session_path;
+    std::string replay_session_path;
     fs::path dump_frames_dir;
     std::uint64_t dump_every = 0U;
     fs::path log_imports_path;
@@ -582,12 +586,19 @@ int main(int argc, char** argv) {
         else if (a == "--retranslate") o.retranslate = true;
         else if (a == "--batch" && i + 1 < argc) o.batch_kib = std::strtoul(argv[++i], nullptr, 10);
         else if (a == "--opt" && i + 1 < argc) o.opt = std::atoi(argv[++i]);
+        else if (a == "--cold-opt" && i + 1 < argc) o.cold_opt = std::atoi(argv[++i]);
+        else if (a == "--all-o2") { o.opt = 2; o.cold_opt = 2; }
         else if (a == "--jobs" && i + 1 < argc) o.jobs = static_cast<unsigned>(std::max(1, std::atoi(argv[++i])));
         else if (a == "--reuse") o.reuse = true;
         else if (a == "--quiet") o.quiet = true;
+        else if (a == "--strict-tso") o.strict_tso = true;
+        else if (a == "--profile-in" && i + 1 < argc) o.profile_in = argv[++i];
+        else if (a == "--profile-out" && i + 1 < argc) o.profile_out = argv[++i];
+        else if (a == "--hot-opt" && i + 1 < argc) o.pgo_hot_opt = std::atoi(argv[++i]);
         else if (a == "--module" && i + 1 < argc) o.module = argv[++i];
         else if (a == "--frames" && i + 1 < argc) o.frame_limit = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--for-phone" && i + 1 < argc) for_phone = argv[++i];
+        else if (a == "--no-texcache") no_texcache = true;
         else if (a == "--capture" && i + 1 < argc) capture = argv[++i];
         else if (a == "--capture-frames" && i + 1 < argc) capture_frames = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--screen" && i + 1 < argc) {  // e.g. 2412x1080: the display the game sees
@@ -600,6 +611,8 @@ int main(int argc, char** argv) {
             want_vulkan = true;
         } else if (a == "--audio" && i + 1 < argc) audio_arg = to_lower_ascii(argv[++i]);
         else if (a == "--script" && i + 1 < argc) script_path = argv[++i];
+        else if (a == "--record-session" && i + 1 < argc) record_session_path = argv[++i];
+        else if (a == "--replay-session" && i + 1 < argc) replay_session_path = argv[++i];
         else if (a == "--dump-frames" && i + 1 < argc) dump_frames_dir = argv[++i];
         else if (a == "--dump-every" && i + 1 < argc) dump_every = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--log-imports" && i + 1 < argc) log_imports_path = argv[++i];
@@ -636,6 +649,7 @@ int main(int argc, char** argv) {
     o.lua = read_file(find_ci(install, "lua5164.dll"));
     o.pdb = read_file(find_ci(install, "mb_warband_wse2_x64.pdb"));
     o.so_dir = (work / "so").string();
+    if (o.crash_report_path.empty()) o.crash_report_path = (work / "crash_report.txt").string();
     if (!for_phone.empty()) {
         wse::recomp::set_code_target(wse::recomp::portable_android_target());
         o.translate_only = true;
@@ -679,6 +693,19 @@ int main(int argc, char** argv) {
         }
         std::printf("[r7] loaded script %s (%zu steps)\n", script_path.c_str(),
                     script_player.step_count());
+    }
+    if (!record_session_path.empty()) {
+        if (!wse::recomp::shim::SessionLog::shared().start_record(record_session_path)) {
+            std::fprintf(stderr, "r4_run: cannot open --record-session %s\n", record_session_path.c_str());
+            return 2;
+        }
+        std::printf("[r8] recording deterministic session to %s\n", record_session_path.c_str());
+    } else if (!replay_session_path.empty()) {
+        if (!wse::recomp::shim::SessionLog::shared().start_replay(replay_session_path)) {
+            std::fprintf(stderr, "r4_run: cannot load --replay-session %s\n", replay_session_path.c_str());
+            return 2;
+        }
+        std::printf("[r8] replaying deterministic session from %s\n", replay_session_path.c_str());
     }
 
     // Optional Vulkan RHI backend for live D3D9 rendering in WSL (Lavapipe or WSLg system ICD).
@@ -775,6 +802,7 @@ int main(int argc, char** argv) {
             std::printf("[r7] audio: sounds_created=%zu active_ch=%zu\n", sounds_n, active_ch);
         }
         if (vk_backend) vk_backend->flush_pipeline_cache();
+        wse::recomp::shim::SessionLog::shared().stop();
         std::fflush(stdout);
     };
 
@@ -911,6 +939,24 @@ int main(int argc, char** argv) {
                         std::printf("[r7] frame=%llu win=%d (%s) cursor=%d\n",
                                     static_cast<unsigned long long>(frames), cur_win,
                                     scene_name(sc_kind), hub.cursor_visible() ? 1 : 0);
+                    }
+
+                    auto& slog = wse::recomp::shim::SessionLog::shared();
+                    if (slog.mode() == wse::recomp::shim::SessionMode::record) {
+                        slog.record_frame_mark(frames);
+                    } else if (slog.mode() == wse::recomp::shim::SessionMode::replay) {
+                        for (const auto& ev : slog.pop_replay_inputs_for_frame(frames)) {
+                            using Tag = wse::recomp::shim::SessionEventTag;
+                            switch (ev.tag) {
+                            case Tag::input_key: hub.inject_key(static_cast<std::uint8_t>(ev.a), ev.b != 0); break;
+                            case Tag::input_mouse_abs: hub.inject_mouse_move_abs(ev.a, ev.b); break;
+                            case Tag::input_mouse_delta: hub.inject_mouse_delta(ev.a, ev.b); break;
+                            case Tag::input_mouse_btn: hub.inject_mouse_button(ev.a, ev.b != 0); break;
+                            case Tag::input_mouse_wheel: hub.inject_mouse_wheel(ev.a); break;
+                            case Tag::input_touch: hub.on_touch_event(ev.a, ev.b, ev.fx, ev.fy); break;
+                            default: break;
+                            }
+                        }
                     }
 
                     if (!script_player.empty()) {
@@ -1057,7 +1103,7 @@ int main(int argc, char** argv) {
 #endif
 
     game.join();
-    if (!for_phone.empty() && rc == 0) {
+    if (!for_phone.empty() && !no_texcache && rc == 0) {
         // Converted textures go in a subfolder; the phone puts them in its texture cache.
         (void)convert_textures_for_phone(install, o.module, for_phone / "texcache", std::max(1U, o.jobs));
     } else if (for_phone.empty()) {

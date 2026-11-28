@@ -65,7 +65,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     private val app: Application = application
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val settingsExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    // rgl_config.txt changes run on settingsExecutor against `rglOnDisk`, the state last read from
+    // rgl_config.ini changes run on settingsExecutor against `rglOnDisk`, the state last read from
     // or written to the file (executor thread only), so a change made before the file was read
     // never writes defaults over it. The screen updates at once when the file is already read.
     // Declared before `init`, which queues the file's first read.
@@ -116,6 +116,34 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     private val _pictureFxaa = MutableStateFlow(false)
     val pictureFxaa: StateFlow<Boolean> = _pictureFxaa.asStateFlow()
+
+    private val _customDriverSharedBuffers = MutableStateFlow(false)
+    val customDriverSharedBuffers: StateFlow<Boolean> = _customDriverSharedBuffers.asStateFlow()
+
+    private val _strictTso = MutableStateFlow(false)
+    val strictTso: StateFlow<Boolean> = _strictTso.asStateFlow()
+
+    private val _recordPgoProfile = MutableStateFlow(false)
+    val recordPgoProfile: StateFlow<Boolean> = _recordPgoProfile.asStateFlow()
+
+    private val _pgoProfileSummary = MutableStateFlow("None")
+    val pgoProfileSummary: StateFlow<String> = _pgoProfileSummary.asStateFlow()
+
+    private val _crashReportText = MutableStateFlow<String?>(null)
+    val crashReportText: StateFlow<String?> = _crashReportText.asStateFlow()
+
+    private val _saveManagerState = MutableStateFlow(SaveManagerUiState())
+    val saveManagerState: StateFlow<SaveManagerUiState> = _saveManagerState.asStateFlow()
+
+    private val _pendingPreparedZip = MutableStateFlow<PendingPreparedZip?>(null)
+    val pendingPreparedZip: StateFlow<PendingPreparedZip?> = _pendingPreparedZip.asStateFlow()
+
+    private val _preparedZipStatus = MutableStateFlow<String?>(null)
+    val preparedZipStatus: StateFlow<String?> = _preparedZipStatus.asStateFlow()
+
+    private var pendingExportSlot: SaveSlotEntry? = null
+    private var pendingLaunchAfterZip = false
+    private var showReportOnCleanExit = false
 
     private val _statusLog = MutableStateFlow("Ready.")
     val statusLog: StateFlow<String> = _statusLog.asStateFlow()
@@ -207,8 +235,7 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
     fun selectTab(tab: LauncherTab) {
         _selectedTab.value = tab
         if (tab == LauncherTab.ADVANCED) {
-            r4Runner.refreshInstallCacheSize()
-            r4Runner.refreshTextureCacheSize()
+            r4Runner.refreshAllStorageSizes()
         }
     }
 
@@ -375,17 +402,279 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
 
     fun clearTextureCache() = r4Runner.clearTextureCache()
 
+    fun clearSoCache() = r4Runner.clearSoCache()
+
+    fun clearShaderCache() = r4Runner.clearShaderCache()
+
+    fun clearSaveBackups() = r4Runner.clearSaveBackups()
+
     fun dismissR4Report() = r4Runner.dismissReport()
 
-    // The result notification was tapped (or live R5a activity returned): open Advanced with the report.
+    // The result notification was tapped (or live R5a/R8 activity returned): open Advanced with the report.
     fun showR4Report(force: Boolean = false) {
         selectTab(LauncherTab.ADVANCED)
         r4Runner.showLastReport(force = force)
     }
 
-    // Phase 5 R5a: launch the translated game on screen with Vulkan using the selected GPU driver.
-    fun launchRecompVulkan() {
-        if (_r4State.value.running || _r0State.value.running) return
+    fun onRecompActivityReturned() {
+        r4Runner.refreshAllStorageSizes()
+        refreshDiagnostics()
+        syncSaveMirrorNow(silentIfUnset = true)
+        val reportFile = File(app.filesDir, "recomp/r4/report.txt")
+        val text = try {
+            reportFile.takeIf { it.isFile }?.readText() ?: ""
+        } catch (_: Throwable) {
+            ""
+        }
+        val cleanExit = text.lineSequence().lastOrNull { it.startsWith("RESULT ") }
+            ?.removePrefix("RESULT ")
+            ?.startsWith("pass-r5a") == true
+        if (showReportOnCleanExit || !cleanExit) {
+            showR4Report(force = true)
+        }
+    }
+
+    fun setCustomDriverSharedBuffers(enabled: Boolean) {
+        if (_customDriverSharedBuffers.value == enabled) return
+        _customDriverSharedBuffers.value = enabled
+        prefs().edit().putBoolean(KEY_CUSTOM_DRIVER_SHARED_BUFFERS, enabled).apply()
+    }
+
+    fun setStrictTso(enabled: Boolean) {
+        if (_strictTso.value == enabled) return
+        _strictTso.value = enabled
+        prefs().edit().putBoolean(KEY_STRICT_TSO, enabled).apply()
+    }
+
+    fun setRecordPgoProfile(enabled: Boolean) {
+        if (_recordPgoProfile.value == enabled) return
+        _recordPgoProfile.value = enabled
+        prefs().edit().putBoolean(KEY_RECORD_PGO_PROFILE, enabled).apply()
+    }
+
+    fun refreshDiagnostics() {
+        val app = getApplication<Application>()
+        val pgoFile = UserStorage.pgoProfileFile(app.filesDir)
+        _pgoProfileSummary.value = if (pgoFile.isFile) {
+            val lines = runCatching { pgoFile.readLines() }.getOrDefault(emptyList())
+            val fns = lines.count { it.isNotBlank() && !it.startsWith("#") }
+            "Active ($fns hot VAs, ${pgoFile.length() / 1024} KiB)"
+        } else {
+            "None"
+        }
+        val crashFile = UserStorage.crashReportFile(app.filesDir)
+        _crashReportText.value = if (crashFile.isFile) {
+            runCatching { crashFile.readText().take(8192) }.getOrNull()?.takeIf { it.isNotBlank() }
+        } else {
+            null
+        }
+    }
+
+    fun clearPgoProfile() {
+        val f = UserStorage.pgoProfileFile(getApplication<Application>().filesDir)
+        if (f.exists()) f.delete()
+        refreshDiagnostics()
+        _events.trySend(LauncherEvent.ShowToast("Performance profile cleared."))
+    }
+
+    fun clearCrashReport() {
+        val f = UserStorage.crashReportFile(getApplication<Application>().filesDir)
+        if (f.exists()) f.delete()
+        refreshDiagnostics()
+        _events.trySend(LauncherEvent.ShowToast("Crash report cleared."))
+    }
+
+    // ---- P14.3 Save Manager & Auto-Sync SAF Save Mirror ----
+
+    fun openSaveManager() {
+        val mod = _modulesState.value.selectedModule?.folderName?.ifBlank { "Native" } ?: "Native"
+        val mirrorLabel = prefs().getString(KEY_SAVE_MIRROR_LABEL, null)
+        _saveManagerState.value = SaveManagerUiState(
+            visible = true,
+            moduleName = mod,
+            saves = emptyList(),
+            mirrorFolderLabel = mirrorLabel,
+            statusMessage = "Loading saves…"
+        )
+        refreshSaveManager(statusMessage = null)
+    }
+
+    fun dismissSaveManager() {
+        _saveManagerState.value = _saveManagerState.value.copy(visible = false, statusMessage = null)
+    }
+
+    fun refreshSaveManager(statusMessage: String? = null) {
+        val mod = _modulesState.value.selectedModule?.folderName?.ifBlank { "Native" } ?: "Native"
+        val mirrorLabel = prefs().getString(KEY_SAVE_MIRROR_LABEL, null)
+        executor.execute {
+            val saves = SaveManager.listSaves(app.filesDir, mod)
+            mainHandler.post {
+                if (!isCleared.get()) {
+                    _saveManagerState.value = _saveManagerState.value.copy(
+                        moduleName = mod,
+                        saves = saves,
+                        mirrorFolderLabel = mirrorLabel,
+                        statusMessage = statusMessage
+                    )
+                }
+            }
+        }
+    }
+
+    fun requestImportSave() {
+        _events.trySend(LauncherEvent.ImportSaveRequested)
+    }
+
+    fun requestExportSave(slot: SaveSlotEntry) {
+        pendingExportSlot = slot
+        _events.trySend(LauncherEvent.ExportSaveRequested(slot))
+    }
+
+    fun requestPickSaveMirror() {
+        _events.trySend(LauncherEvent.PickSaveMirrorRequested)
+    }
+
+    fun onImportSavePicked(uri: Uri) {
+        val mod = _saveManagerState.value.moduleName.ifBlank { "Native" }
+        executor.execute {
+            val existing = SaveManager.listSaves(app.filesDir, mod).map { it.fileName.lowercase() }.toSet()
+            val slotName = (0..8).map { "sg0$it.sav" }.firstOrNull { it !in existing } ?: "sg00.sav"
+            val (_, msg) = SaveManager.importSaveFromUri(app, uri, app.filesDir, mod, slotName)
+            r4Runner.refreshAllStorageSizes()
+            refreshSaveManager(statusMessage = msg)
+        }
+    }
+
+    fun onExportSavePicked(uri: Uri) {
+        val slot = pendingExportSlot ?: return
+        pendingExportSlot = null
+        executor.execute {
+            val (_, msg) = SaveManager.exportSaveToUri(app, slot.file, uri)
+            refreshSaveManager(statusMessage = msg)
+        }
+    }
+
+    fun onSaveMirrorPicked(uri: Uri) {
+        val label = quickTreeDisplayName(uri)
+        if (prefs().getString(KEY_SAVE_MIRROR_URI, null) != uri.toString()) {
+            SaveManager.resetMirrorSyncState(app)  // a new folder gets every save
+        }
+        prefs().edit()
+            .putString(KEY_SAVE_MIRROR_URI, uri.toString())
+            .putString(KEY_SAVE_MIRROR_LABEL, label)
+            .apply()
+        _saveManagerState.value = _saveManagerState.value.copy(
+            mirrorFolderLabel = label,
+            statusMessage = "Syncing saves to $label…"
+        )
+        syncSaveMirrorNow(silentIfUnset = false)
+    }
+
+    fun clearSaveMirror() {
+        prefs().edit()
+            .remove(KEY_SAVE_MIRROR_URI)
+            .remove(KEY_SAVE_MIRROR_LABEL)
+            .apply()
+        SaveManager.resetMirrorSyncState(app)
+        refreshSaveManager(statusMessage = "Auto-sync save mirror turned off.")
+    }
+
+    fun syncSaveMirrorNow(silentIfUnset: Boolean = false) {
+        val raw = prefs().getString(KEY_SAVE_MIRROR_URI, null)
+        if (raw.isNullOrBlank()) {
+            if (!silentIfUnset) {
+                refreshSaveManager(statusMessage = "Pick a mirror folder first.")
+            }
+            return
+        }
+        val uri = Uri.parse(raw)
+        executor.execute {
+            val (_, msg) = try {
+                SaveManager.syncSavesToMirror(app, app.filesDir, uri)
+            } catch (t: Throwable) {
+                0 to "Save mirror sync failed: ${t.message ?: t.javaClass.simpleName}"
+            }
+            if (!silentIfUnset || _saveManagerState.value.visible) {
+                refreshSaveManager(statusMessage = msg)
+            }
+        }
+    }
+
+    fun restoreSaveBackup(slot: SaveSlotEntry, backup: SaveBackupEntry) {
+        executor.execute {
+            val (_, msg) = SaveManager.restoreBackup(backup.file, slot.file)
+            r4Runner.refreshAllStorageSizes()
+            refreshSaveManager(statusMessage = msg)
+        }
+    }
+
+    fun deleteSaveSlot(slot: SaveSlotEntry) {
+        executor.execute {
+            // The save becomes its newest backup, so "Restore backup" can still bring it back.
+            val ok = SaveManager.deleteSlotKeepingBackup(slot.file)
+            r4Runner.refreshAllStorageSizes()
+            refreshSaveManager(
+                statusMessage = if (ok) {
+                    "Deleted ${slot.fileName}. It is kept as a backup until you free up save backups."
+                } else {
+                    "Could not delete ${slot.fileName}."
+                }
+            )
+        }
+    }
+
+    // ---- P14.6 Confirmed SHA-256 PC Zip Import ----
+
+    fun confirmPreparedZipImport() {
+        val zip = _pendingPreparedZip.value ?: return
+        val treeUri = _installFolder.value.treeUri ?: return
+        _pendingPreparedZip.value = null
+        _preparedZipStatus.value = "Verifying SHA-256 hashes in ${zip.fileName}…"
+        r4Runner.importConfirmedPreparedZip(
+            treeUri = treeUri,
+            zip = zip,
+            onProgress = { msg ->
+                if (!isCleared.get()) {
+                    _preparedZipStatus.value = msg
+                    _statusLog.value = msg
+                }
+            },
+            onDone = { res ->
+                if (isCleared.get()) return@importConfirmedPreparedZip
+                _preparedZipStatus.value = null
+                val shouldLaunch = pendingLaunchAfterZip
+                pendingLaunchAfterZip = false
+                if (res.ok) {
+                    refreshDiagnostics()
+                    val summary = "Verified & imported ${res.partsImported} code parts, ${res.texturesImported} textures."
+                    _statusLog.value = summary
+                    _events.trySend(LauncherEvent.ShowToast(summary))
+                    if (shouldLaunch) {
+                        launchRecompVulkanInternal(treeUri)
+                    }
+                } else {
+                    _statusLog.value = res.error
+                    _events.trySend(LauncherEvent.ShowToast(res.error))
+                }
+            }
+        )
+    }
+
+    fun declinePreparedZipImport() {
+        val zip = _pendingPreparedZip.value ?: return
+        _pendingPreparedZip.value = null
+        r4Runner.declinePreparedZip(zip)
+        val shouldLaunch = pendingLaunchAfterZip
+        pendingLaunchAfterZip = false
+        val treeUri = _installFolder.value.treeUri
+        if (shouldLaunch && treeUri != null) {
+            launchRecompVulkanInternal(treeUri)
+        }
+    }
+
+    // Phase 5 R5a/R8: launch the translated game on screen with Vulkan using the selected GPU driver.
+    fun launchRecompVulkan(fromAdvanced: Boolean = true) {
+        if (_r4State.value.running || _r0State.value.running || _preparedZipStatus.value != null) return
         val treeUri = _installFolder.value.treeUri
         if (treeUri == null) {
             _events.trySend(LauncherEvent.ShowWarbandFilesNotFound("No Warband folder is selected."))
@@ -410,22 +699,43 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             )
             return
         }
+        showReportOnCleanExit = fromAdvanced
+        // P14.6: check for an unconfirmed PC-prepared zip before launching so the player confirms
+        // and verifies its SHA-256 manifest explicitly.
+        executor.execute {
+            val pending = r4Runner.findPendingPreparedZip(treeUri)
+            mainHandler.post {
+                if (isCleared.get()) return@post
+                if (pending != null) {
+                    pendingLaunchAfterZip = true
+                    _pendingPreparedZip.value = pending
+                } else {
+                    launchRecompVulkanInternal(treeUri)
+                }
+            }
+        }
+    }
+
+    private fun launchRecompVulkanInternal(treeUri: Uri) {
+        val driver = _driverState.value
+        val mode = driver.selectedModeKey
+        val icdPath = if (mode == "system") "" else (prefs().getString(KEY_DRIVER_PATH_PREFIX + mode, "") ?: "")
         val moduleName = _modulesState.value.selectedModule?.folderName?.ifBlank { "Native" } ?: "Native"
         val maxTex = _settingsState.value.performance?.maxTextureSize ?: 0
+        val capHz = _settingsState.value.performance?.frameRateCapHz ?: 60
+        val targetFps = if (capHz <= 0) 120 else capHz.coerceIn(30, 120)
         val shaderCache = File(app.cacheDir, "mesa_shader_cache").apply { mkdirs() }
         val nativeLibDir = app.applicationInfo.nativeLibraryDir ?: ""
-        val resIdx = _pictureResolutionIndex.value.coerceIn(0, 5)
-        val autoRes = (resIdx == 0)
-        val fixedScale = when (resIdx) {
-            1 -> 1.0f
-            2 -> 0.85f
-            3 -> 0.75f
-            4 -> 0.67f
-            5 -> 0.50f
-            else -> 1.0f
-        }
-        val sharpness = if (_pictureSharpen.value) 0.2f else 0.0f
-        val fxaa = _pictureFxaa.value
+        val modPic = ModuleProfileStore.loadPicturePrefs(
+            app.filesDir,
+            moduleName,
+            ModulePicturePrefs(
+                resolutionIndex = _pictureResolutionIndex.value.coerceIn(0, 5),
+                sharpen = _pictureSharpen.value,
+                fxaa = _pictureFxaa.value,
+                targetFps = targetFps
+            )
+        )
         _statusLog.value = "Getting $moduleName ready to play…"
         r4Runner.prepareForLiveVulkan(treeUri) { copyDir, workDir, jobs ->
             if (!isCleared.get()) {
@@ -441,10 +751,14 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                         nativeLibDir = nativeLibDir,
                         shaderCacheDir = shaderCache.absolutePath,
                         maxTextureSize = maxTex,
-                        renderScale = fixedScale,
-                        autoResolution = autoRes,
-                        sharpness = sharpness,
-                        fxaa = fxaa
+                        renderScale = modPic.fixedRenderScale,
+                        autoResolution = modPic.autoResolution,
+                        sharpness = modPic.sharpnessValue,
+                        fxaa = modPic.fxaa,
+                        customDriverSharedBuffers = _customDriverSharedBuffers.value,
+                        targetFps = modPic.targetFps,
+                        strictTso = _strictTso.value,
+                        recordPgoProfile = _recordPgoProfile.value
                     )
                 )
             }
@@ -595,15 +909,8 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         if (checkStatus?.state != InstallCheckState.READY) {
             return
         }
-        _events.trySend(
-            LauncherEvent.LaunchGame(
-                runModule = true,
-                treeUri = treeUri.toString(),
-                moduleName = currentMod.folderName,
-                gpuDriver = _driverState.value.selectedModeKey,
-                showFpsOverlay = _showFpsOverlay.value
-            )
-        )
+        // P14.1: Home Play launches the real translated WSE2 game (`RecompGameActivity` in `:recomp`).
+        launchRecompVulkan(fromAdvanced = false)
     }
 
     fun onLaunchSelfTestClicked() {
@@ -652,6 +959,22 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         commitSettingsChange(next, json, refreshGraphics = false)
         val mirroredFps = if (capHz <= 0) 240 else capHz.coerceIn(30, 240)
         updateRglConfig { it.copy(maxFramerate = mirroredFps) }
+        val targetFps = if (capHz <= 0) 120 else capHz.coerceIn(30, 120)
+        syncSelectedModulePicture { it.copy(targetFps = targetFps) }
+    }
+
+    // A module whose picture settings were changed in the in-game drawer keeps its own copy
+    // (`ModuleProfileStore`), which the next launch uses. A change made here is the player's
+    // latest choice for the selected module, so it goes into that copy too; otherwise the
+    // launcher's Picture settings would silently stop working for that module.
+    private fun syncSelectedModulePicture(update: (ModulePicturePrefs) -> ModulePicturePrefs) {
+        val mod = _modulesState.value.selectedModule?.folderName?.ifBlank { "Native" } ?: "Native"
+        val filesDir = app.filesDir
+        executor.execute {
+            if (!ModuleProfileStore.hasPicturePrefs(filesDir, mod)) return@execute
+            val current = ModuleProfileStore.loadPicturePrefs(filesDir, mod)
+            ModuleProfileStore.savePicturePrefs(filesDir, mod, update(current))
+        }
     }
 
     fun setPresentMode(presentModeKey: String) {
@@ -814,20 +1137,31 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
             val base = rglOnDisk ?: RglConfigStore.load(filesDir).first
             val updated = transform(base)
             if (updated == base) return@execute
-            writeRglConfig(filesDir, updated, okToast = null, failToast = "Could not save rgl_config.txt.")
+            writeRglConfig(filesDir, updated, okToast = null, failToast = "Could not save the game settings.")
         }
     }
 
     fun resetRglConfigToDefaults() {
         val filesDir = app.filesDir
         settingsExecutor.execute {
-            val base = rglOnDisk ?: RglConfigStore.load(filesDir).first
-            writeRglConfig(
-                filesDir,
-                RglConfigState(extraEntries = base.extraEntries),
-                okToast = "rgl_config.txt restored to defaults.",
-                failToast = "Could not reset rgl_config.txt."
-            )
+            // WSE2 writes its own defaults when the file is missing; the old file is kept aside.
+            val ok = RglConfigStore.reset(filesDir)
+            if (ok) rglOnDisk = null
+            mainHandler.post {
+                if (isCleared.get()) return@post
+                if (ok) {
+                    _settingsState.value = _settingsState.value.copy(
+                        rglConfig = RglConfigState(),
+                        rglConfigReady = false
+                    )
+                }
+                _events.trySend(
+                    LauncherEvent.ShowToast(
+                        if (ok) "Game settings go back to defaults on the next start."
+                        else "Could not reset the game settings."
+                    )
+                )
+            }
         }
     }
 
@@ -857,6 +1191,10 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         _pictureResolutionIndex.value = prefs.getInt(KEY_PICTURE_RESOLUTION_INDEX, 0).coerceIn(0, 5)
         _pictureSharpen.value = prefs.getBoolean(KEY_PICTURE_SHARPEN, true)
         _pictureFxaa.value = prefs.getBoolean(KEY_PICTURE_FXAA, false)
+        _customDriverSharedBuffers.value = prefs.getBoolean(KEY_CUSTOM_DRIVER_SHARED_BUFFERS, false)
+        _strictTso.value = prefs.getBoolean(KEY_STRICT_TSO, false)
+        _recordPgoProfile.value = prefs.getBoolean(KEY_RECORD_PGO_PROFILE, false)
+        refreshDiagnostics()
 
         // Stored as the stable mode id; older builds stored the display label.
         val savedDriver = prefs.getString(KEY_GPU_DRIVER, DRIVER_MODE_KEYS.first()) ?: ""
@@ -1182,7 +1520,9 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                     displayName = m.optString("display_name", ""),
                     hasScriptsTxt = m.optBoolean("has_scripts_txt", false),
                     loadResourceCount = m.optInt("load_resource_count", 0),
-                    loadModResourceCount = m.optInt("load_mod_resource_count", 0)
+                    loadModResourceCount = m.optInt("load_mod_resource_count", 0),
+                    battleSizeMin = m.optInt("battle_size_min", 0),
+                    battleSizeMax = m.optInt("battle_size_max", 0)
                 )
                 parsedModules.add(mod)
                 installStatuses[mod.modulePath] = ModuleInstallStatus(InstallCheckState.CHECKING)
@@ -1664,18 +2004,21 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         if (_pictureResolutionIndex.value == clamped) return
         _pictureResolutionIndex.value = clamped
         prefs().edit().putInt(KEY_PICTURE_RESOLUTION_INDEX, clamped).apply()
+        syncSelectedModulePicture { it.copy(resolutionIndex = clamped) }
     }
 
     fun setPictureSharpen(enabled: Boolean) {
         if (_pictureSharpen.value == enabled) return
         _pictureSharpen.value = enabled
         prefs().edit().putBoolean(KEY_PICTURE_SHARPEN, enabled).apply()
+        syncSelectedModulePicture { it.copy(sharpen = enabled) }
     }
 
     fun setPictureFxaa(enabled: Boolean) {
         if (_pictureFxaa.value == enabled) return
         _pictureFxaa.value = enabled
         prefs().edit().putBoolean(KEY_PICTURE_FXAA, enabled).apply()
+        syncSelectedModulePicture { it.copy(fxaa = enabled) }
     }
 
     private fun prefs() = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1720,6 +2063,11 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         private const val KEY_PICTURE_RESOLUTION_INDEX = "picture_resolution_index"
         private const val KEY_PICTURE_SHARPEN = "picture_sharpen"
         private const val KEY_PICTURE_FXAA = "picture_fxaa"
+        private const val KEY_CUSTOM_DRIVER_SHARED_BUFFERS = "custom_driver_shared_buffers"
+        private const val KEY_STRICT_TSO = "strict_tso"
+        private const val KEY_RECORD_PGO_PROFILE = "record_pgo_profile"
+        private const val KEY_SAVE_MIRROR_URI = "save_mirror_tree_uri"
+        private const val KEY_SAVE_MIRROR_LABEL = "save_mirror_label"
         private const val KEY_FRAME_RATE_CAP = "frame_rate_cap_hz"
         private const val KEY_GYRO_AIM = "gyro_aim_enabled"
         private const val KEY_PINCH_ZOOM = "pinch_zoom_enabled"

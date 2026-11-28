@@ -238,6 +238,10 @@ class WseSafBridge(
             thermalHeadroom: Float
         )
 
+        // P14.3 Save Manager: validates and parses Warband `.sav` header via Phase 2A `savegame.h`.
+        @JvmStatic
+        external fun nativeInspectSavegame(filePath: String): String
+
         init {
             System.loadLibrary("SDL3")
             System.loadLibrary("wse2")

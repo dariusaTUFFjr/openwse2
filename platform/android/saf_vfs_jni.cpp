@@ -30,6 +30,7 @@
 #include "wse/asset/bmp.h"
 #include "wse/core/json.h"
 #include "wse/game/module_loader_common.h"
+#include "wse/game/savegame.h"
 #include "wse/platform/clock.h"
 #include "wse/platform/performance.h"
 #include "wse/platform/driver_package.h"
@@ -508,6 +509,10 @@ Java_org_wse2_android_WseSafBridge_nativeScanTree(JNIEnv* env, jobject thiz) {
         json.append(std::to_string(m.load_mod_resource_count));
         json.append(",\"compatible_with_warband\":");
         wse::core::wse_append_json_string(json, m.compatible_with_warband);
+        json.append(",\"battle_size_min\":");
+        json.append(std::to_string(m.battle_size_min));
+        json.append(",\"battle_size_max\":");
+        json.append(std::to_string(m.battle_size_max));
         json.push_back('}');
     }
     json.append("],\"languages\":[");
@@ -1006,6 +1011,61 @@ Java_org_wse2_android_WseSafBridge_nativeRegisterGameTree(JNIEnv* env, jobject t
         env->DeleteGlobalRef(reg.bridge);
     }
     reg.bridge = global;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_org_wse2_android_WseSafBridge_nativeInspectSavegame(
+    JNIEnv* env, jclass, jstring jfile_path) {
+    const std::string path_str = jstring_to_utf8(env, jfile_path);
+    if (path_str.empty()) {
+        return utf8_to_jstring(env, R"({"ok":false,"error":"empty path"})");
+    }
+    std::FILE* fp = std::fopen(path_str.c_str(), "rb");
+    if (fp == nullptr) {
+        return utf8_to_jstring(env, R"({"ok":false,"error":"cannot open file"})");
+    }
+    std::fseek(fp, 0, SEEK_END);
+    const long fsize = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    // Read header prefix (mbSavegame header is < 4 KiB).
+    const std::size_t to_read = fsize > 0 ? std::min<std::size_t>(static_cast<std::size_t>(fsize), 4096U) : 0U;
+    std::vector<std::byte> buf(to_read);
+    if (to_read > 0U) {
+        const std::size_t got = std::fread(buf.data(), 1U, to_read, fp);
+        buf.resize(got);
+    }
+    std::fclose(fp);
+
+    wse::io::BinaryReader r(buf);
+    std::uint32_t magic = 0U;
+    std::int32_t save_ver = 0;
+    std::int32_t mod_ver = 0;
+    if (!r.read_u32(magic) || magic != wse::game::kSavegameMagic) {
+        return utf8_to_jstring(env, R"json({"ok":false,"error":"not a Warband savegame (bad WRDR magic)"})json");
+    }
+    if (!r.read_i32(save_ver) || save_ver < wse::game::kSavegameMinVersion ||
+        save_ver > wse::game::kSavegameFormatVersion || !r.read_i32(mod_ver)) {
+        return utf8_to_jstring(env, R"({"ok":false,"error":"unsupported savegame version"})");
+    }
+    std::string save_name;
+    std::string player_name;
+    std::int32_t player_level = 1;
+    float game_date_hours = 0.0f;
+    if (!r.read_string(save_name) || !r.read_string(player_name) ||
+        !r.read_i32(player_level) || !r.read_f32(game_date_hours)) {
+        return utf8_to_jstring(env, R"({"ok":false,"error":"truncated savegame header"})");
+    }
+    const int day = static_cast<int>(game_date_hours / 24.0f) + 1;
+    std::string out = "{\"ok\":true,\"name\":";
+    wse::core::wse_append_json_string(out, save_name);
+    out += ",\"player\":";
+    wse::core::wse_append_json_string(out, player_name);
+    out += ",\"level\":" + std::to_string(player_level);
+    out += ",\"day\":" + std::to_string(day);
+    out += ",\"save_ver\":" + std::to_string(save_ver);
+    out += ",\"module_ver\":" + std::to_string(mod_ver);
+    out += ",\"size\":" + std::to_string(fsize > 0 ? fsize : 0L) + "}";
+    return utf8_to_jstring(env, out);
 }
 
 }  // extern "C"

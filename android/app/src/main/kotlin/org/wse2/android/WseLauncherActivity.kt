@@ -72,12 +72,44 @@ class WseLauncherActivity : ComponentActivity() {
         viewModel.importDriverPackage(driverUri)
     }
 
-    // Phase 5 R5a: when the live Vulkan activity exits (or its `:recomp` process dies), show the
-    // saved driver + FPS report so the player can inspect, copy, or share it right away.
+    // Phase 5 R5a/R8: when the live Vulkan activity exits, refresh storage, auto-sync saves to
+    // the SAF mirror (if configured), and show the report if needed.
     private val recompVulkanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        viewModel.showR4Report(force = true)
+        viewModel.onRecompActivityReturned()
+    }
+
+    private val importSaveLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != RESULT_OK) return@registerForActivityResult
+        val uri = result.data?.data ?: return@registerForActivityResult
+        viewModel.onImportSavePicked(uri)
+    }
+
+    private val exportSaveLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != RESULT_OK) return@registerForActivityResult
+        val uri = result.data?.data ?: return@registerForActivityResult
+        viewModel.onExportSavePicked(uri)
+    }
+
+    private val pickSaveMirrorLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != RESULT_OK) return@registerForActivityResult
+        val data = result.data ?: return@registerForActivityResult
+        val uri = data.data ?: return@registerForActivityResult
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (_: SecurityException) {
+        }
+        viewModel.onSaveMirrorPicked(uri)
     }
 
     // Android 13+: the R4 run's progress and result notifications need this; the run starts
@@ -154,7 +186,10 @@ class WseLauncherActivity : ComponentActivity() {
                     onImportDriver = { openDriverPackagePicker() },
                     onLaunchGame = { event -> launchWseActivity(event) },
                     onRunR4Startup = { runR4Startup() },
-                    onLaunchRecompVulkan = { event -> launchRecompVulkanActivity(event) }
+                    onLaunchRecompVulkan = { event -> launchRecompVulkanActivity(event) },
+                    onImportSave = { openImportSavePicker() },
+                    onExportSave = { slot -> openExportSavePicker(slot.fileName) },
+                    onPickSaveMirror = { openSaveMirrorPicker() }
                 )
             }
         }
@@ -222,8 +257,41 @@ class WseLauncherActivity : ComponentActivity() {
             putExtra(RecompGameActivity.EXTRA_AUTO_RESOLUTION, event.autoResolution)
             putExtra(RecompGameActivity.EXTRA_SHARPNESS, event.sharpness)
             putExtra(RecompGameActivity.EXTRA_FXAA, event.fxaa)
+            putExtra(RecompGameActivity.EXTRA_CUSTOM_DRIVER_SHARED_BUFFERS, event.customDriverSharedBuffers)
+            putExtra(RecompGameActivity.EXTRA_TARGET_FPS, event.targetFps)
+            putExtra(RecompGameActivity.EXTRA_STRICT_TSO, event.strictTso)
+            putExtra(RecompGameActivity.EXTRA_RECORD_PGO_PROFILE, event.recordPgoProfile)
         }
         recompVulkanLauncher.launch(intent)
+    }
+
+    private fun openImportSavePicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        importSaveLauncher.launch(intent)
+    }
+
+    private fun openExportSavePicker(suggestedName: String) {
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/octet-stream"
+            putExtra(Intent.EXTRA_TITLE, suggestedName)
+        }
+        exportSaveLauncher.launch(intent)
+    }
+
+    private fun openSaveMirrorPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+            )
+        }
+        pickSaveMirrorLauncher.launch(intent)
     }
 
     // Highest refresh rate among the display's modes (60 when unknown).

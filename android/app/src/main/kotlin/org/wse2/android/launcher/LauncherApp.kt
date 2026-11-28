@@ -56,6 +56,8 @@ import org.wse2.android.launcher.ui.WseNavItem
 import org.wse2.android.launcher.ui.WseNavigationBar
 import org.wse2.android.launcher.ui.WseNavigationRail
 import org.wse2.android.launcher.ui.rememberWseAnimationsEnabled
+import java.text.DateFormat
+import java.util.Date
 
 private sealed interface LauncherDialogState {
     data class ScanError(val reason: String) : LauncherDialogState
@@ -76,7 +78,10 @@ fun LauncherApp(
     onLaunchGame: (LauncherEvent.LaunchGame) -> Unit,
     // The activity asks for the notification permission first (the run's progress and result).
     onRunR4Startup: () -> Unit = viewModel::runR4Startup,
-    onLaunchRecompVulkan: (LauncherEvent.LaunchRecompVulkan) -> Unit = {}
+    onLaunchRecompVulkan: (LauncherEvent.LaunchRecompVulkan) -> Unit = {},
+    onImportSave: () -> Unit = {},
+    onExportSave: (SaveSlotEntry) -> Unit = {},
+    onPickSaveMirror: () -> Unit = {}
 ) {
     val selectedTab by viewModel.selectedTab.collectAsStateWithLifecycle()
     val installFolder by viewModel.installFolder.collectAsStateWithLifecycle()
@@ -88,6 +93,14 @@ fun LauncherApp(
     val pictureResolutionIndex by viewModel.pictureResolutionIndex.collectAsStateWithLifecycle()
     val pictureSharpen by viewModel.pictureSharpen.collectAsStateWithLifecycle()
     val pictureFxaa by viewModel.pictureFxaa.collectAsStateWithLifecycle()
+    val customDriverSharedBuffers by viewModel.customDriverSharedBuffers.collectAsStateWithLifecycle()
+    val strictTso by viewModel.strictTso.collectAsStateWithLifecycle()
+    val recordPgoProfile by viewModel.recordPgoProfile.collectAsStateWithLifecycle()
+    val pgoProfileSummary by viewModel.pgoProfileSummary.collectAsStateWithLifecycle()
+    val crashReportText by viewModel.crashReportText.collectAsStateWithLifecycle()
+    val saveManagerState by viewModel.saveManagerState.collectAsStateWithLifecycle()
+    val pendingPreparedZip by viewModel.pendingPreparedZip.collectAsStateWithLifecycle()
+    val preparedZipStatus by viewModel.preparedZipStatus.collectAsStateWithLifecycle()
     val statusLog by viewModel.statusLog.collectAsStateWithLifecycle()
     val moduleArt by viewModel.moduleArt.collectAsStateWithLifecycle()
     val heroArt by viewModel.heroArt.collectAsStateWithLifecycle()
@@ -125,6 +138,15 @@ fun LauncherApp(
                 }
                 is LauncherEvent.LaunchRecompVulkan -> {
                     onLaunchRecompVulkan(event)
+                }
+                is LauncherEvent.ImportSaveRequested -> {
+                    onImportSave()
+                }
+                is LauncherEvent.ExportSaveRequested -> {
+                    onExportSave(event.slot)
+                }
+                is LauncherEvent.PickSaveMirrorRequested -> {
+                    onPickSaveMirror()
                 }
             }
         }
@@ -178,10 +200,24 @@ fun LauncherApp(
         onDismissR0Report = viewModel::dismissR0Report,
         r4State = r4State,
         onRunR4Startup = onRunR4Startup,
-        onLaunchRecompVulkan = viewModel::launchRecompVulkan,
+        onLaunchRecompVulkan = { viewModel.launchRecompVulkan(fromAdvanced = true) },
         onR4UseCopyChange = viewModel::setR4UseCopy,
         onClearInstallCache = viewModel::clearInstallCache,
         onClearTextureCache = viewModel::clearTextureCache,
+        onClearSoCache = viewModel::clearSoCache,
+        onClearShaderCache = viewModel::clearShaderCache,
+        onClearSaveBackups = viewModel::clearSaveBackups,
+        onOpenSaveManager = viewModel::openSaveManager,
+        customDriverSharedBuffers = customDriverSharedBuffers,
+        onCustomDriverSharedBuffersChange = viewModel::setCustomDriverSharedBuffers,
+        strictTso = strictTso,
+        onStrictTsoChange = viewModel::setStrictTso,
+        recordPgoProfile = recordPgoProfile,
+        onRecordPgoProfileChange = viewModel::setRecordPgoProfile,
+        pgoProfileSummary = pgoProfileSummary,
+        onClearPgoProfile = viewModel::clearPgoProfile,
+        crashReportText = crashReportText,
+        onClearCrashReport = viewModel::clearCrashReport,
         onDismissR4Report = viewModel::dismissR4Report,
         pictureResolutionIndex = pictureResolutionIndex,
         pictureSharpen = pictureSharpen,
@@ -190,6 +226,50 @@ fun LauncherApp(
         onPictureSharpenChange = viewModel::setPictureSharpen,
         onPictureFxaaChange = viewModel::setPictureFxaa
     )
+
+    if (saveManagerState.visible) {
+        SaveManagerDialog(
+            moduleName = saveManagerState.moduleName,
+            saves = saveManagerState.saves,
+            mirrorFolderLabel = saveManagerState.mirrorFolderLabel,
+            statusMessage = saveManagerState.statusMessage,
+            onImportSave = viewModel::requestImportSave,
+            onExportSave = viewModel::requestExportSave,
+            onRestoreBackup = viewModel::restoreSaveBackup,
+            onDeleteSave = viewModel::deleteSaveSlot,
+            onPickMirrorFolder = viewModel::requestPickSaveMirror,
+            onClearMirrorFolder = viewModel::clearSaveMirror,
+            onSyncMirrorNow = { viewModel.syncSaveMirrorNow(silentIfUnset = false) },
+            onDismiss = viewModel::dismissSaveManager
+        )
+    }
+
+    pendingPreparedZip?.let { zip ->
+        val sizeMb = if (zip.sizeBytes > 0) "${zip.sizeBytes / (1024L * 1024L)} MB" else "unknown size"
+        val modified = if (zip.lastModifiedMs > 0) {
+            DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(zip.lastModifiedMs))
+        } else {
+            "unknown date"
+        }
+        WseDialog(
+            title = "Import PC-prepared game code?",
+            text = "Found ${zip.fileName} ($sizeMb, modified $modified) in your Warband folder.\n\n" +
+                "Because this archive contains executable code prepared on your PC, WSE2 will verify " +
+                "every file against its SHA-256 manifest.json before importing.",
+            confirm = WseDialogAction("Verify & Import") { viewModel.confirmPreparedZipImport() },
+            dismiss = WseDialogAction("Skip") { viewModel.declinePreparedZipImport() },
+            onDismissRequest = { viewModel.declinePreparedZipImport() }
+        )
+    }
+
+    preparedZipStatus?.let { status ->
+        WseDialog(
+            title = "Verifying PC archive…",
+            text = status,
+            confirm = WseDialogAction("Working…") {},
+            onDismissRequest = {}
+        )
+    }
 
     when (val dialog = activeDialog) {
         is LauncherDialogState.ScanError -> {
@@ -294,6 +374,20 @@ fun LauncherAppContent(
     onR4UseCopyChange: (Boolean) -> Unit = {},
     onClearInstallCache: () -> Unit = {},
     onClearTextureCache: () -> Unit = {},
+    onClearSoCache: () -> Unit = {},
+    onClearShaderCache: () -> Unit = {},
+    onClearSaveBackups: () -> Unit = {},
+    onOpenSaveManager: (() -> Unit)? = null,
+    customDriverSharedBuffers: Boolean = false,
+    onCustomDriverSharedBuffersChange: (Boolean) -> Unit = {},
+    strictTso: Boolean = false,
+    onStrictTsoChange: (Boolean) -> Unit = {},
+    recordPgoProfile: Boolean = false,
+    onRecordPgoProfileChange: (Boolean) -> Unit = {},
+    pgoProfileSummary: String = "None",
+    onClearPgoProfile: () -> Unit = {},
+    crashReportText: String? = null,
+    onClearCrashReport: () -> Unit = {},
     onDismissR4Report: () -> Unit = {},
     pictureResolutionIndex: Int = 0,
     pictureSharpen: Boolean = true,
@@ -335,6 +429,11 @@ fun LauncherAppContent(
         pictureResolutionIndex = pictureResolutionIndex,
         pictureSharpen = pictureSharpen,
         pictureFxaa = pictureFxaa,
+        customDriverSharedBuffers = customDriverSharedBuffers,
+        strictTso = strictTso,
+        recordPgoProfile = recordPgoProfile,
+        pgoProfileSummary = pgoProfileSummary,
+        crashReportText = crashReportText,
         statusLog = statusLog
     )
 
@@ -368,7 +467,8 @@ fun LauncherAppContent(
                 modules = modulesState.modules,
                 selectedIndex = modulesState.selectedIndex,
                 moduleArt = moduleArt,
-                onSelectModule = onSelectModule
+                onSelectModule = onSelectModule,
+                onOpenSaveManager = onOpenSaveManager
             )
             LauncherTab.MODULES -> ModulesScreen(
                 state = modulesState,
@@ -401,7 +501,8 @@ fun LauncherAppContent(
                 onLanguageChange = onLanguageChange,
                 topContentPadding = topPadding,
                 onUpdateRglConfig = onUpdateRglConfig,
-                onResetRglConfig = onResetRglConfig
+                onResetRglConfig = onResetRglConfig,
+                selectedModule = modulesState.selectedModule
             )
             LauncherTab.ADVANCED -> AdvancedScreen(
                 state = advancedState,
@@ -422,6 +523,15 @@ fun LauncherAppContent(
                 onR4UseCopyChange = onR4UseCopyChange,
                 onClearInstallCache = onClearInstallCache,
                 onClearTextureCache = onClearTextureCache,
+                onClearSoCache = onClearSoCache,
+                onClearShaderCache = onClearShaderCache,
+                onClearSaveBackups = onClearSaveBackups,
+                onOpenSaveManager = onOpenSaveManager ?: {},
+                onCustomDriverSharedBuffersChange = onCustomDriverSharedBuffersChange,
+                onStrictTsoChange = onStrictTsoChange,
+                onRecordPgoProfileChange = onRecordPgoProfileChange,
+                onClearPgoProfile = onClearPgoProfile,
+                onClearCrashReport = onClearCrashReport,
                 onDismissR4Report = onDismissR4Report,
                 onPictureResolutionChange = onPictureResolutionChange,
                 onPictureSharpenChange = onPictureSharpenChange,

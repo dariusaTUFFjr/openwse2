@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <utility>
@@ -228,6 +229,55 @@ inline std::uint64_t fnv1a_step_u32_le(std::uint64_t h, std::uint32_t v) noexcep
     if (max_size == 0U) return first;
     while (first + 1U < mip_count && std::max(width >> first, height >> first) > max_size) ++first;
     return first;
+}
+
+struct TextureCachePruneResult {
+    std::size_t removed_files = 0;
+    std::uint64_t freed_bytes = 0;
+    std::uint64_t remaining_bytes = 0;
+};
+
+[[nodiscard]] inline TextureCachePruneResult prune_texture_cache_lru(const std::filesystem::path& dir,
+                                                                     std::uint64_t max_bytes) {
+    namespace fs = std::filesystem;
+    TextureCachePruneResult res{};
+    if (max_bytes == 0U || dir.empty()) return res;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return res;
+    struct Entry {
+        fs::path path;
+        std::uint64_t size = 0;
+        fs::file_time_type mtime{};
+    };
+    std::vector<Entry> entries;
+    std::uint64_t total = 0;
+    for (const fs::directory_entry& de : fs::directory_iterator(dir, ec)) {
+        if (!de.is_regular_file(ec)) continue;
+        if (de.path().extension() != ".etc2") continue;
+        const std::uint64_t sz = de.file_size(ec);
+        if (ec) continue;
+        const auto mt = de.last_write_time(ec);
+        if (ec) continue;
+        entries.push_back({de.path(), sz, mt});
+        total += sz;
+    }
+    res.remaining_bytes = total;
+    if (total <= max_bytes) return res;
+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.mtime != b.mtime) return a.mtime < b.mtime;
+        return a.path.filename() < b.path.filename();
+    });
+    const std::uint64_t target = (max_bytes * 85ULL) / 100ULL;
+    for (const Entry& e : entries) {
+        if (total <= target) break;
+        if (fs::remove(e.path, ec)) {
+            total -= e.size;
+            ++res.removed_files;
+            res.freed_bytes += e.size;
+        }
+    }
+    res.remaining_bytes = total;
+    return res;
 }
 
 }  // namespace wse::asset

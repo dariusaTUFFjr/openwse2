@@ -61,6 +61,12 @@ object R4Native {
         autoResolution: Boolean,
         sharpness: Float,
         fxaa: Boolean,
+        targetFps: Float,
+        customDriverSharedBuffers: Boolean,
+        strictTso: Boolean,
+        profileInPath: String,
+        profileOutPath: String,
+        crashReportPath: String,
         hudListener: HudListener?
     ): Int
 
@@ -155,4 +161,30 @@ object R4Native {
 
     @JvmStatic
     external fun nativeIsCursorVisible(): Boolean
+
+    // ---- Phase 5 P14.2 / P14.4: Live Graphics Drawer, Touch Layout Editor & Telemetry ----
+
+    @JvmStatic
+    external fun nativeSetGraphicsConfig(
+        renderScale: Float,
+        autoResolution: Boolean,
+        sharpness: Float,
+        fxaa: Boolean,
+        targetFps: Float
+    )
+
+    @JvmStatic
+    external fun nativeSetLayoutEditMode(enabled: Boolean)
+
+    @JvmStatic
+    external fun nativeResetTouchLayout()
+
+    @JvmStatic
+    external fun nativeExportTouchLayoutJson(): String
+
+    @JvmStatic
+    external fun nativeImportTouchLayoutJson(json: String): Boolean
+
+    @JvmStatic
+    external fun nativeAppendReportLine(line: String)
 }

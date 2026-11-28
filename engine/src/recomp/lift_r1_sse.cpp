@@ -108,8 +108,8 @@ Value* splat_vec(Ctx& c, Value* scalar, unsigned n) {
                                    llvm::ArrayRef<int>(zeros.data(), n));
 }
 
-// Reads a 128-bit XMM/m128 operand as `i128` or bitcast to `vec_ty`.
-Value* read_i128(Ctx& c, const DInsn& d, int op_idx, bool* ok = nullptr) {
+// Reads a 128-bit XMM/m128 operand natively as `<2 x i64>` (stays in NEON v0..v31 on AArch64).
+Value* read_v2i64(Ctx& c, const DInsn& d, int op_idx, bool* ok = nullptr) {
     const ZydisDecodedOperand& o = d.ops[op_idx];
     if (o.type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int idx = Ctx::xmm_index(o.reg.value);
@@ -117,18 +117,28 @@ Value* read_i128(Ctx& c, const DInsn& d, int op_idx, bool* ok = nullptr) {
             if (ok != nullptr) *ok = false;
             return nullptr;
         }
-        return c.xmm(idx);
+        return c.xmm_vec(idx);
     }
     if (o.type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        return c.load(c.address(d, o), 128);
+        return c.load_vec128(c.address(d, o));
     }
     if (ok != nullptr) *ok = false;
     return nullptr;
 }
 
 Value* read_vec(Ctx& c, const DInsn& d, int op_idx, Type* vec_ty, bool* ok = nullptr) {
-    Value* v = read_i128(c, d, op_idx, ok);
+    Value* v = read_v2i64(c, d, op_idx, ok);
     return v != nullptr ? c.B.CreateBitCast(v, vec_ty) : nullptr;
+}
+
+Value* extract_xmm_low_int(Ctx& c, int src_idx, unsigned bits) {
+    if (bits == 64U) {
+        return c.B.CreateExtractElement(c.xmm_vec(src_idx), std::uint64_t{0});
+    }
+    if (bits == 32U) {
+        return c.B.CreateExtractElement(c.B.CreateBitCast(c.xmm_vec(src_idx), v4i32_ty(c)), std::uint64_t{0});
+    }
+    return c.B.CreateTrunc(c.xmm(src_idx), c.ity(bits));
 }
 
 Value* read_scalar_fp(Ctx& c, const DInsn& d, int op_idx, bool is_double, bool* ok = nullptr) {
@@ -140,7 +150,7 @@ Value* read_scalar_fp(Ctx& c, const DInsn& d, int op_idx, bool is_double, bool* 
             if (ok != nullptr) *ok = false;
             return nullptr;
         }
-        Value* vec = c.B.CreateBitCast(c.xmm(idx), is_double ? v2d_ty(c) : v4f_ty(c));
+        Value* vec = c.B.CreateBitCast(c.xmm_vec(idx), is_double ? v2d_ty(c) : v4f_ty(c));
         return c.B.CreateExtractElement(vec, std::uint64_t{0});
     }
     if (o.type == ZYDIS_OPERAND_TYPE_MEMORY) {
@@ -155,7 +165,7 @@ void write_scalar_merge(Ctx& c, int dst_idx, Value* scalar_val) {
     Type* st = scalar_val->getType();
     const bool w64 = st->isDoubleTy() || st->isIntegerTy(64);
     Type* vty = llvm::FixedVectorType::get(st, w64 ? 2U : 4U);
-    Value* cur = c.B.CreateBitCast(c.xmm(dst_idx), vty);
+    Value* cur = c.B.CreateBitCast(c.xmm_vec(dst_idx), vty);
     c.set_xmm(dst_idx, c.B.CreateInsertElement(cur, scalar_val, std::uint64_t{0}));
 }
 
@@ -278,13 +288,13 @@ Lifted lift_mov_scalar(Ctx& c, const DInsn& d, unsigned bits) {
         if (d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
             const int src = Ctx::xmm_index(d.ops[1].reg.value);
             if (src < 0) return fail_insn(c, d);
-            Value* low = c.B.CreateTrunc(c.xmm(src), c.ity(bits));
+            Value* low = extract_xmm_low_int(c, src, bits);
             write_scalar_merge(c, dst, low);
             return Lifted::yes;
         }
         if (d.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
             Value* v = c.load(c.address(d, d.ops[1]), bits);
-            c.set_xmm(dst, c.B.CreateZExt(v, c.i128()));
+            c.set_xmm(dst, v);
             return Lifted::yes;
         }
         return fail_insn(c, d);
@@ -292,7 +302,7 @@ Lifted lift_mov_scalar(Ctx& c, const DInsn& d, unsigned bits) {
     if (d.ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src = Ctx::xmm_index(d.ops[1].reg.value);
         if (src < 0) return fail_insn(c, d);
-        c.store(c.address(d, d.ops[0]), c.B.CreateTrunc(c.xmm(src), c.ity(bits)));
+        c.store(c.address(d, d.ops[0]), extract_xmm_low_int(c, src, bits));
         return Lifted::yes;
     }
     return fail_insn(c, d);
@@ -307,7 +317,7 @@ Lifted lift_movdq(Ctx& c, const DInsn& d, unsigned bits) {
             if (d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
                 const int src_xmm = Ctx::xmm_index(d.ops[1].reg.value);
                 if (src_xmm >= 0) {
-                    v = c.B.CreateTrunc(c.xmm(src_xmm), c.ity(bits));
+                    v = extract_xmm_low_int(c, src_xmm, bits);
                 } else if (Ctx::gpr_index(d.ops[1].reg.value) >= 0) {
                     v = c.B.CreateZExtOrTrunc(c.gpr(d.ops[1].reg.value), c.ity(bits));
                 }
@@ -315,13 +325,13 @@ Lifted lift_movdq(Ctx& c, const DInsn& d, unsigned bits) {
                 v = c.load(c.address(d, d.ops[1]), bits);
             }
             if (v == nullptr) return fail_insn(c, d);
-            c.set_xmm(dst_xmm, c.B.CreateZExt(v, c.i128()));
+            c.set_xmm(dst_xmm, v);
             return Lifted::yes;
         }
         if (Ctx::gpr_index(d.ops[0].reg.value) >= 0 && d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
             const int src_xmm = Ctx::xmm_index(d.ops[1].reg.value);
             if (src_xmm < 0) return fail_insn(c, d);
-            c.set_gpr(d.ops[0].reg.value, c.B.CreateTrunc(c.xmm(src_xmm), c.ity(bits)));
+            c.set_gpr(d.ops[0].reg.value, extract_xmm_low_int(c, src_xmm, bits));
             return Lifted::yes;
         }
         return fail_insn(c, d);
@@ -329,7 +339,7 @@ Lifted lift_movdq(Ctx& c, const DInsn& d, unsigned bits) {
     if (d.ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_xmm = Ctx::xmm_index(d.ops[1].reg.value);
         if (src_xmm < 0) return fail_insn(c, d);
-        c.store(c.address(d, d.ops[0]), c.B.CreateTrunc(c.xmm(src_xmm), c.ity(bits)));
+        c.store(c.address(d, d.ops[0]), extract_xmm_low_int(c, src_xmm, bits));
         return Lifted::yes;
     }
     return fail_insn(c, d);
@@ -337,11 +347,10 @@ Lifted lift_movdq(Ctx& c, const DInsn& d, unsigned bits) {
 
 Lifted lift_mov_half64(Ctx& c, const DInsn& d, unsigned lane) {
     // movlps/movlpd (lane 0) and movhps/movhpd (lane 1): preserve the other 64-bit half of dst.
-    auto* v2i = v2i64_ty(c);
     if (d.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && d.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         const int dst = Ctx::xmm_index(d.ops[0].reg.value);
         if (dst < 0) return fail_insn(c, d);
-        Value* cur = c.B.CreateBitCast(c.xmm(dst), v2i);
+        Value* cur = c.xmm_vec(dst);
         Value* val = c.load(c.address(d, d.ops[1]), 64);
         c.set_xmm(dst, c.B.CreateInsertElement(cur, val, static_cast<std::uint64_t>(lane)));
         return Lifted::yes;
@@ -349,8 +358,7 @@ Lifted lift_mov_half64(Ctx& c, const DInsn& d, unsigned lane) {
     if (d.ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src = Ctx::xmm_index(d.ops[1].reg.value);
         if (src < 0) return fail_insn(c, d);
-        Value* vec = c.B.CreateBitCast(c.xmm(src), v2i);
-        c.store(c.address(d, d.ops[0]), c.B.CreateExtractElement(vec, static_cast<std::uint64_t>(lane)));
+        c.store(c.address(d, d.ops[0]), c.B.CreateExtractElement(c.xmm_vec(src), static_cast<std::uint64_t>(lane)));
         return Lifted::yes;
     }
     return fail_insn(c, d);
@@ -364,7 +372,7 @@ Lifted lift_movmsk(Ctx& c, const DInsn& d, unsigned lanes, unsigned elem_bits) {
     const int src = Ctx::xmm_index(d.ops[1].reg.value);
     if (src < 0) return fail_insn(c, d);
     auto* vty = llvm::FixedVectorType::get(c.ity(elem_bits), lanes);
-    Value* vec = c.B.CreateBitCast(c.xmm(src), vty);
+    Value* vec = c.B.CreateBitCast(c.xmm_vec(src), vty);
     Value* signs = c.B.CreateICmpSLT(vec, llvm::ConstantAggregateZero::get(vty));
     Value* mask = c.B.CreateZExt(c.B.CreateBitCast(signs, c.ity(lanes)), c.B.getInt32Ty());
     c.set_gpr(d.ops[0].reg.value, mask);
@@ -580,7 +588,7 @@ Lifted lift_pextr(Ctx& c, const DInsn& d, unsigned elem_bits) {
     const unsigned lanes = 128U / elem_bits;
     const unsigned idx = static_cast<unsigned>(d.ops[2].imm.value.u) & (lanes - 1U);
     auto* vty = llvm::FixedVectorType::get(c.ity(elem_bits), lanes);
-    Value* elem = c.B.CreateExtractElement(c.B.CreateBitCast(c.xmm(src), vty), static_cast<std::uint64_t>(idx));
+    Value* elem = c.B.CreateExtractElement(c.B.CreateBitCast(c.xmm_vec(src), vty), static_cast<std::uint64_t>(idx));
     if (d.ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         c.store(c.address(d, d.ops[0]), elem);
         return Lifted::yes;
@@ -598,7 +606,7 @@ Lifted lift_pinsr(Ctx& c, const DInsn& d, unsigned elem_bits) {
     const unsigned lanes = 128U / elem_bits;
     const unsigned idx = static_cast<unsigned>(d.ops[2].imm.value.u) & (lanes - 1U);
     auto* vty = llvm::FixedVectorType::get(c.ity(elem_bits), lanes);
-    Value* vec = c.B.CreateBitCast(c.xmm(dst), vty);
+    Value* vec = c.B.CreateBitCast(c.xmm_vec(dst), vty);
     Value* elem = c.B.CreateTrunc(c.read(d, 1), c.ity(elem_bits));
     c.set_xmm(dst, c.B.CreateInsertElement(vec, elem, static_cast<std::uint64_t>(idx)));
     return Lifted::yes;
@@ -686,7 +694,7 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
     case ZYDIS_MNEMONIC_LDDQU:
     case ZYDIS_MNEMONIC_MOVNTDQA: {
         bool ok = true;
-        Value* src = read_i128(c, d, 1, &ok);
+        Value* src = read_v2i64(c, d, 1, &ok);
         if (!ok) return fail_insn(c, d);
         if (d.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
             const int dst = Ctx::xmm_index(d.ops[0].reg.value);
@@ -708,7 +716,7 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
         }
         const int src = Ctx::xmm_index(d.ops[1].reg.value);
         if (src < 0) return fail_insn(c, d);
-        c.store(c.address(d, d.ops[0]), c.xmm(src));
+        c.store(c.address(d, d.ops[0]), c.xmm_vec(src));
         return Lifted::yes;
     }
     case ZYDIS_MNEMONIC_MOVNTI:
@@ -735,9 +743,8 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
         const int dst = Ctx::xmm_index(d.ops[0].reg.value);
         const int src = Ctx::xmm_index(d.ops[1].reg.value);
         if (dst < 0 || src < 0) return fail_insn(c, d);
-        auto* v2i = v2i64_ty(c);
-        Value* dv = B.CreateBitCast(c.xmm(dst), v2i);
-        Value* sv = B.CreateBitCast(c.xmm(src), v2i);
+        Value* dv = c.xmm_vec(dst);
+        Value* sv = c.xmm_vec(src);
         if (mn == ZYDIS_MNEMONIC_MOVHLPS) {
             c.set_xmm(dst, B.CreateInsertElement(dv, B.CreateExtractElement(sv, std::uint64_t{1}),
                                                  std::uint64_t{0}));
@@ -760,7 +767,7 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
         if (d.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
             const int src = Ctx::xmm_index(d.ops[1].reg.value);
             if (src < 0) return fail_insn(c, d);
-            lo = B.CreateTrunc(c.xmm(src), B.getInt64Ty());
+            lo = extract_xmm_low_int(c, src, 64U);
         } else if (d.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
             lo = c.load(c.address(d, d.ops[1]), 64);
         } else {
@@ -913,8 +920,8 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
         const int dst = Ctx::xmm_index(d.ops[0].reg.value);
         if (dst < 0) return fail_insn(c, d);
         bool ok = true;
-        Value* a = read_i128(c, d, 0, &ok);
-        Value* b = read_i128(c, d, 1, &ok);
+        Value* a = read_v2i64(c, d, 0, &ok);
+        Value* b = read_v2i64(c, d, 1, &ok);
         if (!ok) return fail_insn(c, d);
         Value* r = nullptr;
         if (mn == ZYDIS_MNEMONIC_ANDPS || mn == ZYDIS_MNEMONIC_ANDPD || mn == ZYDIS_MNEMONIC_PAND) {
@@ -1461,16 +1468,24 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
         const int dst = Ctx::xmm_index(d.ops[0].reg.value);
         if (dst < 0) return fail_insn(c, d);
         bool ok = true;
-        Value* a = read_i128(c, d, 0, &ok);
-        Value* b = read_i128(c, d, 1, &ok);
+        Value* a = read_vec(c, d, 0, v16i8_ty(c), &ok);
+        Value* b = read_vec(c, d, 1, v16i8_ty(c), &ok);
         if (!ok) return fail_insn(c, d);
         const unsigned shift = static_cast<unsigned>(d.ops[2].imm.value.u) & 0xFFU;
+        Value* zero_v = llvm::ConstantAggregateZero::get(v16i8_ty(c));
         if (shift >= 32U) {
-            c.set_xmm(dst, B.getIntN(128, 0));
+            c.set_xmm(dst, zero_v);
+        } else if (shift < 16U) {
+            int mask[16];
+            for (unsigned i = 0; i < 16U; ++i) mask[i] = static_cast<int>(i + shift);
+            c.set_xmm(dst, B.CreateShuffleVector(b, a, mask));
         } else {
-            Type* i256 = c.ity(256);
-            Value* concat = B.CreateOr(B.CreateShl(B.CreateZExt(a, i256), 128), B.CreateZExt(b, i256));
-            c.set_xmm(dst, B.CreateTrunc(B.CreateLShr(concat, shift * 8U), c.i128()));
+            int mask[16];
+            for (unsigned i = 0; i < 16U; ++i) {
+                const unsigned idx = i + shift - 16U;
+                mask[i] = idx < 16U ? static_cast<int>(idx) : 16;
+            }
+            c.set_xmm(dst, B.CreateShuffleVector(a, zero_v, mask));
         }
         return Lifted::yes;
     }
@@ -1514,12 +1529,15 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
     case ZYDIS_MNEMONIC_PHSUBSW: return lift_horiz_int(c, d, 16, true, true);
     case ZYDIS_MNEMONIC_PTEST: {
         bool ok = true;
-        Value* a = read_i128(c, d, 0, &ok);
-        Value* b = read_i128(c, d, 1, &ok);
+        Value* a = read_v2i64(c, d, 0, &ok);
+        Value* b = read_v2i64(c, d, 1, &ok);
         if (!ok) return fail_insn(c, d);
-        Value* z = B.getIntN(128, 0);
-        c.set_flag(ZF, B.CreateICmpEQ(B.CreateAnd(a, b), z));
-        c.set_flag(CF, B.CreateICmpEQ(B.CreateAnd(B.CreateNot(a), b), z));
+        Value* t1 = B.CreateAnd(a, b);
+        Value* t2 = B.CreateAnd(B.CreateNot(a), b);
+        Value* o1 = B.CreateOr(B.CreateExtractElement(t1, uint64_t{0}), B.CreateExtractElement(t1, uint64_t{1}));
+        Value* o2 = B.CreateOr(B.CreateExtractElement(t2, uint64_t{0}), B.CreateExtractElement(t2, uint64_t{1}));
+        c.set_flag(ZF, B.CreateICmpEQ(o1, B.getInt64(0)));
+        c.set_flag(CF, B.CreateICmpEQ(o2, B.getInt64(0)));
         c.set_flag(OF, B.getFalse());
         c.set_flag(SF, B.getFalse());
         c.set_flag(PF, B.getFalse());
@@ -1579,7 +1597,7 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
             const int src = Ctx::xmm_index(d.ops[1].reg.value);
             if (src < 0) return fail_insn(c, d);
             const unsigned count_s = (imm >> 6U) & 3U;
-            src_elem = B.CreateExtractElement(B.CreateBitCast(c.xmm(src), v4i32_ty(c)),
+            src_elem = B.CreateExtractElement(B.CreateBitCast(c.xmm_vec(src), v4i32_ty(c)),
                                               static_cast<std::uint64_t>(count_s));
         } else if (d.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
             // Intel SDM: COUNT_S is ignored for m32 source.
@@ -1588,7 +1606,7 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
             return fail_insn(c, d);
         }
         const unsigned count_d = (imm >> 4U) & 3U;
-        Value* ins = B.CreateInsertElement(B.CreateBitCast(c.xmm(dst), v4i32_ty(c)), src_elem,
+        Value* ins = B.CreateInsertElement(B.CreateBitCast(c.xmm_vec(dst), v4i32_ty(c)), src_elem,
                                            static_cast<std::uint64_t>(count_d));
         const int mask[4] = {
             (imm & 1U) != 0 ? 4 : 0,
@@ -1632,7 +1650,7 @@ Lifted lift_sse(Ctx& c, const DInsn& d) {
         Value* a = read_vec(c, d, 0, vty, &ok);
         Value* b = read_vec(c, d, 1, vty, &ok);
         if (!ok) return fail_insn(c, d);
-        Value* mask_vec = B.CreateBitCast(c.xmm(0), vty);
+        Value* mask_vec = B.CreateBitCast(c.xmm_vec(0), vty);
         Value* pick_b = B.CreateICmpSLT(mask_vec, llvm::ConstantAggregateZero::get(vty));
         c.set_xmm(dst, B.CreateSelect(pick_b, b, a));
         return Lifted::yes;

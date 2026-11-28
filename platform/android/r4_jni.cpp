@@ -38,6 +38,7 @@
 #include "aaudio_device.h"
 #include "d3d9_vulkan.h"
 #include "driver_loader.h"
+#include "perf_hint.h"
 #include "saf_jni_util.h"
 #include "wse/asset/audio_codecs.h"
 #include "wse/platform/caching_vfs.h"
@@ -225,6 +226,10 @@ private:
 // Install reads (count, bytes, wall time including the wait for the lock), for the load-time
 // breakdown in the report's `fps:` lines.
 std::atomic<std::uint64_t> g_file_ns{0}, g_file_count{0}, g_file_bytes{0};
+bool g_strict_tso = false;
+std::string g_profile_in;
+std::string g_profile_out;
+std::string g_crash_report_path;
 
 // Serializes every call of a Vfs that is not thread-safe (`SafVfs`): guest threads read files
 // concurrently (resource loading threads).
@@ -435,6 +440,8 @@ std::string_view driver_label(wse::platform::DriverMode mode) noexcept {
 std::mutex g_vk_m;
 std::shared_ptr<wse::platform::VulkanD3d9Backend> g_vk_backend;
 ANativeWindow* g_pending_window = nullptr;
+std::unique_ptr<wse::platform::android_perf::PerformanceHintSession> g_adpf_session;
+std::atomic<bool> g_notified_first_frame{false};
 
 // Live R6 audio & VFS handles shared with `FmodSteam::created_hook()` and `nativeSetPaused`.
 std::mutex g_audio_m;
@@ -514,7 +521,15 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
         game_install = install_cache.get();
     }
     g_install_cache.store(install_cache.get(), std::memory_order_release);
-    static wse::platform::HostVfs user(work / "user");
+    // Permanent user storage (`filesDir/wse2/user`, P14.3): kept outside `filesDir/recomp/r4/`
+    // so cache clears never touch saves or config. Falls back to `work / "user"` if no parent dir.
+    const fs::path files_root = work.parent_path().parent_path();
+    const fs::path user_root = files_root.empty() ? (work / "user") : (files_root / "wse2" / "user");
+    {
+        std::error_code uec;
+        fs::create_directories(user_root, uec);
+    }
+    static wse::platform::HostVfs user(user_root);
     {
         const std::lock_guard<std::mutex> lock(g_audio_m);
         g_audio_install_vfs = game_install;
@@ -554,6 +569,17 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     }
 
     wse::recomp::StartupOptions o;
+    o.strict_tso = g_strict_tso;
+    o.profile_in = g_profile_in;
+    if (o.profile_in.empty()) {
+        std::error_code pec;
+        const fs::path default_pgo = user_root / "wse_pgo.txt";
+        if (fs::is_regular_file(default_pgo, pec)) {
+            o.profile_in = default_pgo.string();
+        }
+    }
+    o.profile_out = g_profile_out;
+    o.crash_report_path = g_crash_report_path.empty() ? (user_root / "crash_report.txt").string() : g_crash_report_path;
     if (hud) hud->update("Reading the game…");
     if (!game_install->read_file("mb_warband_wse2_x64.exe", o.exe) ||
         !game_install->read_file("lua5164.dll", o.lua) ||
@@ -622,10 +648,14 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
 extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_nativeRun(JNIEnv* env, jclass, jobject bridge,
                                                                                     jstring jcopy_dir, jstring jwork_dir,
                                                                                     jstring jmodule, jint jobs, jlong frames) {
+    g_strict_tso = false;
+    g_profile_in.clear();
+    g_profile_out.clear();
+    g_crash_report_path.clear();
     namespace fs = std::filesystem;
     const fs::path work = fs::path(jstring_to_utf8(env, jwork_dir)) / "r4";
     std::error_code ec;
-    fs::create_directories(work / "user", ec);
+    fs::create_directories(work, ec);
     {
         const std::lock_guard<std::mutex> lock(g_report_m);
         g_report = std::fopen((work / "report.txt").c_str(), "w");
@@ -643,11 +673,17 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     JNIEnv* env, jclass, jobject bridge, jstring jcopy_dir, jstring jwork_dir, jstring jmodule, jint jobs,
     jlong frames, jobject jsurface, jstring jdriver_mode, jstring jcustom_icd_path, jstring jnative_lib_dir,
     jstring jshader_cache_dir, jint max_texture_size, jfloat render_scale, jboolean auto_resolution,
-    jfloat sharpness, jboolean fxaa, jobject jhud_listener) {
+    jfloat sharpness, jboolean fxaa, jfloat target_fps, jboolean custom_driver_shared_buffers,
+    jboolean strict_tso, jstring jprofile_in, jstring jprofile_out, jstring jcrash_report_path,
+    jobject jhud_listener) {
+    g_strict_tso = (strict_tso == JNI_TRUE);
+    g_profile_in = jstring_to_utf8(env, jprofile_in);
+    g_profile_out = jstring_to_utf8(env, jprofile_out);
+    g_crash_report_path = jstring_to_utf8(env, jcrash_report_path);
     namespace fs = std::filesystem;
     const fs::path work = fs::path(jstring_to_utf8(env, jwork_dir)) / "r4";
     std::error_code ec;
-    fs::create_directories(work / "user", ec);
+    fs::create_directories(work, ec);
     {
         const std::lock_guard<std::mutex> lock(g_report_m);
         g_report = std::fopen((work / "report.txt").c_str(), "w");
@@ -656,6 +692,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     g_reported_driver_summary.store(false);
     g_saved_menu_cache.store(false);
     g_finished_report.store(false);
+    g_notified_first_frame.store(false);
 
     JavaVM* vm = nullptr;
     (void)env->GetJavaVM(&vm);
@@ -777,18 +814,39 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
     }
     cfg.max_texture_size = static_cast<std::uint32_t>(std::max<jint>(0, max_texture_size));
     cfg.native_window = init_win;
+    cfg.custom_driver_shared_buffers = (custom_driver_shared_buffers == JNI_TRUE);
     cfg.render_scale = std::clamp(static_cast<float>(render_scale), 0.5F, 1.0F);
     cfg.auto_resolution = (auto_resolution == JNI_TRUE);
+    const float resolved_target_fps = std::clamp(static_cast<float>(target_fps), 30.0F, 120.0F);
     cfg.min_render_scale = 0.5F;
-    cfg.target_fps = 60.0F;
+    cfg.target_fps = resolved_target_fps;
     cfg.sharpness = std::max(0.0F, static_cast<float>(sharpness));
     cfg.fxaa = (fxaa == JNI_TRUE);
+    {
+        const std::lock_guard<std::mutex> lock(g_vk_m);
+        const auto target_ns = static_cast<std::int64_t>(1'000'000'000.0 / static_cast<double>(resolved_target_fps));
+        g_adpf_session = wse::platform::android_perf::PerformanceHintSession::create(target_ns);
+        if (!g_adpf_session) {
+            (void)wse::platform::android_perf::raise_current_thread_priority();
+        }
+    }
     cfg.on_frame_presented = [hud, drv_label](std::uint64_t frame, double inst_fps, double avg_fps,
                                               std::string_view present_path) {
+        if (hud && !g_notified_first_frame.exchange(true)) {
+            hud->ui_action("first_frame");
+        }
         std::shared_ptr<wse::platform::VulkanD3d9Backend> bk;
         {
             const std::lock_guard<std::mutex> lock(g_vk_m);
             bk = g_vk_backend;
+            if (g_adpf_session && bk) {
+                // ADPF wants the work duration, not the frame interval: a frame that waits for
+                // vsync or the frame cap would always look exactly on target.
+                const auto ft = bk->last_frame_timings();
+                if (ft.cpu_ms > 0.0) {
+                    g_adpf_session->report_actual(static_cast<std::int64_t>(ft.cpu_ms * 1e6));
+                }
+            }
         }
         if (bk && !g_reported_driver_summary.exchange(true)) {
             report(bk->report().format_summary() + "\n");
@@ -847,10 +905,16 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
                 line += " menu_avg=" + format_fixed1(menu_avg);
             }
             if (bk) {
+                const auto ft = bk->last_frame_timings();
                 line += " shaders=" + std::to_string(bk->compiled_shader_count()) + "/" +
                         std::to_string(bk->failed_shader_count()) +
                         " pipelines=" + std::to_string(bk->cached_pipeline_count()) +
-                        " scale=" + format_fixed2(bk->current_render_scale());
+                        " scale=" + format_fixed2(ft.render_scale) +
+                        " cpu_ms=" + format_fixed1(ft.cpu_ms);
+                if (ft.gpu_ms >= 0.0) {
+                    line += " gpu_ms=" + format_fixed1(ft.gpu_ms);
+                }
+                line += " thermal=" + std::string(wse::platform::thermal_status_name(ft.thermal));
             }
             line += " path=" + std::string(present_path) + "\n";
             // Where the time goes: install reads, texture preparation, the game thread's own CPU
@@ -899,8 +963,20 @@ extern "C" JNIEXPORT jint JNICALL Java_org_wse2_android_launcher_R4Native_native
         poll_guest_scene_and_cheats();
         if (should_hud && hud) {
             std::string pill = format_fixed1(inst_fps) + " FPS";
-            if (bk && bk->current_render_scale() < 0.995F) {
-                pill += " · " + std::to_string(static_cast<int>(std::lround(bk->current_render_scale() * 100.0F))) + "%";
+            if (bk) {
+                const auto ft = bk->last_frame_timings();
+                if (ft.cpu_ms > 0.0) {
+                    pill += " · " + format_fixed1(ft.cpu_ms) + "ms";
+                }
+                if (ft.gpu_ms >= 0.0) {
+                    pill += "/G:" + format_fixed1(ft.gpu_ms) + "ms";
+                }
+                if (ft.render_scale < 0.995F) {
+                    pill += " · " + std::to_string(static_cast<int>(std::lround(ft.render_scale * 100.0F))) + "%";
+                }
+                if (ft.thermal != wse::platform::ThermalStatus::None) {
+                    pill += " · " + std::string(wse::platform::thermal_status_name(ft.thermal));
+                }
             }
             hud->update(pill);
         }
@@ -1069,6 +1145,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
 }
 
 extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeFinishReport(JNIEnv*, jclass) {
+    wse::recomp::flush_pgo_profile_now();
     {
         const std::lock_guard<std::mutex> lock(g_pause_m);
         g_shutting_down = true;
@@ -1273,4 +1350,50 @@ extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_native
 
 extern "C" JNIEXPORT jboolean JNICALL Java_org_wse2_android_launcher_R4Native_nativeIsCursorVisible(JNIEnv*, jclass) {
     return wse::recomp::shim::RecompInputHub::shared().cursor_visible() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetGraphicsConfig(
+    JNIEnv*, jclass, jfloat render_scale, jboolean auto_resolution, jfloat sharpness, jboolean fxaa,
+    jfloat target_fps) {
+    std::shared_ptr<wse::platform::VulkanD3d9Backend> bk;
+    {
+        const std::lock_guard<std::mutex> lock(g_vk_m);
+        bk = g_vk_backend;
+        if (g_adpf_session && target_fps > 0.0F) {
+            const auto ns = static_cast<std::int64_t>(1e9 / static_cast<double>(std::clamp(static_cast<float>(target_fps), 15.0F, 240.0F)));
+            g_adpf_session->update_target(ns);
+        }
+    }
+    if (bk) {
+        bk->set_graphics_options(static_cast<float>(render_scale), auto_resolution == JNI_TRUE,
+                                 static_cast<float>(sharpness), fxaa == JNI_TRUE, static_cast<float>(target_fps));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeSetLayoutEditMode(
+    JNIEnv*, jclass, jboolean enabled) {
+    wse::recomp::shim::RecompInputHub::shared().set_edit_mode(enabled == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeResetTouchLayout(JNIEnv*, jclass) {
+    wse::recomp::shim::RecompInputHub::shared().reset_layout_to_defaults();
+}
+
+extern "C" JNIEXPORT jstring JNICALL Java_org_wse2_android_launcher_R4Native_nativeExportTouchLayoutJson(
+    JNIEnv* env, jclass) {
+    return utf8_to_jstring(env, wse::recomp::shim::RecompInputHub::shared().export_layout_json());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_org_wse2_android_launcher_R4Native_nativeImportTouchLayoutJson(
+    JNIEnv* env, jclass, jstring jjson) {
+    const std::string json = jstring_to_utf8(env, jjson);
+    return wse::recomp::shim::RecompInputHub::shared().import_layout_json(json) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_org_wse2_android_launcher_R4Native_nativeAppendReportLine(
+    JNIEnv* env, jclass, jstring jline) {
+    const std::string line = jstring_to_utf8(env, jline);
+    if (!line.empty()) {
+        report(line.back() == '\n' ? line : (line + "\n"));
+    }
 }
