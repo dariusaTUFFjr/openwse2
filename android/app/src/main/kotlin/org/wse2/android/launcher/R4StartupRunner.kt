@@ -189,7 +189,9 @@ class R4StartupRunner private constructor(private val app: Application) {
                         val size = if (c.isNull(2)) -1L else c.getLong(2)
                         val mtime = if (c.isNull(3)) -1L else c.getLong(3)
                         val stamp = "$name/$size/$mtime"
-                        val alreadyImported = prefs.getString(PREF_IMPORTED, null) == stamp
+                        val pgoMissingHot = UserStorage.pgoProfileFile(app.filesDir).isFile &&
+                            !File(r4Dir, "so/exe_hot_0.so").isFile
+                        val alreadyImported = prefs.getString(PREF_IMPORTED, null) == stamp && !pgoMissingHot
                         val alreadyDeclined = prefs.getString(PREF_DECLINED_ZIP, null) == stamp
                         if (!alreadyImported && !alreadyDeclined) {
                             pending = PendingPreparedZip(

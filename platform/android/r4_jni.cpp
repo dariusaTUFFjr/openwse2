@@ -571,6 +571,13 @@ int run_startup_common(JNIEnv* env, jobject bridge, const std::string& copy_dir,
     wse::recomp::StartupOptions o;
     o.strict_tso = g_strict_tso;
     o.profile_in = g_profile_in;
+    if (o.profile_in.empty()) {
+        std::error_code pec;
+        const fs::path default_pgo = user_root / "wse_pgo.txt";
+        if (fs::is_regular_file(default_pgo, pec)) {
+            o.profile_in = default_pgo.string();
+        }
+    }
     o.profile_out = g_profile_out;
     o.crash_report_path = g_crash_report_path.empty() ? (user_root / "crash_report.txt").string() : g_crash_report_path;
     if (hud) hud->update("Reading the game…");
