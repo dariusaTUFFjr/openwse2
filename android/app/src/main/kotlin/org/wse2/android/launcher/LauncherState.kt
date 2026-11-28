@@ -406,6 +406,7 @@ sealed interface LauncherEvent {
         val customDriverSharedBuffers: Boolean = false,
         val targetFps: Int = 60,
         val strictTso: Boolean = false,
-        val recordPgoProfile: Boolean = false
+        val recordPgoProfile: Boolean = false,
+        val showFpsOverlay: Boolean = false
     ) : LauncherEvent
 }

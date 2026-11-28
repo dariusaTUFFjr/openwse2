@@ -6793,6 +6793,59 @@ void test_r6_input_shims_and_adaptive_touch() {
                         {256U, reinterpret_cast<std::uintptr_t>(kstate)});
     expect(kstate[dik::kLShift] == 0U && kstate[dik::kLCtrl] == 0U,
            "R6 Touch UX H5: release_all clears latched/held modifier keys");
+
+    // 7. Decluttered minimal battle HUD + radial orders/weapon flick + forgiving 2-frame tap:
+    {
+        RecompInputHub mhub;
+        mhub.set_screen_size(2412, 1080);
+        mhub.set_surface_size(2412, 1080);
+        mhub.on_show_cursor(false);
+        const auto battle_vis = mhub.visible_buttons_snapshot();
+        expect(battle_vis.size() <= 11U,
+               "R6 Minimal Battle HUD: default battle screen stays uncluttered (<= 11 buttons)");
+
+        // Orders button: hold & flick up -> Charge! macro (F1 then F3).
+        for (const auto& b : battle_vis) {
+            if (b.id == "orders") {
+                const float ox = b.nx * 2412.0F;
+                const float oy = b.ny * 1080.0F;
+                mhub.on_touch_event(31, 0, ox, oy);
+                mhub.on_touch_event(31, 2, ox, oy - 70.0F);
+                mhub.on_touch_event(31, 1, ox, oy - 70.0F);
+                break;
+            }
+        }
+        std::uint8_t mk[256]{};
+        mhub.tick_frame();
+        mhub.fill_dinput_keyboard_state(mk, sizeof(mk));
+        expect(mk[dik::kF1] == 0x80U, "R6 Radial Orders: flick-up starts F1 macro step");
+        mhub.tick_frame();
+        mhub.tick_frame();
+        mhub.tick_frame();
+        mhub.tick_frame();
+        mhub.fill_dinput_keyboard_state(mk, sizeof(mk));
+        expect(mk[dik::kF3] == 0x80U, "R6 Radial Orders: flick-up follows with F3 (Charge!)");
+
+        // Dialog tap with realistic 22 px finger wobble still clicks at start coords & holds 2 frames.
+        mhub.set_inferred_scene(TouchScene::dialog);
+        mhub.on_show_cursor(true);
+        mhub.on_touch_event(41, 0, 900.0F, 400.0F);
+        mhub.on_touch_event(41, 2, 916.0F, 415.0F);  // ~22 px wobble (< 34 px slop)
+        mhub.on_touch_event(41, 1, 916.0F, 415.0F);
+        int cx = 0, cy = 0;
+        mhub.get_cursor_pos(cx, cy);
+        expect(cx == 900 && cy == 400, "R6 Tap Reliability: small jitter stays anchored to touch-down coords");
+        std::uint8_t ms[20]{};
+        mhub.tick_frame();  // hover -> LMB down (hold 2 frames)
+        mhub.fill_dinput_mouse_state(ms, sizeof(ms));
+        expect(ms[12] == 0x80U, "R6 Tap Reliability: deferred dialog tap presses LMB on frame 1");
+        mhub.tick_frame();  // hold frame 2
+        mhub.fill_dinput_mouse_state(ms, sizeof(ms));
+        expect(ms[12] == 0x80U, "R6 Tap Reliability: quick tap holds LMB across frame 2");
+        mhub.tick_frame();  // release frame 3
+        mhub.fill_dinput_mouse_state(ms, sizeof(ms));
+        expect(ms[12] == 0x00U, "R6 Tap Reliability: releases LMB cleanly on frame 3");
+    }
 }
 
 void test_r6_mod_controls_detector_and_icons() {

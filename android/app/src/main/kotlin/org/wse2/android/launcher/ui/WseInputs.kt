@@ -52,6 +52,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -563,76 +564,104 @@ fun WseCategoryStrip(
     }
 
     Column(modifier = modifier.fillMaxWidth()) {
-        LazyRow(
-            state = listState,
-            modifier = Modifier
-                .fillMaxWidth()
-                .selectableGroup(),
-            contentPadding = contentPadding,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            itemsIndexed(tabs) { index, tab ->
-                val isSelected = index == safeIdx
-                val interactionSource = remember { MutableInteractionSource() }
-                val labelColor by animateColorAsState(
-                    targetValue = if (isSelected) colors.onSurface else colors.onSurfaceVariant,
-                    animationSpec = wseAnimationSpec(
-                        animationsEnabled = animationsEnabled,
-                        durationMillis = 150
-                    ),
-                    label = "wse-category-color"
-                )
-                val indicatorColor by animateColorAsState(
-                    targetValue = if (isSelected) colors.primary else Color.Transparent,
-                    animationSpec = wseAnimationSpec(
-                        animationsEnabled = animationsEnabled,
-                        durationMillis = 150
-                    ),
-                    label = "wse-category-indicator"
-                )
-
-                Column(
-                    modifier = Modifier
-                        .width(IntrinsicSize.Max)
-                        .selectable(
-                            selected = isSelected,
-                            interactionSource = interactionSource,
-                            indication = null,
-                            role = Role.Tab,
-                            onClick = { onSelect(index) }
+        Box(modifier = Modifier.fillMaxWidth()) {
+            LazyRow(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .selectableGroup(),
+                contentPadding = contentPadding,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                itemsIndexed(tabs) { index, tab ->
+                    val isSelected = index == safeIdx
+                    val interactionSource = remember { MutableInteractionSource() }
+                    val labelColor by animateColorAsState(
+                        targetValue = if (isSelected) colors.onSurface else colors.onSurfaceVariant,
+                        animationSpec = wseAnimationSpec(
+                            animationsEnabled = animationsEnabled,
+                            durationMillis = 150
                         ),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        label = "wse-category-color"
+                    )
+                    val indicatorColor by animateColorAsState(
+                        targetValue = if (isSelected) colors.primary else Color.Transparent,
+                        animationSpec = wseAnimationSpec(
+                            animationsEnabled = animationsEnabled,
+                            durationMillis = 150
+                        ),
+                        label = "wse-category-indicator"
+                    )
+
+                    Column(
+                        modifier = Modifier
+                            .width(IntrinsicSize.Max)
+                            .selectable(
+                                selected = isSelected,
+                                interactionSource = interactionSource,
+                                indication = null,
+                                role = Role.Tab,
+                                onClick = { onSelect(index) }
+                            ),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        if (tab.icon != null) {
-                            Icon(
-                                imageVector = tab.icon,
-                                contentDescription = null,
-                                tint = if (isSelected) colors.primary else labelColor,
-                                modifier = Modifier.size(15.dp)
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            if (tab.icon != null) {
+                                Icon(
+                                    imageVector = tab.icon,
+                                    contentDescription = null,
+                                    tint = if (isSelected) colors.primary else labelColor,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                            Text(
+                                text = tab.label,
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
+                                    letterSpacing = 0.2.sp
+                                ),
+                                color = labelColor,
+                                maxLines = 1
                             )
                         }
-                        Text(
-                            text = tab.label,
-                            style = MaterialTheme.typography.labelLarge.copy(
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-                                letterSpacing = 0.2.sp
-                            ),
-                            color = labelColor,
-                            maxLines = 1
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(2.dp)
+                                .background(indicatorColor)
                         )
                     }
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(2.dp)
-                            .background(indicatorColor)
-                    )
                 }
+            }
+            if (listState.canScrollBackward) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .width(24.dp)
+                        .height(42.dp)
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(colors.surface, Color.Transparent)
+                            )
+                        )
+                )
+            }
+            if (listState.canScrollForward) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .width(24.dp)
+                        .height(42.dp)
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(Color.Transparent, colors.surface)
+                            )
+                        )
+                )
             }
         }
         HorizontalDivider(

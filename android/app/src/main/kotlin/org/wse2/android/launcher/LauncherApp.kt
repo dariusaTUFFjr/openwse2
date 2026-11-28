@@ -167,10 +167,7 @@ fun LauncherApp(
         onChooseFolder = onChooseFolder,
         onRescan = viewModel::rescanSelectedFolder,
         onCancelScan = viewModel::cancelScan,
-        onSelectModule = { index ->
-            viewModel.selectModule(index)
-            viewModel.selectTab(LauncherTab.HOME)
-        },
+        onSelectModule = viewModel::selectModule,
         onShowMissingFiles = viewModel::showMissingFiles,
         onPlay = viewModel::onPlayClicked,
         onQualityPresetChange = viewModel::setQualityPreset,
@@ -480,6 +477,7 @@ fun LauncherAppContent(
                 onCancelScan = onCancelScan,
                 onSelectModule = onSelectModule,
                 onShowMissingFiles = onShowMissingFiles,
+                onPlay = onPlay,
                 topContentPadding = topPadding,
                 sharedTransitionScope = sharedScope,
                 animatedVisibilityScope = animScope
@@ -502,7 +500,13 @@ fun LauncherAppContent(
                 topContentPadding = topPadding,
                 onUpdateRglConfig = onUpdateRglConfig,
                 onResetRglConfig = onResetRglConfig,
-                selectedModule = modulesState.selectedModule
+                selectedModule = modulesState.selectedModule,
+                pictureResolutionIndex = pictureResolutionIndex,
+                pictureSharpen = pictureSharpen,
+                pictureFxaa = pictureFxaa,
+                onPictureResolutionChange = onPictureResolutionChange,
+                onPictureSharpenChange = onPictureSharpenChange,
+                onPictureFxaaChange = onPictureFxaaChange
             )
             LauncherTab.ADVANCED -> AdvancedScreen(
                 state = advancedState,

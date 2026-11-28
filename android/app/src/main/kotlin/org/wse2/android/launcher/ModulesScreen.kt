@@ -63,6 +63,7 @@ fun ModulesScreen(
     onSelectModule: (Int) -> Unit,
     onShowMissingFiles: (ModuleChoice, List<String>) -> Unit,
     modifier: Modifier = Modifier,
+    onPlay: () -> Unit = {},
     topContentPadding: Dp = 0.dp,
     sharedTransitionScope: SharedTransitionScope? = null,
     animatedVisibilityScope: AnimatedVisibilityScope? = null
@@ -317,10 +318,11 @@ fun ModulesScreen(
                             badge = selectedMod.displayName.ifBlank { selectedMod.folderName }
                         )
                         LauncherGroupedCard {
-                            Box(
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(16.dp)
+                                    .padding(16.dp),
+                                verticalArrangement = Arrangement.spacedBy(14.dp)
                             ) {
                                 WseKeyValueGrid(
                                     items = listOf(
@@ -338,6 +340,21 @@ fun ModulesScreen(
                                     ),
                                     columns = 2
                                 )
+                                val st = state.installStatuses[selectedMod.modulePath]
+                                if (st?.state == InstallCheckState.MISSING) {
+                                    WseSecondaryButton(
+                                        text = "View missing files",
+                                        onClick = { onShowMissingFiles(selectedMod, st.missingFiles) },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                } else {
+                                    WsePrimaryButton(
+                                        text = "Play ${selectedMod.displayName.ifBlank { selectedMod.folderName }}",
+                                        onClick = onPlay,
+                                        enabled = st?.state == InstallCheckState.READY,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
                             }
                         }
                     }

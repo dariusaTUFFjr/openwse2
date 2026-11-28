@@ -759,7 +759,8 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
                         customDriverSharedBuffers = _customDriverSharedBuffers.value,
                         targetFps = modPic.targetFps,
                         strictTso = _strictTso.value,
-                        recordPgoProfile = _recordPgoProfile.value
+                        recordPgoProfile = _recordPgoProfile.value,
+                        showFpsOverlay = _showFpsOverlay.value
                     )
                 )
             }
@@ -1106,6 +1107,17 @@ class LauncherViewModel(application: Application) : AndroidViewModel(application
         val next = prev.copy(gyroAimEnabled = enabled)
         val json = JSONObject().put("gyro_aim_enabled", enabled.toString()).toString()
         commitSettingsChange(next, json, refreshGraphics = false)
+        // Mirror into the live `:recomp` controls store so the toggle takes effect in-game.
+        app.getSharedPreferences("wse2_r6_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("gyroEnabled", enabled)
+            .apply()
+        val mod = _modulesState.value.selectedModule?.folderName?.ifBlank { "Native" } ?: "Native"
+        val filesDir = app.filesDir
+        executor.execute {
+            val current = ModuleProfileStore.loadControlsPrefs(filesDir, mod)
+            ModuleProfileStore.saveControlsPrefs(filesDir, mod, current.copy(gyroEnabled = enabled))
+        }
     }
 
     fun setPinchZoom(enabled: Boolean) {

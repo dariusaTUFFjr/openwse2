@@ -71,7 +71,13 @@ fun SettingsScreen(
     onUpdateRglConfig: ((RglConfigState) -> RglConfigState) -> Unit = {},
     onResetRglConfig: () -> Unit = {},
     selectedModule: ModuleChoice? = null,
-    initialCategory: SettingsCategory = SettingsCategory.PERFORMANCE
+    initialCategory: SettingsCategory = SettingsCategory.PERFORMANCE,
+    pictureResolutionIndex: Int = 0,
+    pictureSharpen: Boolean = true,
+    pictureFxaa: Boolean = false,
+    onPictureResolutionChange: (Int) -> Unit = {},
+    onPictureSharpenChange: (Boolean) -> Unit = {},
+    onPictureFxaaChange: (Boolean) -> Unit = {}
 ) {
     val perf = state.performance ?: SettingsPlaceholderPerformance
     val rgl = state.rglConfig
@@ -123,10 +129,15 @@ fun SettingsScreen(
                     state = state,
                     perf = perf,
                     enabled = enabled,
+                    pictureResolutionIndex = pictureResolutionIndex,
+                    pictureSharpen = pictureSharpen,
+                    pictureFxaa = pictureFxaa,
                     onQualityPresetChange = onQualityPresetChange,
                     onFrameRateCapChange = onFrameRateCapChange,
                     onPresentModeChange = onPresentModeChange,
-                    onRenderScaleChange = onRenderScaleChange,
+                    onPictureResolutionChange = onPictureResolutionChange,
+                    onPictureSharpenChange = onPictureSharpenChange,
+                    onPictureFxaaChange = onPictureFxaaChange,
                     onMaxTextureSizeChange = onMaxTextureSizeChange,
                     onThermalThrottlingChange = onThermalThrottlingChange,
                     onDynamicResolutionChange = onDynamicResolutionChange,
@@ -188,10 +199,15 @@ private fun PerformanceSettingsSection(
     state: SettingsUiState,
     perf: PerformanceUiState,
     enabled: Boolean,
+    pictureResolutionIndex: Int,
+    pictureSharpen: Boolean,
+    pictureFxaa: Boolean,
     onQualityPresetChange: (String) -> Unit,
     onFrameRateCapChange: (Int) -> Unit,
     onPresentModeChange: (String) -> Unit,
-    onRenderScaleChange: (Int) -> Unit,
+    onPictureResolutionChange: (Int) -> Unit,
+    onPictureSharpenChange: (Boolean) -> Unit,
+    onPictureFxaaChange: (Boolean) -> Unit,
     onMaxTextureSizeChange: (Int) -> Unit,
     onThermalThrottlingChange: (Boolean) -> Unit,
     onDynamicResolutionChange: (Boolean) -> Unit,
@@ -207,7 +223,7 @@ private fun PerformanceSettingsSection(
             .coerceAtLeast(0)
         TileGridListItem(
             headline = "Quality preset",
-            supporting = "Sets render scale, texture size and the game's shadow and detail settings",
+            supporting = "Sets texture size and the game's shadow and detail settings",
             options = LauncherDefaults.QUALITY_PRESET_LABELS,
             selectedIndex = presetIdx,
             columns = 4,
@@ -238,15 +254,38 @@ private fun PerformanceSettingsSection(
         )
         LauncherSectionDivider()
 
-        SliderListItem(
-            headline = "Render scale",
-            supporting = "Internal 3D viewport scale relative to screen resolution",
-            persistedPercent = perf.renderScalePercent,
-            minPercent = LauncherDefaults.RENDER_SCALE_MIN,
-            maxPercent = LauncherDefaults.RENDER_SCALE_MAX,
-            stepPercent = LauncherDefaults.SCALE_STEP,
-            enabled = enabled,
-            onCommitPercent = onRenderScaleChange
+        val resolutionLabels = listOf("Auto", "100%", "85%", "75%", "67%", "50%")
+        val resIdx = pictureResolutionIndex.coerceIn(0, resolutionLabels.lastIndex)
+        TileGridListItem(
+            headline = "Render resolution",
+            supporting = if (resIdx == 0) {
+                "Scales down when the phone can't keep up or gets warm, then sharpens back up"
+            } else {
+                "Internal 3D viewport resolution (also adjustable live in-game)"
+            },
+            options = resolutionLabels,
+            selectedIndex = resIdx,
+            columns = 3,
+            valueReadout = if (resIdx == 0) "Auto" else resolutionLabels[resIdx],
+            enabled = true,
+            onSelected = onPictureResolutionChange
+        )
+        LauncherSectionDivider()
+
+        SwitchListItem(
+            headline = "Sharpen picture (FSR)",
+            supporting = "Recovers crisp edges when resolution scales down",
+            checked = pictureSharpen,
+            enabled = true,
+            onCheckedChange = onPictureSharpenChange
+        )
+        LauncherSectionDivider()
+
+        SwitchListItem(
+            headline = "Smooth jagged edges (FXAA)",
+            checked = pictureFxaa,
+            enabled = true,
+            onCheckedChange = onPictureFxaaChange
         )
         LauncherSectionDivider()
 

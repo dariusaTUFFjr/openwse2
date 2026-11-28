@@ -261,6 +261,7 @@ class WseLauncherActivity : ComponentActivity() {
             putExtra(RecompGameActivity.EXTRA_TARGET_FPS, event.targetFps)
             putExtra(RecompGameActivity.EXTRA_STRICT_TSO, event.strictTso)
             putExtra(RecompGameActivity.EXTRA_RECORD_PGO_PROFILE, event.recordPgoProfile)
+            putExtra(RecompGameActivity.EXTRA_SHOW_FPS_OVERLAY, event.showFpsOverlay)
         }
         recompVulkanLauncher.launch(intent)
     }

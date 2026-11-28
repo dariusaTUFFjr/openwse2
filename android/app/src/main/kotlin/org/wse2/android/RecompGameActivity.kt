@@ -2,7 +2,6 @@ package org.wse2.android
 
 import org.wse2.android.launcher.UserStorage
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -25,7 +24,6 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.InputDevice
@@ -38,15 +36,9 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
-import android.view.inputmethod.InputMethodManager
-import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 import android.window.OnBackInvokedDispatcher
 import org.wse2.android.launcher.ModuleControlsPrefs
@@ -63,16 +55,21 @@ import kotlin.math.roundToInt
 class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListener,
     InputManager.InputDeviceListener {
 
+    private lateinit var rootContainer: FrameLayout
     private lateinit var surfaceView: SurfaceView
     private lateinit var hudPill: TextView
     private lateinit var loadingOverlay: LinearLayout
     private lateinit var loadingStatusText: TextView
     private lateinit var editLayoutBar: LinearLayout
+    private var quickOptionsOverlay: QuickOptionsOverlay? = null
+    private var keyboardOverlay: InGameKeyboardOverlay? = null
 
     private val started = AtomicBoolean(false)
     private val finishing = AtomicBoolean(false)
     private val firstFrameShown = AtomicBoolean(false)
     private var hudDimmed = false
+    private var showFpsOverlay = false
+    private var lastHudText = ""
     private var activeModule = "Native"
     private var layoutSnapshotBeforeEdit = ""
 
@@ -146,6 +143,8 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             isFocusable = true
             isFocusableInTouchMode = true
         }
+        rootContainer = root
+        showFpsOverlay = intent.getBooleanExtra(EXTRA_SHOW_FPS_OVERLAY, true)
 
         surfaceView = SurfaceView(this).apply {
             holder.addCallback(this@RecompGameActivity)
@@ -265,37 +264,40 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             )
         )
 
-        // P14.4 Floating Touch Layout Editor banner (shown only while dragging buttons).
+        // Minimal Iron & Gold Floating Touch Layout Editor banner (shown only while dragging buttons).
+        val uiStyle = InGameStyle(this)
         editLayoutBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            background = pillDrawable(0xE61A1D22.toInt())
+            setPadding(dp(14), dp(8), dp(10), dp(8))
+            background = uiStyle.rounded(uiStyle.bgCard, 18, uiStyle.gold)
             visibility = View.GONE
-            addView(TextView(this@RecompGameActivity).apply {
-                text = "Drag buttons to reposition"
-                setTextColor(0xFFE7D3A2.toInt())
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            addView(uiStyle.label("Drag buttons to move", 12.5f, uiStyle.goldText, uiStyle.manropeBold).apply {
                 setPadding(0, 0, dp(12), 0)
             })
-            addView(Button(this@RecompGameActivity).apply {
-                text = "Save"
-                setOnClickListener { finishLayoutEdit(save = true) }
+            addView(uiStyle.pillButton("Save", primary = true, sp = 12f, padH = 14, padV = 6) {
+                finishLayoutEdit(save = true)
             })
-            addView(Button(this@RecompGameActivity).apply {
-                text = "Reset"
-                setOnClickListener {
-                    // Only the buttons on screen go back to the defaults: Save stores them,
-                    // Cancel brings back the layout from before editing (and its saved file).
+            addView(
+                uiStyle.pillButton("Reset", sp = 12f, padH = 12, padV = 6) {
                     if (R4Native.loadError == null) {
                         R4Native.nativeResetTouchLayout()
                     }
-                }
-            })
-            addView(Button(this@RecompGameActivity).apply {
-                text = "Cancel"
-                setOnClickListener { finishLayoutEdit(save = false) }
-            })
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+            )
+            addView(
+                uiStyle.pillButton("Cancel", sp = 12f, padH = 12, padV = 6) {
+                    finishLayoutEdit(save = false)
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+            )
         }
         root.addView(
             editLayoutBar,
@@ -315,8 +317,17 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             onBackInvokedDispatcher.registerOnBackInvokedCallback(
                 OnBackInvokedDispatcher.PRIORITY_DEFAULT
             ) {
-                showQuickDrawer()
+                handleBackNavigation()
             }
+        }
+    }
+
+    private fun handleBackNavigation() {
+        when {
+            keyboardOverlay?.isShowing == true -> keyboardOverlay?.dismiss()
+            quickOptionsOverlay?.isShowing == true -> quickOptionsOverlay?.dismiss()
+            editLayoutBar.visibility == View.VISIBLE -> finishLayoutEdit(save = false)
+            else -> showQuickDrawer()
         }
     }
 
@@ -344,7 +355,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        showQuickDrawer()
+        handleBackNavigation()
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -528,6 +539,9 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (!started.get() || R4Native.loadError != null) return super.dispatchKeyEvent(event)
+        if (keyboardOverlay?.isShowing == true && event.keyCode != KeyEvent.KEYCODE_BACK) {
+            return super.dispatchKeyEvent(event)
+        }
         val down = event.action == KeyEvent.ACTION_DOWN
         if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) {
             return super.dispatchKeyEvent(event)
@@ -712,174 +726,135 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         }
     }
 
-    // ---- Soft Keyboard & Plain-Language Quick Settings Drawer ----
+    // ---- Minimal Iron & Gold Keyboard Bar & Quick Options Side-Sheet ----
+
+    private fun pulseKey(dik: Int, vk: Int, ctrl: Boolean = false, alt: Boolean = false) {
+        if (R4Native.loadError != null) return
+        if (ctrl) R4Native.nativeKeyEvent(0x1D, 0x11, true)
+        if (alt) R4Native.nativeKeyEvent(0x38, 0x12, true)
+        R4Native.nativeKeyEvent(dik, vk, true)
+        telemetryHandler.postDelayed({
+            if (R4Native.loadError != null) return@postDelayed
+            R4Native.nativeKeyEvent(dik, vk, false)
+            if (alt) R4Native.nativeKeyEvent(0x38, 0x12, false)
+            if (ctrl) R4Native.nativeKeyEvent(0x1D, 0x11, false)
+        }, 55L)
+    }
 
     private fun showSoftKeyboardDialog() {
         runOnUiThread {
             if (isFinishing || isDestroyed) return@runOnUiThread
-            val input = EditText(this).apply {
-                inputType = InputType.TYPE_CLASS_TEXT
-                hint = "Type text for the game"
-            }
-            val dlg = AlertDialog.Builder(this)
-                .setTitle("Keyboard")
-                .setView(input)
-                .setPositiveButton("Send") { _, _ ->
-                    val txt = input.text?.toString().orEmpty()
+            quickOptionsOverlay?.dismiss(notifyDismissed = false)
+            if (keyboardOverlay?.isShowing == true) return@runOnUiThread
+            val kbd = InGameKeyboardOverlay(
+                activity = this,
+                parent = rootContainer,
+                onText = { txt ->
                     if (R4Native.loadError == null) {
-                        if (txt.isNotEmpty()) {
-                            R4Native.nativeTextInput(txt)
-                        } else {
-                            R4Native.nativeTextInput("\n")
-                        }
+                        R4Native.nativeTextInput(txt)
                     }
+                },
+                onKeyPulse = { dik, vk, ctrl, alt ->
+                    pulseKey(dik, vk, ctrl, alt)
+                },
+                onDismissed = {
+                    keyboardOverlay = null
                     applyImmersiveFullscreen()
                 }
-                .setNeutralButton("Backspace") { _, _ ->
-                    if (R4Native.loadError == null) {
-                        R4Native.nativeTextInput("\b")
-                    }
-                    applyImmersiveFullscreen()
-                }
-                .setNegativeButton("Cancel") { _, _ -> applyImmersiveFullscreen() }
-                .create()
-            dlg.show()
-            input.requestFocus()
-            input.post {
-                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                imm?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
-            }
+            )
+            keyboardOverlay = kbd
+            kbd.show()
         }
     }
 
     private fun showQuickDrawer() {
         runOnUiThread {
             if (isFinishing || isDestroyed) return@runOnUiThread
-            val container = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(18), dp(12), dp(18), dp(12))
-            }
-
-            fun addCheck(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-                container.addView(CheckBox(this).apply {
-                    text = label
-                    isChecked = checked
-                    setOnCheckedChangeListener { _, isChecked ->
-                        onChange(isChecked)
-                        pushLiveConfig()
+            keyboardOverlay?.dismiss()
+            if (quickOptionsOverlay?.isShowing == true) return@runOnUiThread
+            val cb = object : QuickOptionsOverlay.Callbacks {
+                override var pictureResIndex: Int
+                    get() = this@RecompGameActivity.pictureResIndex
+                    set(value) { this@RecompGameActivity.pictureResIndex = value }
+                override var pictureTargetFps: Int
+                    get() = this@RecompGameActivity.pictureTargetFps
+                    set(value) { this@RecompGameActivity.pictureTargetFps = value }
+                override var pictureSharpen: Boolean
+                    get() = this@RecompGameActivity.pictureSharpen
+                    set(value) { this@RecompGameActivity.pictureSharpen = value }
+                override var pictureFxaa: Boolean
+                    get() = this@RecompGameActivity.pictureFxaa
+                    set(value) { this@RecompGameActivity.pictureFxaa = value }
+                override var showTouchControls: Boolean
+                    get() = this@RecompGameActivity.showTouchControls
+                    set(value) { this@RecompGameActivity.showTouchControls = value }
+                override var aimHold: Boolean
+                    get() = this@RecompGameActivity.aimHold
+                    set(value) { this@RecompGameActivity.aimHold = value }
+                override var gyroEnabled: Boolean
+                    get() = this@RecompGameActivity.gyroEnabled
+                    set(value) {
+                        this@RecompGameActivity.gyroEnabled = value
+                        if (value) registerGyroIfEnabled() else unregisterGyro()
                     }
-                })
-            }
+                override var touchOpacity: Float
+                    get() = this@RecompGameActivity.touchOpacity
+                    set(value) { this@RecompGameActivity.touchOpacity = value }
+                override var buttonScale: Float
+                    get() = this@RecompGameActivity.buttonScale
+                    set(value) { this@RecompGameActivity.buttonScale = value }
+                override var lookSensitivity: Float
+                    get() = this@RecompGameActivity.lookSensitivity
+                    set(value) { this@RecompGameActivity.lookSensitivity = value }
+                override var soundVolume: Float
+                    get() = this@RecompGameActivity.soundVolume
+                    set(value) { this@RecompGameActivity.soundVolume = value }
+                override var hapticsEnabled: Boolean
+                    get() = this@RecompGameActivity.hapticsEnabled
+                    set(value) { this@RecompGameActivity.hapticsEnabled = value }
+                override var hapticWhenHit: Boolean
+                    get() = this@RecompGameActivity.hapticWhenHit
+                    set(value) { this@RecompGameActivity.hapticWhenHit = value }
+                override var hapticWhenDealing: Boolean
+                    get() = this@RecompGameActivity.hapticWhenDealing
+                    set(value) { this@RecompGameActivity.hapticWhenDealing = value }
+                override var hapticStrength: Int
+                    get() = this@RecompGameActivity.hapticStrength
+                    set(value) { this@RecompGameActivity.hapticStrength = value }
+                override var showFpsOverlay: Boolean
+                    get() = this@RecompGameActivity.showFpsOverlay
+                    set(value) { this@RecompGameActivity.showFpsOverlay = value }
 
-            fun addSlider(label: String, min: Int, max: Int, value: Int, onChange: (Int) -> Unit) {
-                val cur = value.coerceIn(min, max)
-                val tv = TextView(this).apply { text = "$label: $cur%" }
-                container.addView(tv)
-                container.addView(SeekBar(this).apply {
-                    this.max = (max - min).coerceAtLeast(1)
-                    progress = (cur - min).coerceIn(0, this.max)
-                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                        override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                            val actual = min + p
-                            tv.text = "$label: $actual%"
-                            onChange(actual)
-                            pushLiveConfig()
-                        }
-                        override fun onStartTrackingTouch(sb: SeekBar?) {}
-                        override fun onStopTrackingTouch(sb: SeekBar?) {}
-                    })
-                })
-            }
-
-            fun addSectionTitle(title: String) {
-                container.addView(TextView(this).apply {
-                    text = title
-                    setTextColor(0xFFC8A45D.toInt())
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                    typeface = Typeface.DEFAULT_BOLD
-                    setPadding(0, dp(10), 0, dp(4))
-                })
-            }
-
-            addSectionTitle("PICTURE (LIVE)")
-            val resLabels = arrayOf("Auto (recommended)", "100%", "85%", "75%", "67%", "50%")
-            val resBtn = Button(this).apply {
-                text = "Resolution: ${resLabels[pictureResIndex.coerceIn(0, resLabels.lastIndex)]}"
-                setOnClickListener {
-                    pictureResIndex = (pictureResIndex + 1) % resLabels.size
-                    text = "Resolution: ${resLabels[pictureResIndex]}"
-                    pushGraphicsConfig()
+                override fun onGraphicsChanged() = pushGraphicsConfig()
+                override fun onControlsChanged() = pushLiveConfig()
+                override fun onFpsOverlayChanged(show: Boolean) {
+                    hudPill.visibility = if (show) View.VISIBLE else View.GONE
+                }
+                override fun onOpenKeyboard() = showSoftKeyboardDialog()
+                override fun onEnterLayoutEdit() = enterLayoutEditMode()
+                override fun onSendEscape() {
+                    pulseKey(0x01, 0x1B)
+                    applyImmersiveFullscreen()
+                }
+                override fun onSendQuickSave() {
+                    pulseKey(0x58, 0x7B)
+                    applyImmersiveFullscreen()
+                }
+                override fun onExitGame() = exitAndFinish()
+                override fun onDismissed() {
+                    quickOptionsOverlay = null
+                    applyImmersiveFullscreen()
                 }
             }
-            container.addView(resBtn)
-
-            val fpsChoices = intArrayOf(30, 60, 90, 120)
-            val fpsBtn = Button(this).apply {
-                text = "Target FPS: $pictureTargetFps"
-                setOnClickListener {
-                    val idx = fpsChoices.indexOf(pictureTargetFps).let { if (it < 0) 1 else (it + 1) % fpsChoices.size }
-                    pictureTargetFps = fpsChoices[idx]
-                    text = "Target FPS: $pictureTargetFps"
-                    pushGraphicsConfig()
-                }
-            }
-            container.addView(fpsBtn)
-
-            addCheck("Sharpen the picture (FSR)", pictureSharpen) {
-                pictureSharpen = it
-                pushGraphicsConfig()
-            }
-            addCheck("Smooth jagged edges (FXAA)", pictureFxaa) {
-                pictureFxaa = it
-                pushGraphicsConfig()
-            }
-
-            addSectionTitle("TOUCH & CONTROLS ($activeModule)")
-            addCheck("Show touch controls", showTouchControls) { showTouchControls = it }
-            addCheck("Hold to zoom", aimHold) { aimHold = it }
-            addCheck("Gyro aiming while zooming", gyroEnabled) {
-                gyroEnabled = it
-                if (it) registerGyroIfEnabled() else unregisterGyro()
-            }
-            addSlider("Touch opacity", 20, 100, (touchOpacity * 100f).roundToInt()) {
-                touchOpacity = (it / 100f).coerceIn(0.2f, 1.0f)
-            }
-            addSlider("Button size", 70, 145, (buttonScale * 100f).roundToInt()) {
-                buttonScale = (it / 100f).coerceIn(0.7f, 1.45f)
-            }
-            addSlider("Look speed", 25, 200, (lookSensitivity * 100f).roundToInt()) {
-                lookSensitivity = (it / 100f).coerceIn(0.25f, 2.0f)
-            }
-
-            addSectionTitle("SOUND & HAPTICS")
-            addSlider("Sound volume", 0, 100, (soundVolume * 100f).roundToInt()) {
-                soundVolume = (it / 100f).coerceIn(0.0f, 1.0f)
-            }
-            addCheck("Vibrate on hits", hapticsEnabled) { hapticsEnabled = it }
-            addCheck("Vibrate when you are hit", hapticWhenHit) { hapticWhenHit = it }
-            addCheck("Vibrate when you land a hit", hapticWhenDealing) { hapticWhenDealing = it }
-            addSlider("Vibration strength", 10, 100, hapticStrength) {
-                hapticStrength = it.coerceIn(10, 100)
-            }
-
-            var dlg: AlertDialog? = null
-            container.addView(Button(this).apply {
-                text = "Edit touch layout"
-                setOnClickListener {
-                    dlg?.dismiss()
-                    enterLayoutEditMode()
-                }
-            })
-
-            val scroll = ScrollView(this).apply { addView(container) }
-            dlg = AlertDialog.Builder(this)
-                .setTitle("Quick Settings ($activeModule)")
-                .setView(scroll)
-                .setNeutralButton("Open keyboard") { _, _ -> showSoftKeyboardDialog() }
-                .setNegativeButton("Exit and save report") { _, _ -> exitAndFinish() }
-                .setPositiveButton("Resume") { _, _ -> applyImmersiveFullscreen() }
-                .setOnCancelListener { applyImmersiveFullscreen() }
-                .show()
+            val overlay = QuickOptionsOverlay(
+                activity = this,
+                parent = rootContainer,
+                moduleName = activeModule,
+                telemetryText = lastHudText,
+                callbacks = cb
+            )
+            quickOptionsOverlay = overlay
+            overlay.show()
         }
     }
 
@@ -903,7 +878,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
             R4Native.nativeSetLayoutEditMode(false)
         }
         editLayoutBar.visibility = View.GONE
-        hudPill.visibility = View.VISIBLE
+        hudPill.visibility = if (showFpsOverlay) View.VISIBLE else View.GONE
         applyImmersiveFullscreen()
     }
 
@@ -1107,6 +1082,9 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
                                     loadingOverlay.animate().alpha(0f).setDuration(260L).withEndAction {
                                         loadingOverlay.visibility = View.GONE
                                     }.start()
+                                    if (!showFpsOverlay) {
+                                        hudPill.visibility = View.GONE
+                                    }
                                 }
                             }
                         }
@@ -1174,6 +1152,7 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
     private fun updateHud(text: String) {
         runOnUiThread {
             if (!isFinishing && !isDestroyed) {
+                lastHudText = text
                 hudPill.text = text
                 if (!firstFrameShown.get()) {
                     loadingStatusText.text = text
@@ -1244,5 +1223,6 @@ class RecompGameActivity : Activity(), SurfaceHolder.Callback, SensorEventListen
         const val EXTRA_TARGET_FPS = "wse.recomp.target_fps"
         const val EXTRA_STRICT_TSO = "wse.recomp.strict_tso"
         const val EXTRA_RECORD_PGO_PROFILE = "wse.recomp.record_pgo_profile"
+        const val EXTRA_SHOW_FPS_OVERLAY = "wse.recomp.show_fps_overlay"
     }
 }

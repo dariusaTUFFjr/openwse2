@@ -124,15 +124,17 @@ fun SaveManagerDialog(
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             if (!slot.deleted) {
                                 WseTextButton(text = "Export", onClick = { onExportSave(slot) })
-                            }
-                            slot.backups.firstOrNull()?.let { latest ->
-                                WseTextButton(
-                                    text = "Restore backup",
-                                    onClick = { onRestoreBackup(slot, latest) }
-                                )
-                            }
-                            if (!slot.deleted) {
                                 WseTextButton(text = "Delete", onClick = { confirmDelete = slot })
+                            }
+                        }
+                        if (slot.backups.isNotEmpty()) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                for (bak in slot.backups) {
+                                    WseTextButton(
+                                        text = "Restore .bak${bak.backupIndex}",
+                                        onClick = { onRestoreBackup(slot, bak) }
+                                    )
+                                }
                             }
                         }
                         LauncherSectionDivider()

@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -86,6 +87,16 @@ fun AdvancedScreen(
     var showLicencesDialog by remember { mutableStateOf(false) }
     var showCrashReportDialog by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf<ConfirmClear?>(null) }
+    var showDevTools by rememberSaveable { mutableStateOf(false) }
+    val devToolsVisible = showDevTools || r0State.running || r4State.running
+
+    val clearCacheEnabled = !r4State.running && !r0State.running
+    val soMb = r4State.soCacheBytes / (1024L * 1024L)
+    val texCacheMb = r4State.textureCacheBytes / (1024L * 1024L)
+    val shaderMb = r4State.shaderCacheBytes / (1024L * 1024L)
+    val cacheMb = r4State.installCacheBytes / (1024L * 1024L)
+    val backupsMb = r4State.saveBackupsBytes / (1024L * 1024L)
+    val totalMb = soMb + texCacheMb + shaderMb + cacheMb + backupsMb
 
     Box(
         modifier = modifier
@@ -106,36 +117,6 @@ fun AdvancedScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             WseScreenHeader(title = "Advanced")
-
-            LauncherSectionHeader(title = "Warband Folder (SAF)")
-            LauncherGroupedCard {
-                WseListRow(
-                    title = "Tree URI",
-                    supporting = treeUri?.toString() ?: "No Warband folder selected."
-                )
-                WseListRow(
-                    title = "SAF tree index",
-                    supporting = state.scanState.indexStatsText
-                )
-                WseListRow(
-                    title = "Verify scripts.txt",
-                    supporting = "Checks module script mapping via SafVfs",
-                    trailing = {
-                        Text(
-                            text = "Run",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = if (verifyEnabled) {
-                                colors.primary
-                            } else {
-                                colors.onSurfaceVariant.copy(alpha = 0.45f)
-                            }
-                        )
-                    },
-                    enabled = verifyEnabled,
-                    showDivider = false,
-                    onClick = onVerifyScripts
-                )
-            }
 
             LauncherSectionHeader(title = "GPU Driver")
             LauncherGroupedCard {
@@ -163,24 +144,6 @@ fun AdvancedScreen(
                     onClick = onImportDriver
                 )
 
-                SwitchListItem(
-                    headline = "Allow mock ICD fallback",
-                    supporting = "Testing only",
-                    checked = state.driverState.allowMockFallback,
-                    enabled = true,
-                    onCheckedChange = onAllowMockFallbackChange
-                )
-                LauncherSectionDivider()
-
-                SwitchListItem(
-                    headline = "Custom driver zero-copy buffers",
-                    supporting = "Experimental AHardwareBuffer bridge for PanVK/Turnip (off uses reliable CPU upload)",
-                    checked = state.customDriverSharedBuffers,
-                    enabled = true,
-                    onCheckedChange = onCustomDriverSharedBuffersChange
-                )
-                LauncherSectionDivider()
-
                 WseListRow(
                     title = "Probe Vulkan driver",
                     supporting = "Inspect physical devices and extensions",
@@ -205,153 +168,11 @@ fun AdvancedScreen(
                 )
             }
 
-            LauncherSectionHeader(title = "Picture")
+            LauncherSectionHeader(
+                title = "Saves & Storage",
+                badge = if (totalMb > 0L) "$totalMb MB" else null
+            )
             LauncherGroupedCard {
-                val pictureOptions = listOf(
-                    "Automatic (recommended)",
-                    "100 %",
-                    "85 %",
-                    "75 %",
-                    "67 %",
-                    "50 %"
-                )
-                val resIdx = state.pictureResolutionIndex.coerceIn(0, pictureOptions.lastIndex)
-                ExposedDropdownListItem(
-                    headline = "Resolution",
-                    options = pictureOptions,
-                    selectedIndex = resIdx,
-                    enabled = true,
-                    onSelected = onPictureResolutionChange,
-                    supporting = if (resIdx == 0) {
-                        "Draws fewer pixels when the phone can't keep up or gets warm, then sharpens the picture back up."
-                    } else {
-                        null
-                    }
-                )
-                LauncherSectionDivider()
-
-                SwitchListItem(
-                    headline = "Sharpen the picture",
-                    checked = state.pictureSharpen,
-                    enabled = true,
-                    onCheckedChange = onPictureSharpenChange
-                )
-                LauncherSectionDivider()
-
-                SwitchListItem(
-                    headline = "Smooth jagged edges",
-                    checked = state.pictureFxaa,
-                    enabled = true,
-                    onCheckedChange = onPictureFxaaChange
-                )
-            }
-
-            LauncherSectionHeader(title = "Runtime")
-            LauncherGroupedCard {
-                SwitchListItem(
-                    headline = "Show FPS overlay",
-                    checked = state.showFpsOverlay,
-                    enabled = true,
-                    onCheckedChange = onShowFpsOverlayChange
-                )
-                LauncherSectionDivider()
-
-                WseListRow(
-                    title = "SDL3 self-test",
-                    supporting = "Launch native surface and input check",
-                    trailing = {
-                        Text(
-                            text = "Launch",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = colors.primary
-                        )
-                    },
-                    showDivider = false,
-                    onClick = onLaunchSelfTest
-                )
-            }
-
-            LauncherSectionHeader(title = "Running the game (experimental)")
-            LauncherGroupedCard {
-                WseListRow(
-                    title = "Phone check",
-                    supporting = if (r0State.running) {
-                        "Checking. This can take a few minutes."
-                    } else {
-                        "Checks that this phone can run game code translated from your " +
-                            "mb_warband_wse2_x64.exe. Takes a few minutes."
-                    },
-                    trailing = if (r0State.running) {
-                        {
-                            CircularProgressIndicator(
-                                color = colors.accent,
-                                modifier = Modifier.size(20.dp),
-                                strokeWidth = 2.dp
-                            )
-                        }
-                    } else {
-                        null
-                    },
-                    showDivider = true,
-                    enabled = !r0State.running && !r4State.running,
-                    onClick = onRunR0Spikes
-                )
-                WseListRow(
-                    title = "Game test",
-                    supporting = if (r4State.running) {
-                        r4State.status.ifEmpty { "Working…" } +
-                            "\nYou can leave the app; it keeps working in the background. To stop it, " +
-                            "use the notification."
-                    } else {
-                        "Prepares the game for your phone (needed only once; it takes a few hours " +
-                            "and progress is saved), then starts Native briefly to check that it " +
-                            "works. Nothing is shown on screen yet."
-                    },
-                    trailing = if (r4State.running) {
-                        {
-                            CircularProgressIndicator(
-                                color = colors.accent,
-                                modifier = Modifier.size(20.dp),
-                                strokeWidth = 2.dp
-                            )
-                        }
-                    } else {
-                        null
-                    },
-                    showDivider = true,
-                    enabled = !r4State.running && !r0State.running,
-                    onClick = onRunR4Startup
-                )
-                val liveVulkanEnabled = !r4State.running && !r0State.running && treeUri != null
-                val activeDriverLabel = state.driverState.options.getOrElse(state.driverState.selectedIndex) {
-                    "Vulkan"
-                }
-                WseListRow(
-                    title = "Play on screen (test)",
-                    supporting = "Starts the game on screen with $activeDriverLabel, using the game files " +
-                        "already prepared. Saves a report with the frame rate when you exit.",
-                    trailing = {
-                        Text(
-                            text = "Launch",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = if (liveVulkanEnabled) {
-                                colors.primary
-                            } else {
-                                colors.onSurfaceVariant.copy(alpha = 0.45f)
-                            }
-                        )
-                    },
-                    showDivider = true,
-                    enabled = liveVulkanEnabled,
-                    onClick = onLaunchRecompVulkan
-                )
-                val clearCacheEnabled = !r4State.running && !r0State.running
-                val soMb = r4State.soCacheBytes / (1024L * 1024L)
-                val texCacheMb = r4State.textureCacheBytes / (1024L * 1024L)
-                val shaderMb = r4State.shaderCacheBytes / (1024L * 1024L)
-                val cacheMb = r4State.installCacheBytes / (1024L * 1024L)
-                val backupsMb = r4State.saveBackupsBytes / (1024L * 1024L)
-
                 WseListRow(
                     title = "Manage saved games",
                     supporting = "Inspect, import/export .sav files, restore backups, and configure auto-sync mirror.",
@@ -431,102 +252,21 @@ fun AdvancedScreen(
                             color = if (clearCacheEnabled) colors.primary else colors.onSurfaceVariant.copy(alpha = 0.45f)
                         )
                     },
-                    showDivider = true,
+                    showDivider = false,
                     enabled = clearCacheEnabled,
                     onClick = { confirmClear = ConfirmClear.SAVE_BACKUPS }
                 )
-                // Saves the report as a file the player picks, during a run too (the user's
-                // request, 2026-11-21: keep the phone's report when finishing on the PC).
-                val saveContext = LocalContext.current
-                val saveReport = rememberLauncherForActivityResult(
-                    ActivityResultContracts.CreateDocument("text/plain")
-                ) { uri ->
-                    if (uri != null) {
-                        val runner = R4StartupRunner.get(saveContext.applicationContext as Application)
-                        val text = runner.reportToSave()
-                        val saved = text != null && runner.saveReport(uri, text)
-                        Toast.makeText(
-                            saveContext,
-                            if (saved) "Report saved." else "There is no report to save yet.",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                }
-                WseListRow(
-                    title = "Save the game test report",
-                    supporting = "Saves what the game test has written so far as a text file, even " +
-                        "while it is running.",
-                    showDivider = true,
-                    onClick = { saveReport.launch("wse2-game-test-report.txt") }
-                )
-                val runnerForPrev = remember(saveContext) {
-                    R4StartupRunner.get(saveContext.applicationContext as Application)
-                }
-                val hasPrevCrashReport = remember(r4State) { runnerForPrev.hasPreviousCrashReport() }
-                val savePrevReport = rememberLauncherForActivityResult(
-                    ActivityResultContracts.CreateDocument("text/plain")
-                ) { uri ->
-                    if (uri != null) {
-                        val text = runnerForPrev.previousCrashReportToSave()
-                        val saved = text != null && runnerForPrev.saveReport(uri, text)
-                        Toast.makeText(
-                            saveContext,
-                            if (saved) "Previous report saved." else "There is no previous report to save.",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                }
-                if (hasPrevCrashReport) {
-                    WseListRow(
-                        title = "Save the previous report",
-                        supporting = "Saves the report from the run before this one as a text file.",
-                        showDivider = true,
-                        onClick = { savePrevReport.launch("wse2-previous-report.txt") }
-                    )
-                }
-                SwitchListItem(
-                    headline = "Work from a copy of the game folder",
-                    supporting = "Copies the game folder (without other modules) into the app " +
-                        "first. Needs that much free space; turning this off deletes the copy.",
-                    checked = r4State.useCopy,
-                    enabled = !r4State.running,
-                    onCheckedChange = onR4UseCopyChange
-                )
-                LauncherSectionDivider()
+            }
 
+            LauncherSectionHeader(title = "Runtime")
+            LauncherGroupedCard {
                 SwitchListItem(
-                    headline = "Strict memory ordering (TSO)",
-                    supporting = "Slower safe fallback for mods with lock-free thread races (re-translates on change).",
-                    checked = state.strictTso,
-                    enabled = !r4State.running,
-                    onCheckedChange = onStrictTsoChange
+                    headline = "Show FPS overlay",
+                    supporting = "Shows the frame-rate pill at the top of the screen while playing",
+                    checked = state.showFpsOverlay,
+                    enabled = true,
+                    onCheckedChange = onShowFpsOverlayChange
                 )
-                LauncherSectionDivider()
-
-                SwitchListItem(
-                    headline = "Record performance profile (PGO)",
-                    supporting = "Samples hot game loops during play (${state.pgoProfileSummary}) to speed up future runs.",
-                    checked = state.recordPgoProfile,
-                    enabled = !r4State.running,
-                    onCheckedChange = onRecordPgoProfileChange
-                )
-                if (state.pgoProfileSummary != "None") {
-                    LauncherSectionDivider()
-                    WseListRow(
-                        title = "Clear performance profile",
-                        supporting = state.pgoProfileSummary,
-                        trailing = {
-                            Text(
-                                text = "Clear",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = colors.primary
-                            )
-                        },
-                        showDivider = false,
-                        enabled = !r4State.running,
-                        onClick = onClearPgoProfile
-                    )
-                }
             }
 
             state.crashReportText?.let { crashText ->
@@ -562,18 +302,250 @@ fun AdvancedScreen(
                 }
             }
 
-            LauncherSectionHeader(title = "Status Log")
+            LauncherSectionHeader(title = "Developer tools")
             LauncherGroupedCard {
-                Text(
-                    text = state.statusLog,
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        fontFamily = FontFamily.Monospace
-                    ),
-                    color = colors.onSurfaceVariant,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp)
+                WseListRow(
+                    title = if (devToolsVisible) "Hide developer tools" else "Show developer tools",
+                    supporting = "Bring-up tests, SAF info, custom driver flags, TSO/PGO, and status log",
+                    trailing = {
+                        Text(
+                            text = if (devToolsVisible) "Hide" else "Show",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = colors.primary
+                        )
+                    },
+                    showDivider = devToolsVisible,
+                    onClick = { showDevTools = !showDevTools }
                 )
+
+                if (devToolsVisible) {
+                    WseListRow(
+                        title = "Tree URI",
+                        supporting = treeUri?.toString() ?: "No Warband folder selected."
+                    )
+                    WseListRow(
+                        title = "SAF tree index",
+                        supporting = state.scanState.indexStatsText
+                    )
+                    WseListRow(
+                        title = "Verify scripts.txt",
+                        supporting = "Checks module script mapping via SafVfs",
+                        trailing = {
+                            Text(
+                                text = "Run",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = if (verifyEnabled) {
+                                    colors.primary
+                                } else {
+                                    colors.onSurfaceVariant.copy(alpha = 0.45f)
+                                }
+                            )
+                        },
+                        enabled = verifyEnabled,
+                        showDivider = true,
+                        onClick = onVerifyScripts
+                    )
+                    SwitchListItem(
+                        headline = "Allow mock ICD fallback",
+                        supporting = "Testing only",
+                        checked = state.driverState.allowMockFallback,
+                        enabled = true,
+                        onCheckedChange = onAllowMockFallbackChange
+                    )
+                    LauncherSectionDivider()
+                    SwitchListItem(
+                        headline = "Custom driver zero-copy buffers",
+                        supporting = "Experimental AHardwareBuffer bridge for PanVK/Turnip (off uses reliable CPU upload)",
+                        checked = state.customDriverSharedBuffers,
+                        enabled = true,
+                        onCheckedChange = onCustomDriverSharedBuffersChange
+                    )
+                    LauncherSectionDivider()
+                    WseListRow(
+                        title = "SDL3 self-test",
+                        supporting = "Launch native surface and input check",
+                        trailing = {
+                            Text(
+                                text = "Launch",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colors.primary
+                            )
+                        },
+                        showDivider = true,
+                        onClick = onLaunchSelfTest
+                    )
+                    WseListRow(
+                        title = "Phone check",
+                        supporting = if (r0State.running) {
+                            "Checking. This can take a few minutes."
+                        } else {
+                            "Checks that this phone can run game code translated from your " +
+                                "mb_warband_wse2_x64.exe. Takes a few minutes."
+                        },
+                        trailing = if (r0State.running) {
+                            {
+                                CircularProgressIndicator(
+                                    color = colors.accent,
+                                    modifier = Modifier.size(20.dp),
+                                    strokeWidth = 2.dp
+                                )
+                            }
+                        } else {
+                            null
+                        },
+                        showDivider = true,
+                        enabled = !r0State.running && !r4State.running,
+                        onClick = onRunR0Spikes
+                    )
+                    WseListRow(
+                        title = "Game test",
+                        supporting = if (r4State.running) {
+                            r4State.status.ifEmpty { "Working…" } +
+                                "\nYou can leave the app; it keeps working in the background. To stop it, " +
+                                "use the notification."
+                        } else {
+                            "Prepares the game for your phone (needed only once; it takes a few hours " +
+                                "and progress is saved), then starts Native briefly to check that it " +
+                                "works. Nothing is shown on screen yet."
+                        },
+                        trailing = if (r4State.running) {
+                            {
+                                CircularProgressIndicator(
+                                    color = colors.accent,
+                                    modifier = Modifier.size(20.dp),
+                                    strokeWidth = 2.dp
+                                )
+                            }
+                        } else {
+                            null
+                        },
+                        showDivider = true,
+                        enabled = !r4State.running && !r0State.running,
+                        onClick = onRunR4Startup
+                    )
+                    val liveVulkanEnabled = !r4State.running && !r0State.running && treeUri != null
+                    val activeDriverLabel = state.driverState.options.getOrElse(state.driverState.selectedIndex) {
+                        "Vulkan"
+                    }
+                    WseListRow(
+                        title = "Play on screen (test)",
+                        supporting = "Starts the game on screen with $activeDriverLabel, using the game files " +
+                            "already prepared. Saves a report with the frame rate when you exit.",
+                        trailing = {
+                            Text(
+                                text = "Launch",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = if (liveVulkanEnabled) {
+                                    colors.primary
+                                } else {
+                                    colors.onSurfaceVariant.copy(alpha = 0.45f)
+                                }
+                            )
+                        },
+                        showDivider = true,
+                        enabled = liveVulkanEnabled,
+                        onClick = onLaunchRecompVulkan
+                    )
+                    val saveContext = LocalContext.current
+                    val saveReport = rememberLauncherForActivityResult(
+                        ActivityResultContracts.CreateDocument("text/plain")
+                    ) { uri ->
+                        if (uri != null) {
+                            val runner = R4StartupRunner.get(saveContext.applicationContext as Application)
+                            val text = runner.reportToSave()
+                            val saved = text != null && runner.saveReport(uri, text)
+                            Toast.makeText(
+                                saveContext,
+                                if (saved) "Report saved." else "There is no report to save yet.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                    WseListRow(
+                        title = "Save the game test report",
+                        supporting = "Saves what the game test has written so far as a text file, even " +
+                            "while it is running.",
+                        showDivider = true,
+                        onClick = { saveReport.launch("wse2-game-test-report.txt") }
+                    )
+                    val runnerForPrev = remember(saveContext) {
+                        R4StartupRunner.get(saveContext.applicationContext as Application)
+                    }
+                    val hasPrevCrashReport = remember(r4State) { runnerForPrev.hasPreviousCrashReport() }
+                    val savePrevReport = rememberLauncherForActivityResult(
+                        ActivityResultContracts.CreateDocument("text/plain")
+                    ) { uri ->
+                        if (uri != null) {
+                            val text = runnerForPrev.previousCrashReportToSave()
+                            val saved = text != null && runnerForPrev.saveReport(uri, text)
+                            Toast.makeText(
+                                saveContext,
+                                if (saved) "Previous report saved." else "There is no previous report to save.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                    if (hasPrevCrashReport) {
+                        WseListRow(
+                            title = "Save the previous report",
+                            supporting = "Saves the report from the run before this one as a text file.",
+                            showDivider = true,
+                            onClick = { savePrevReport.launch("wse2-previous-report.txt") }
+                        )
+                    }
+                    SwitchListItem(
+                        headline = "Work from a copy of the game folder",
+                        supporting = "Copies the game folder (without other modules) into the app " +
+                            "first. Needs that much free space; turning this off deletes the copy.",
+                        checked = r4State.useCopy,
+                        enabled = !r4State.running,
+                        onCheckedChange = onR4UseCopyChange
+                    )
+                    LauncherSectionDivider()
+                    SwitchListItem(
+                        headline = "Strict memory ordering (TSO)",
+                        supporting = "Slower safe fallback for mods with lock-free thread races (re-translates on change).",
+                        checked = state.strictTso,
+                        enabled = !r4State.running,
+                        onCheckedChange = onStrictTsoChange
+                    )
+                    LauncherSectionDivider()
+                    SwitchListItem(
+                        headline = "Record performance profile (PGO)",
+                        supporting = "Samples hot game loops during play (${state.pgoProfileSummary}) to speed up future runs.",
+                        checked = state.recordPgoProfile,
+                        enabled = !r4State.running,
+                        onCheckedChange = onRecordPgoProfileChange
+                    )
+                    if (state.pgoProfileSummary != "None") {
+                        LauncherSectionDivider()
+                        WseListRow(
+                            title = "Clear performance profile",
+                            supporting = state.pgoProfileSummary,
+                            trailing = {
+                                Text(
+                                    text = "Clear",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = colors.primary
+                                )
+                            },
+                            showDivider = true,
+                            enabled = !r4State.running,
+                            onClick = onClearPgoProfile
+                        )
+                    }
+                    LauncherSectionDivider()
+                    Text(
+                        text = state.statusLog,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace
+                        ),
+                        color = colors.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp)
+                    )
+                }
             }
 
             LauncherSectionHeader(title = "About")

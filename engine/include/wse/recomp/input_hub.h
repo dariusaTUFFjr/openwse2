@@ -273,6 +273,9 @@ enum class OverlayActionKind : std::uint8_t {
     zoom_hold,          // Hold-to-zoom (aim slowdown + opt-in gyro)
     orders_open,        // Switch to Orders 4-button sub-pad
     orders_close,       // Return from Orders sub-pad to Battle
+    orders_radial,      // Tap: Orders sub-pad; Hold+Flick: 6-wedge tactical orders wheel
+    weapon_radial,      // Tap: Next weapon; Hold+Flick: Shield / Mode / Kick / Drop
+    mod_menu_toggle,    // Expand / collapse auto-detected mod buttons
     map_look_toggle,    // Toggle Campaign Map pan/zoom mode
     map_camera_action,  // Follow party / Home recenter
     map_stop_rest,      // Pause/resume map time (Space)
@@ -419,6 +422,17 @@ public:
             }
             tap_phase_ = TapPhase::idle;
             tap_release_queued_ = false;
+            tap_hold_frames_ = 0;
+            radial_mode_ = RadialMode::none;
+            radial_pointer_ = -1;
+            radial_selected_ = -1;
+            if (macro_active_dik_ != 0U) {
+                set_key_locked(macro_active_dik_, false);
+                macro_active_dik_ = 0U;
+            }
+            macro_keys_.clear();
+            macro_hold_frames_ = 0;
+            macro_gap_frames_ = 0;
             recompute_modifiers_locked();
         }
         if (sink) {
@@ -560,6 +574,13 @@ public:
             const std::size_t idx = extra_start_index_ + slot;
             if (idx < buttons_.size()) {
                 buttons_[idx].visible = false;
+            }
+        }
+        detected_mod_count_ = slot;
+        mods_expanded_ = false;
+        for (auto& b : buttons_) {
+            if (b.id == "mod_menu") {
+                b.latched = false;
             }
         }
     }
@@ -874,6 +895,9 @@ public:
         std::string triggered_ui_action;
         int move_cx = -1;
         int move_cy = -1;
+        bool flush_lmb_up = false;
+        int flush_cx = 0;
+        int flush_cy = 0;
 
         {
             const std::lock_guard<std::mutex> lock(m_);
@@ -922,7 +946,8 @@ public:
             }
 
             if (action == 0) {  // DOWN
-                handle_pointer_down_locked(pointer_id, bx, by, nx, ny, triggered_ui_action, move_cx, move_cy);
+                handle_pointer_down_locked(pointer_id, bx, by, nx, ny, triggered_ui_action,
+                                           move_cx, move_cy, flush_lmb_up, flush_cx, flush_cy);
             } else if (action == 2) {  // MOVE
                 handle_pointer_move_locked(pointer_id, bx, by, nx, ny, move_cx, move_cy);
             } else {  // UP or CANCEL
@@ -932,6 +957,9 @@ public:
             ui_sink = on_ui_action_;
         }
 
+        if (msg_sink && flush_lmb_up) {
+            msg_sink(0x0202U, 0U, pack_lparam(flush_cx, flush_cy));
+        }
         if (msg_sink && move_cx >= 0 && move_cy >= 0) {
             msg_sink(0x0200U, 0U, pack_lparam(move_cx, move_cy));
         }
@@ -940,8 +968,8 @@ public:
         }
     }
 
-    // Advances the two-phase cursor tap/drop state machine and easy-dismount micro-sequence
-    // once per presented frame (called on the game thread at Present/poll).
+    // Advances the two-phase cursor tap/drop state machine, radial wheel hold reveal,
+    // multi-key order macros, and easy-dismount micro-sequence once per presented frame.
     void tick_frame() {
         PostWindowMsgFn sink;
         std::vector<std::pair<std::uint32_t, std::pair<std::uint64_t, std::uint64_t>>> queued_msgs;
@@ -949,16 +977,35 @@ public:
             const std::lock_guard<std::mutex> lock(m_);
             sink = post_msg_;
 
-            // Two-phase menu tap: frame N moves cursor, frame N+1 clicks, frame N+2 releases.
+            // Reveal radial wheel automatically after holding Orders or Weapon button for >= 180 ms.
+            if (radial_mode_ != RadialMode::none && !radial_open_ &&
+                (now_ms_locked() - radial_down_ms_) >= 180U) {
+                radial_open_ = true;
+            }
+
+            // Two-phase menu tap: frame N moves cursor, frame N+1 clicks (held >=2 frames so
+            // DirectInput polling & Warband UI click handlers never miss a fast tap), then releases.
             if (tap_phase_ == TapPhase::hover_then_down) {
+                queued_msgs.push_back({0x0200U, {0U, pack_lparam(cursor_x_, cursor_y_)}});
                 set_mouse_button_locked(0, true);
                 queued_msgs.push_back({0x0201U, {1U, pack_lparam(cursor_x_, cursor_y_)}});
-                tap_phase_ = tap_release_queued_ ? TapPhase::hold_then_up : TapPhase::holding;
+                if (tap_release_queued_) {
+                    tap_phase_ = TapPhase::hold_then_up;
+                    tap_hold_frames_ = 2;
+                } else {
+                    tap_phase_ = TapPhase::holding;
+                    tap_hold_frames_ = 0;
+                }
                 tap_release_queued_ = false;
             } else if (tap_phase_ == TapPhase::hold_then_up) {
-                set_mouse_button_locked(0, false);
-                queued_msgs.push_back({0x0202U, {0U, pack_lparam(cursor_x_, cursor_y_)}});
-                tap_phase_ = TapPhase::idle;
+                if (tap_hold_frames_ > 1) {
+                    --tap_hold_frames_;
+                } else {
+                    tap_hold_frames_ = 0;
+                    set_mouse_button_locked(0, false);
+                    queued_msgs.push_back({0x0202U, {0U, pack_lparam(cursor_x_, cursor_y_)}});
+                    tap_phase_ = TapPhase::idle;
+                }
             }
 
             // Easy-dismount sequence: pitch down briefly, press F, release F.
@@ -971,6 +1018,25 @@ public:
                     set_key_locked(dik::kF, false);
                 }
                 --dismount_frames_;
+            }
+
+            // Multi-step key macro sequencer (used for 1-flick troop orders like F1 -> F3).
+            if (macro_active_dik_ != 0U) {
+                if (macro_hold_frames_ > 1) {
+                    --macro_hold_frames_;
+                } else {
+                    set_key_locked(macro_active_dik_, false);
+                    macro_active_dik_ = 0U;
+                    macro_hold_frames_ = 0;
+                    macro_gap_frames_ = 1;
+                }
+            } else if (macro_gap_frames_ > 0) {
+                --macro_gap_frames_;
+            } else if (!macro_keys_.empty()) {
+                macro_active_dik_ = macro_keys_.front();
+                macro_keys_.pop_front();
+                set_key_locked(macro_active_dik_, true);
+                macro_hold_frames_ = 2;
             }
 
             // One-frame pulse release for discrete UI & cheat chord actions.
@@ -1184,6 +1250,11 @@ public:
                                            btn.enabled ? std::min(1.0F, alpha + 0.25F) : alpha);
         }
 
+        // 3. Minimal Iron & Gold hold-and-flick radial wheel (Orders 6-wedge or Weapon/Gear 4-wedge).
+        if (radial_mode_ != RadialMode::none && radial_open_) {
+            emit_radial_overlay_locked(out_frame, base_vtx, w, h, short_side);
+        }
+
         if (out_frame.indices.size() > base_idx) {
             wse::platform::GeometryBatch batch{};
             batch.texture = 0U;
@@ -1214,6 +1285,7 @@ public:
 
 private:
     enum class TapPhase : std::uint8_t { idle = 0, hover_then_down = 1, holding = 2, hold_then_up = 3 };
+    enum class RadialMode : std::uint8_t { none = 0, orders = 1, weapon = 2 };
 
     struct ActiveTouch {
         int pointer_id = -1;
@@ -1318,8 +1390,11 @@ private:
             return scene_ == TouchScene::main_menu || scene_ == TouchScene::screens ||
                    scene_ == TouchScene::dialog || scene_ == TouchScene::trade || scene_ == TouchScene::party;
         }
+        if (b.id == "mod_menu") {
+            return scene_ == TouchScene::battle && detected_mod_count_ > 0U;
+        }
         if (b.is_extra) {
-            return scene_ == TouchScene::battle;
+            return scene_ == TouchScene::battle && mods_expanded_;
         }
         if (b.scene != scene_) {
             return false;
@@ -1396,7 +1471,8 @@ private:
     }
 
     void handle_pointer_down_locked(int pointer_id, float x_px, float y_px, float, float,
-                                    std::string& out_ui_action, int& out_move_cx, int& out_move_cy) {
+                                    std::string& out_ui_action, int& out_move_cx, int& out_move_cy,
+                                    bool& out_flush_lmb_up, int& out_flush_cx, int& out_flush_cy) {
         const float w = static_cast<float>(screen_w_);
         const float h = static_cast<float>(screen_h_);
         const float short_side = std::min(w, h);
@@ -1415,10 +1491,22 @@ private:
                 button_pixel_circle_locked(b, w, h, bx, by, br);
                 const float dx = x_px - bx;
                 const float dy = y_px - by;
-                if (dx * dx + dy * dy <= (br * 1.12F) * (br * 1.12F)) {
+                if (dx * dx + dy * dy <= (br * 1.15F) * (br * 1.15F)) {
                     t.button_index = static_cast<int>(i);
                     b.pressed = true;
-                    activate_button_down_locked(b, out_ui_action);
+                    if (b.action == OverlayActionKind::orders_radial ||
+                        b.action == OverlayActionKind::weapon_radial) {
+                        radial_mode_ = (b.action == OverlayActionKind::orders_radial)
+                            ? RadialMode::orders : RadialMode::weapon;
+                        radial_pointer_ = pointer_id;
+                        radial_down_ms_ = now_ms_locked();
+                        radial_open_ = false;
+                        radial_selected_ = -1;
+                        radial_anchor_x_ = bx;
+                        radial_anchor_y_ = by;
+                    } else {
+                        activate_button_down_locked(b, out_ui_action);
+                    }
                     touches_.push_back(t);
                     return;
                 }
@@ -1461,6 +1549,7 @@ private:
                 tap_phase_ = TapPhase::idle;
             } else if (tap_phase_ == TapPhase::holding) {
                 tap_phase_ = TapPhase::hold_then_up;
+                tap_hold_frames_ = 1;
             }
             begin_two_finger_gesture_locked();
             return;
@@ -1475,11 +1564,15 @@ private:
         // Two-phase menu tap:
         // In scrollable list scenes (`dialog`, `screens`), defer LMB press until finger-up so
         // dragging to scroll never accidentally clicks and commits a dialog/list choice!
-        // Also flush any pending LMB release before starting a rapid second tap.
+        // Flush any pending LMB release cleanly (including WM_LBUTTONUP) before a rapid second tap.
         if (tap_phase_ == TapPhase::hold_then_up || mouse_buttons_[0] != 0U) {
             set_mouse_button_locked(0, false);
+            out_flush_lmb_up = true;
+            out_flush_cx = cursor_x_;
+            out_flush_cy = cursor_y_;
             tap_phase_ = TapPhase::idle;
             tap_release_queued_ = false;
+            tap_hold_frames_ = 0;
         }
         map_screen_to_game_locked(x_px, y_px, cursor_x_, cursor_y_);
         out_move_cx = cursor_x_;
@@ -1522,6 +1615,34 @@ private:
 
         if (t->button_index >= 0 && static_cast<std::size_t>(t->button_index) < buttons_.size()) {
             const TouchButtonSpec& b = buttons_[static_cast<std::size_t>(t->button_index)];
+            if (b.action == OverlayActionKind::orders_radial ||
+                b.action == OverlayActionKind::weapon_radial) {
+                if (radial_pointer_ == pointer_id && radial_mode_ != RadialMode::none) {
+                    const float total_dx = x_px - t->start_x;
+                    const float total_dy = y_px - t->start_y;
+                    const float dist = std::sqrt(total_dx * total_dx + total_dy * total_dy);
+                    if (!radial_open_ && (dist >= 22.0F || (now_ms_locked() - radial_down_ms_) >= 180U)) {
+                        radial_open_ = true;
+                    }
+                    if (radial_open_) {
+                        const float dead_r = std::max(24.0F, short_side * 0.042F);
+                        if (dist < dead_r) {
+                            radial_selected_ = -1;
+                        } else {
+                            // Angle from -pi/2 (straight up), clockwise in [0, 2*pi).
+                            constexpr float kPi = 3.14159265358979323846F;
+                            constexpr float kTwoPi = 6.28318530717958647692F;
+                            const int wedges = (radial_mode_ == RadialMode::orders) ? 6 : 4;
+                            const float step = kTwoPi / static_cast<float>(wedges);
+                            float a = std::atan2(total_dy, total_dx) + (kPi * 0.5F) + (step * 0.5F);
+                            while (a < 0.0F) a += kTwoPi;
+                            while (a >= kTwoPi) a -= kTwoPi;
+                            radial_selected_ = std::clamp(static_cast<int>(a / step), 0, wedges - 1);
+                        }
+                    }
+                }
+                return;
+            }
             if (b.action == OverlayActionKind::slide_attack) {
                 const float total_dx = x_px - t->start_x;
                 const float total_dy = y_px - t->start_y;
@@ -1550,11 +1671,20 @@ private:
                 add_mouse_delta_float_locked(dx * 0.8F, dy * 0.8F);
                 return;
             }
-            // In Dialog / Screens, vertical drag > 18 px smoothly scrolls lists via mouse wheel.
-            const float dist_sq = (x_px - t->start_x) * (x_px - t->start_x) +
-                                  (y_px - t->start_y) * (y_px - t->start_y);
-            if (!t->dragged && dist_sq > 324.0F) {
-                t->dragged = true;
+            // Resolution-aware touch slop (~34 px on 1080p) so normal thumb wobble never
+            // swallows taps in Dialog / Screens, while deliberate vertical drags scroll smoothly.
+            const float slop = std::max(28.0F, short_side * 0.032F);
+            const float total_dx = x_px - t->start_x;
+            const float total_dy = y_px - t->start_y;
+            const float dist_sq = total_dx * total_dx + total_dy * total_dy;
+            if (!t->dragged) {
+                if (scene_ == TouchScene::dialog || scene_ == TouchScene::screens) {
+                    if (std::fabs(total_dy) > slop || dist_sq > (slop * 1.4F) * (slop * 1.4F)) {
+                        t->dragged = true;
+                    }
+                } else if (dist_sq > slop * slop) {
+                    t->dragged = true;
+                }
             }
             if (t->dragged && (scene_ == TouchScene::dialog || scene_ == TouchScene::screens)) {
                 t->scroll_accum += dy;
@@ -1569,10 +1699,13 @@ private:
                     t->scroll_accum += 36.0F;
                 }
             }
-            // Keep cursor synchronized with finger so dragged items drop right where lifted.
-            map_screen_to_game_locked(x_px, y_px, cursor_x_, cursor_y_);
-            out_move_cx = cursor_x_;
-            out_move_cy = cursor_y_;
+            // Only move cursor during an active drag so slight thumb jitter on a tap stays locked
+            // onto the exact UI button where the finger landed.
+            if (t->dragged || !t->defer_tap) {
+                map_screen_to_game_locked(x_px, y_px, cursor_x_, cursor_y_);
+                out_move_cx = cursor_x_;
+                out_move_cy = cursor_y_;
+            }
         }
     }
 
@@ -1590,7 +1723,11 @@ private:
             if (t.button_index >= 0 && static_cast<std::size_t>(t.button_index) < buttons_.size()) {
                 TouchButtonSpec& b = buttons_[static_cast<std::size_t>(t.button_index)];
                 b.pressed = false;
-                activate_button_up_locked(b);
+                if (radial_pointer_ == pointer_id && radial_mode_ != RadialMode::none) {
+                    finish_radial_release_locked();
+                } else {
+                    activate_button_up_locked(b);
+                }
                 return;
             }
             if (t.is_cursor) {
@@ -1598,8 +1735,11 @@ private:
                     set_mouse_button_locked(1, false);
                     return;
                 }
-                // Update final drop coordinates before releasing LMB so dragged items land accurately!
-                map_screen_to_game_locked(x_px, y_px, cursor_x_, cursor_y_);
+                // Keep quick taps anchored to touch-down coords so finger-lift roll doesn't miss
+                // small Warband buttons; dragged items drop at the final lift position.
+                const float final_x = t.dragged ? x_px : t.start_x;
+                const float final_y = t.dragged ? y_px : t.start_y;
+                map_screen_to_game_locked(final_x, final_y, cursor_x_, cursor_y_);
                 out_move_cx = cursor_x_;
                 out_move_cy = cursor_y_;
                 if (t.defer_tap) {
@@ -1609,10 +1749,11 @@ private:
                         tap_release_queued_ = true;
                     }
                 } else if (tap_phase_ == TapPhase::hover_then_down) {
-                    // Quick tap: ensure press happens on next frame and release on the following frame.
+                    // Quick tap: ensure press happens on next frame and holds >=2 frames before up.
                     tap_release_queued_ = true;
                 } else if (tap_phase_ == TapPhase::holding) {
                     tap_phase_ = TapPhase::hold_then_up;
+                    tap_hold_frames_ = 1;
                 }
             }
             return;
@@ -1732,6 +1873,10 @@ private:
         case OverlayActionKind::cheat_menu_toggle:
             cheats_expanded_ = !cheats_expanded_;
             b.latched = cheats_expanded_;
+            break;
+        case OverlayActionKind::mod_menu_toggle:
+            mods_expanded_ = !mods_expanded_;
+            b.latched = mods_expanded_;
             break;
         case OverlayActionKind::cheat_chord_pulse:
             pulse_release_ctrl_ = b.need_ctrl;
@@ -2029,14 +2174,162 @@ private:
         }
     }
 
+    static void emit_radial_wedge(wse::platform::GeometryFrame& f, std::size_t base_vtx,
+                                  float cx, float cy, float r_in, float r_out,
+                                  float a0, float a1,
+                                  float cr, float cg, float cb, float ca, int segs = 10) {
+        auto push = [&](float x, float y) -> std::int32_t {
+            wse::platform::GeometryVertex gv{};
+            gv.x = x;
+            gv.y = y;
+            gv.r = cr;
+            gv.g = cg;
+            gv.b = cb;
+            gv.a = ca;
+            const auto idx = static_cast<std::int32_t>(f.vertices.size() - base_vtx);
+            f.vertices.push_back(gv);
+            return idx;
+        };
+        const std::int32_t first = static_cast<std::int32_t>(f.vertices.size() - base_vtx);
+        for (int i = 0; i <= segs; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(segs);
+            const float a = a0 + (a1 - a0) * t;
+            const float ca_v = std::cos(a);
+            const float sa_v = std::sin(a);
+            (void)push(cx + ca_v * r_in, cy + sa_v * r_in);
+            (void)push(cx + ca_v * r_out, cy + sa_v * r_out);
+        }
+        for (int i = 0; i < segs; ++i) {
+            const std::int32_t i0 = first + i * 2;
+            const std::int32_t o0 = i0 + 1;
+            const std::int32_t i1 = i0 + 2;
+            const std::int32_t o1 = i0 + 3;
+            f.indices.push_back(i0);
+            f.indices.push_back(o0);
+            f.indices.push_back(o1);
+            f.indices.push_back(i0);
+            f.indices.push_back(o1);
+            f.indices.push_back(i1);
+        }
+    }
+
+    void emit_radial_overlay_locked(wse::platform::GeometryFrame& out_frame, std::size_t base_vtx,
+                                    float w, float h, float short_side) const {
+        using Icon = wse::platform::TouchIconId;
+        constexpr float kPi = 3.14159265358979323846F;
+        constexpr float kTwoPi = 6.28318530717958647692F;
+        const bool is_orders = (radial_mode_ == RadialMode::orders);
+        const int wedges = is_orders ? 6 : 4;
+        const float r_out = short_side * (is_orders ? 0.21F : 0.165F);
+        const float r_in = r_out * 0.34F;
+        const float cx = std::clamp(radial_anchor_x_, r_out + 12.0F, w - r_out - 12.0F);
+        const float cy = std::clamp(radial_anchor_y_, r_out + 12.0F, h - r_out - 12.0F);
+        const float step = kTwoPi / static_cast<float>(wedges);
+        const float gap = 0.035F;
+
+        static constexpr Icon kOrdersIcons[6] = {
+            Icon::sword,          // 0: Top - Charge! (F1->F3)
+            Icon::arrow_right,    // 1: Top-Right - Follow (F1->F2)
+            Icon::shield,         // 2: Bottom-Right - Hold Pos (F1->F1)
+            Icon::horse_mount,    // 3: Bottom - Cavalry (3)
+            Icon::crosshair,      // 4: Bottom-Left - Archers (2)
+            Icon::formation_wall, // 5: Top-Left - Infantry (1)
+        };
+        static constexpr Icon kWeaponIcons[4] = {
+            Icon::weapon_mode,    // 0: Top - Weapon Mode (X)
+            Icon::boot_kick,      // 1: Right - Kick (E)
+            Icon::drop_item,      // 2: Bottom - Drop Weapon (G)
+            Icon::next_shield,    // 3: Left - Next Shield (wheel-)
+        };
+
+        for (int i = 0; i < wedges; ++i) {
+            const float center_a = -kPi * 0.5F + static_cast<float>(i) * step;
+            const float a0 = center_a - step * 0.5F + gap;
+            const float a1 = center_a + step * 0.5F - gap;
+            const bool sel = (radial_selected_ == i);
+            emit_radial_wedge(out_frame, base_vtx, cx, cy, r_in, r_out, a0, a1,
+                              sel ? 0.30F : 0.08F, sel ? 0.24F : 0.09F, sel ? 0.13F : 0.11F,
+                              sel ? 0.88F : 0.72F, 10);
+            const float mid_r = 0.5F * (r_in + r_out);
+            const float ix = cx + std::cos(center_a) * mid_r;
+            const float iy = cy + std::sin(center_a) * mid_r;
+            const Icon ic = is_orders ? kOrdersIcons[i] : kWeaponIcons[i];
+            wse::platform::emit_touch_icon(out_frame, base_vtx, ic, ix, iy, (r_out - r_in) * 0.32F,
+                                           sel ? 1.0F : 0.90F, sel ? 0.88F : 0.88F, sel ? 0.52F : 0.82F,
+                                           sel ? 0.98F : 0.86F);
+        }
+        emit_ring(out_frame, base_vtx, cx, cy, r_out, 2.2F, 0.78F, 0.64F, 0.36F, 0.80F, 36);
+        const bool center_sel = (radial_selected_ == -1);
+        emit_disc(out_frame, base_vtx, cx, cy, r_in * 0.92F,
+                  center_sel ? 0.24F : 0.10F, center_sel ? 0.20F : 0.11F, center_sel ? 0.12F : 0.13F,
+                  0.85F, 20);
+        emit_ring(out_frame, base_vtx, cx, cy, r_in * 0.92F, 2.0F, 0.86F, 0.70F, 0.36F, 0.90F, 20);
+        wse::platform::emit_touch_icon(out_frame, base_vtx,
+                                       is_orders ? Icon::banner_orders : Icon::switch_weapon,
+                                       cx, cy, r_in * 0.48F, 0.95F, 0.85F, 0.56F, 0.95F);
+    }
+
+    void enqueue_key_macro_locked(std::uint8_t k1, std::uint8_t k2 = 0U) {
+        if (k1 != 0U) macro_keys_.push_back(k1);
+        if (k2 != 0U) macro_keys_.push_back(k2);
+    }
+
+    void finish_radial_release_locked() {
+        const RadialMode mode = radial_mode_;
+        const bool opened = radial_open_;
+        const int sel = radial_selected_;
+        radial_mode_ = RadialMode::none;
+        radial_pointer_ = -1;
+        radial_open_ = false;
+        radial_selected_ = -1;
+
+        if (mode == RadialMode::orders) {
+            if (!opened) {
+                // Quick tap opens the manual Orders sub-pad for full F1/F2/F3 navigation.
+                const TouchScene prev = scene_;
+                scene_ = TouchScene::orders;
+                on_scene_changed_locked(prev, scene_);
+                return;
+            }
+            switch (sel) {
+            case 0: enqueue_key_macro_locked(dik::kF1, dik::kF3); break;  // Charge!
+            case 1: enqueue_key_macro_locked(dik::kF1, dik::kF2); break;  // Follow Me
+            case 2: enqueue_key_macro_locked(dik::kF1, dik::kF1); break;  // Hold Position
+            case 3: enqueue_key_macro_locked(dik::k3); break;             // Cavalry
+            case 4: enqueue_key_macro_locked(dik::k2); break;             // Archers
+            case 5: enqueue_key_macro_locked(dik::k1); break;             // Infantry
+            default: enqueue_key_macro_locked(dik::k0); break;            // Everyone
+            }
+            return;
+        }
+        if (mode == RadialMode::weapon) {
+            if (!opened || sel < 0) {
+                // Quick tap (or center): Next Weapon (mouse wheel up).
+                mouse_dz_ += 120;
+                push_mouse_event_locked(8U, 120U);
+                return;
+            }
+            switch (sel) {
+            case 0: enqueue_key_macro_locked(dik::kX); break;  // Toggle Weapon Mode
+            case 1: enqueue_key_macro_locked(dik::kE); break;  // Kick
+            case 2: enqueue_key_macro_locked(dik::kG); break;  // Drop Weapon
+            case 3:                                            // Next Shield (mouse wheel down)
+                mouse_dz_ -= 120;
+                push_mouse_event_locked(8U, static_cast<std::uint32_t>(-120));
+                break;
+            default: break;
+            }
+        }
+    }
+
     void init_default_buttons() {
         using Icon = wse::platform::TouchIconId;
         buttons_.clear();
         auto add = [&](TouchButtonSpec b) { buttons_.push_back(std::move(b)); };
 
-        // Global corner buttons (compact, unobstructed)
-        add({"pause_drawer", "Menu", TouchScene::battle, Icon::pause_bars, OverlayActionKind::pause_drawer, 0, 0, false, false, 0.045F, 0.095F, 0.095F});
-        add({"scene_mode", "Mode", TouchScene::battle, Icon::compass_look, OverlayActionKind::scene_cycle, 0, 0, false, false, 0.105F, 0.095F, 0.085F});
+        // Global corner buttons (compact, unobstructed; debug scene-mode hidden by default)
+        add({"pause_drawer", "Menu", TouchScene::battle, Icon::pause_bars, OverlayActionKind::pause_drawer, 0, 0, false, false, 0.045F, 0.095F, 0.092F});
+        add({"scene_mode", "Mode", TouchScene::battle, Icon::compass_look, OverlayActionKind::scene_cycle, 0, 0, false, false, 0.105F, 0.095F, 0.085F, false});
         add({"cheat_menu", "Cheats", TouchScene::battle, Icon::cheat_menu, OverlayActionKind::cheat_menu_toggle, 0, 0, false, false, 0.045F, 0.340F, 0.092F, true, true, false, false, false, false, false, true});
         add({"soft_keyboard", "Keyboard", TouchScene::main_menu, Icon::keyboard, OverlayActionKind::soft_keyboard, 0, 0, false, false, 0.945F, 0.095F, 0.095F});
 
@@ -2089,24 +2382,28 @@ private:
         add_cheat("cheat_screen_xp", "+1000 XP", TouchScene::screens, Icon::cheat_xp, OverlayActionKind::cheat_chord_pulse, dik::kX, true, false, false, 0.045F, 0.460F);
         add_cheat("cheat_dialog_xp", "+1000 XP", TouchScene::dialog, Icon::cheat_xp, OverlayActionKind::cheat_chord_pulse, dik::kX, true, false, false, 0.045F, 0.460F);
 
-        // Battle controls (clean-room ergonomics designed for 20:9 landscape thumb reach;
-        // bottom-right HP/horse/shield HUD and top-center kill-feed stay unobstructed)
-        add({"attack", "Attack", TouchScene::battle, Icon::sword, OverlayActionKind::slide_attack, 0, 0, false, false, 0.895F, 0.65F, 0.175F});
-        add({"defend", "Defend", TouchScene::battle, Icon::shield, OverlayActionKind::mouse_button, 0, 1, false, false, 0.775F, 0.69F, 0.135F});
-        add({"jump", "Jump", TouchScene::battle, Icon::jump_arrow, OverlayActionKind::key_hold, dik::kSpace, 0, false, false, 0.905F, 0.43F, 0.112F});
-        add({"kick", "Kick", TouchScene::battle, Icon::boot_kick, OverlayActionKind::key_hold, dik::kE, 0, false, false, 0.815F, 0.49F, 0.102F});
-        add({"use", "Use", TouchScene::battle, Icon::hand_use, OverlayActionKind::easy_dismount, dik::kF, 0, false, false, 0.905F, 0.25F, 0.112F});
-        add({"zoom", "Zoom", TouchScene::battle, Icon::crosshair, OverlayActionKind::zoom_hold, dik::kLShift, 0, false, false, 0.750F, 0.37F, 0.102F});
-        add({"switch_weapon", "Weapon", TouchScene::battle, Icon::switch_weapon, OverlayActionKind::mouse_wheel_step, 0, 0, false, false, 0.680F, 0.77F, 0.098F});
-        add({"next_shield", "Shield", TouchScene::battle, Icon::next_shield, OverlayActionKind::mouse_wheel_step, 0, 1, false, false, 0.765F, 0.82F, 0.092F});
-        add({"weapon_mode", "Mode", TouchScene::battle, Icon::weapon_mode, OverlayActionKind::key_hold, dik::kX, 0, false, false, 0.690F, 0.59F, 0.094F});
-        add({"drop", "Drop", TouchScene::battle, Icon::drop_item, OverlayActionKind::key_hold, dik::kG, 0, false, false, 0.610F, 0.80F, 0.088F});
+        // Battle controls — minimalistic ergonomic 20:9 layout:
+        // Core 6-button right arc + 3-button top-left strip + Leave.
+        // Secondary gear/combat actions (Next Shield, Weapon Mode, Kick, Drop) are folded into
+        // `switch_weapon`'s hold-and-flick radial; tactical troop commands fold into `orders`'s
+        // hold-and-flick radial; auto-detected mod buttons fold behind `mod_menu`.
+        add({"attack", "Attack", TouchScene::battle, Icon::sword, OverlayActionKind::slide_attack, 0, 0, false, false, 0.905F, 0.71F, 0.165F});
+        add({"defend", "Defend", TouchScene::battle, Icon::shield, OverlayActionKind::mouse_button, 0, 1, false, false, 0.785F, 0.74F, 0.130F});
+        add({"jump", "Jump", TouchScene::battle, Icon::jump_arrow, OverlayActionKind::key_hold, dik::kSpace, 0, false, false, 0.910F, 0.49F, 0.110F});
+        add({"kick", "Kick", TouchScene::battle, Icon::boot_kick, OverlayActionKind::key_hold, dik::kE, 0, false, false, 0.815F, 0.49F, 0.102F, false});
+        add({"use", "Use", TouchScene::battle, Icon::hand_use, OverlayActionKind::easy_dismount, dik::kF, 0, false, false, 0.910F, 0.30F, 0.108F});
+        add({"zoom", "Zoom", TouchScene::battle, Icon::crosshair, OverlayActionKind::zoom_hold, dik::kLShift, 0, false, false, 0.805F, 0.54F, 0.104F});
+        add({"switch_weapon", "Weapon", TouchScene::battle, Icon::switch_weapon, OverlayActionKind::weapon_radial, 0, 0, false, false, 0.695F, 0.78F, 0.100F});
+        add({"next_shield", "Shield", TouchScene::battle, Icon::next_shield, OverlayActionKind::mouse_wheel_step, 0, 1, false, false, 0.765F, 0.82F, 0.092F, false});
+        add({"weapon_mode", "Mode", TouchScene::battle, Icon::weapon_mode, OverlayActionKind::key_hold, dik::kX, 0, false, false, 0.690F, 0.59F, 0.094F, false});
+        add({"drop", "Drop", TouchScene::battle, Icon::drop_item, OverlayActionKind::key_hold, dik::kG, 0, false, false, 0.610F, 0.80F, 0.088F, false});
         add({"crouch", "Crouch", TouchScene::battle, Icon::crouch, OverlayActionKind::key_toggle, dik::kZ, 0, false, false, 0.065F, 0.44F, 0.098F});
-        add({"camera", "Camera", TouchScene::battle, Icon::eye_cam, OverlayActionKind::key_hold, dik::kR, 0, false, false, 0.180F, 0.095F, 0.090F});
-        add({"orders", "Orders", TouchScene::battle, Icon::banner_orders, OverlayActionKind::orders_open, 0, 0, false, false, 0.255F, 0.095F, 0.095F});
-        add({"orders_more", "More", TouchScene::battle, Icon::orders_more, OverlayActionKind::key_hold, dik::kF2, 0, false, false, 0.325F, 0.095F, 0.088F});
-        add({"leave", "Leave", TouchScene::battle, Icon::door_exit, OverlayActionKind::key_hold, dik::kTab, 0, false, false, 0.945F, 0.095F, 0.095F});
-        add({"chat", "Chat", TouchScene::battle, Icon::chat_bubble, OverlayActionKind::key_hold, dik::kT, 0, false, false, 0.400F, 0.095F, 0.088F});
+        add({"camera", "Camera", TouchScene::battle, Icon::eye_cam, OverlayActionKind::key_hold, dik::kR, 0, false, false, 0.112F, 0.095F, 0.090F});
+        add({"orders", "Orders", TouchScene::battle, Icon::banner_orders, OverlayActionKind::orders_radial, 0, 0, false, false, 0.179F, 0.095F, 0.095F});
+        add({"mod_menu", "Mods", TouchScene::battle, Icon::star, OverlayActionKind::mod_menu_toggle, 0, 0, false, false, 0.246F, 0.095F, 0.090F});
+        add({"orders_more", "More", TouchScene::battle, Icon::orders_more, OverlayActionKind::key_hold, dik::kF2, 0, false, false, 0.325F, 0.095F, 0.088F, false});
+        add({"leave", "Leave", TouchScene::battle, Icon::door_exit, OverlayActionKind::key_hold, dik::kTab, 0, false, false, 0.945F, 0.095F, 0.092F});
+        add({"chat", "Chat", TouchScene::battle, Icon::chat_bubble, OverlayActionKind::key_hold, dik::kT, 0, false, false, 0.315F, 0.095F, 0.088F});
 
         // Orders 4-button sub-pad (replaces battle action clutter when issuing troop commands)
         add({"orders_up", "Up", TouchScene::orders, Icon::arrow_up, OverlayActionKind::key_hold, dik::kF1, 0, false, false, 0.84F, 0.42F, 0.112F});
@@ -2212,12 +2509,26 @@ private:
 
     TapPhase tap_phase_ = TapPhase::idle;
     bool tap_release_queued_ = false;
+    int tap_hold_frames_ = 0;
     int dismount_frames_ = 0;
     std::uint8_t pulse_release_dik_ = 0U;
     bool pulse_release_ctrl_ = false;
     bool pulse_release_shift_ = false;
     bool pulse_release_alt_ = false;
     bool cheats_expanded_ = false;
+    std::size_t detected_mod_count_ = 0U;
+    bool mods_expanded_ = false;
+    RadialMode radial_mode_ = RadialMode::none;
+    int radial_pointer_ = -1;
+    std::uint32_t radial_down_ms_ = 0U;
+    bool radial_open_ = false;
+    int radial_selected_ = -1;
+    float radial_anchor_x_ = 0.0F;
+    float radial_anchor_y_ = 0.0F;
+    std::deque<std::uint8_t> macro_keys_;
+    std::uint8_t macro_active_dik_ = 0U;
+    int macro_hold_frames_ = 0;
+    int macro_gap_frames_ = 0;
     float pinch_prev_dist_ = 0.0F;
     float pinch_prev_mid_x_ = 0.0F;
     float pinch_prev_mid_y_ = 0.0F;
