@@ -566,6 +566,7 @@ int main(int argc, char** argv) {
     fs::path work = "/root/wse/r4";
     wse::recomp::StartupOptions o;
     fs::path for_phone;
+    bool no_texcache = false;
     std::string capture;
     std::uint64_t capture_frames = 60;
     bool want_vulkan = false;
@@ -597,6 +598,7 @@ int main(int argc, char** argv) {
         else if (a == "--module" && i + 1 < argc) o.module = argv[++i];
         else if (a == "--frames" && i + 1 < argc) o.frame_limit = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--for-phone" && i + 1 < argc) for_phone = argv[++i];
+        else if (a == "--no-texcache") no_texcache = true;
         else if (a == "--capture" && i + 1 < argc) capture = argv[++i];
         else if (a == "--capture-frames" && i + 1 < argc) capture_frames = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--screen" && i + 1 < argc) {  // e.g. 2412x1080: the display the game sees
@@ -1101,7 +1103,7 @@ int main(int argc, char** argv) {
 #endif
 
     game.join();
-    if (!for_phone.empty() && rc == 0) {
+    if (!for_phone.empty() && !no_texcache && rc == 0) {
         // Converted textures go in a subfolder; the phone puts them in its texture cache.
         (void)convert_textures_for_phone(install, o.module, for_phone / "texcache", std::max(1U, o.jobs));
     } else if (for_phone.empty()) {

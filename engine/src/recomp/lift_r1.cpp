@@ -488,8 +488,8 @@ void Ctx::emit_unsupported(std::uint64_t va, const std::string& what) {
 
 namespace {
 
-constexpr int kFastArgGprs[7] = {1, 2, 8, 9, 10, 11, 4};       // rcx, rdx, r8, r9, r10, r11, rsp
-constexpr int kFastRetGprs[8] = {0, 1, 2, 8, 9, 10, 11, 4};    // rax, rcx, rdx, r8, r9, r10, r11, rsp
+constexpr int kFastArgGprs[8] = {0, 1, 2, 8, 9, 10, 11, 4};  // rax, rcx, rdx, r8, r9, r10, r11, rsp
+constexpr int kFastRetGprs[8] = {0, 1, 2, 8, 9, 10, 11, 4};  // rax, rcx, rdx, r8, r9, r10, r11, rsp
 
 }  // namespace
 
@@ -539,7 +539,8 @@ struct R1Translator::Impl {
         llvm::Type* p = llvm::PointerType::getUnqual(*context);
         llvm::Type* i64 = llvm::Type::getInt64Ty(*context);
         llvm::Type* v2 = llvm::FixedVectorType::get(i64, 2);
-        return llvm::FunctionType::get(fast_ret_ty(), {p, i64, i64, i64, i64, i64, i64, i64, v2, v2, v2, v2}, false);
+        return llvm::FunctionType::get(fast_ret_ty(), {p, i64, i64, i64, i64, i64, i64, i64, i64, v2, v2, v2, v2},
+                                       false);
     }
 
     llvm::Value* ext_call_slot_ptr(llvm::IRBuilder<>& b, std::uint64_t va) {
@@ -862,8 +863,10 @@ bool is_fast_abi_eligible(const DFunction& fn, const ImageInfo& image) {
         (void)va;
         const auto cat = d.ins.meta.category;
         const auto mn = d.ins.mnemonic;
-        if (cat == ZYDIS_CATEGORY_CALL || mn == ZYDIS_MNEMONIC_CPUID || insn_is_trap(d) ||
-            insn_gated_ext(d) != nullptr) {
+        if (cat == ZYDIS_CATEGORY_CALL || cat == ZYDIS_CATEGORY_FLAGOP || cat == ZYDIS_CATEGORY_X87_ALU ||
+            cat == ZYDIS_CATEGORY_MMX || mn == ZYDIS_MNEMONIC_CPUID || mn == ZYDIS_MNEMONIC_LDMXCSR ||
+            mn == ZYDIS_MNEMONIC_STMXCSR || mn == ZYDIS_MNEMONIC_VLDMXCSR || mn == ZYDIS_MNEMONIC_VSTMXCSR ||
+            insn_is_trap(d) || insn_gated_ext(d) != nullptr) {
             return false;
         }
         if (cat == ZYDIS_CATEGORY_RET && d.ins.operand_count_visible > 0 && d.ops[0].imm.value.u != 0) {
@@ -892,59 +895,14 @@ bool is_fast_abi_eligible(const DFunction& fn, const ImageInfo& image) {
             }
         }
     }
-    // Check whether entry block defines RAX before exiting; non-entry blocks inherit that guarantee.
-    bool entry_defines_rax = false;
-    {
-        std::uint64_t va = fn.entry;
-        while (const DInsn* dp = fn.at(va)) {
-            const DInsn& d = *dp;
-            for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
-                const ZydisDecodedOperand& o = d.ops[i];
-                if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
-                    o.type == ZYDIS_OPERAND_TYPE_REGISTER && r1::Ctx::gpr_index(o.reg.value) == 0 &&
-                    o.size >= 32) {
-                    entry_defines_rax = true;
-                    break;
-                }
-            }
-            if (entry_defines_rax || d.ins.meta.category == ZYDIS_CATEGORY_COND_BR ||
-                d.ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR || d.ins.meta.category == ZYDIS_CATEGORY_RET) {
-                break;
-            }
-            va = d.next();
-            if (fn.block_starts.count(va) != 0) break;
-        }
-    }
-    // Verify no block reads RAX or any CPU flag before writing it.
+    // Verify no block reads any CPU flag before writing it (RAX is passed in via kFastArgGprs).
     for (const std::uint64_t bstart : fn.block_starts) {
-        bool rax_written = (bstart != fn.entry) && entry_defines_rax;
         std::uint64_t flags_defined = 0;
         std::uint64_t va = bstart;
         while (const DInsn* dp = fn.at(va)) {
             const DInsn& d = *dp;
             if (d.ins.cpu_flags != nullptr && (d.ins.cpu_flags->tested & ~flags_defined) != 0) {
                 return false;
-            }
-            if (!rax_written) {
-                for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
-                    const ZydisDecodedOperand& o = d.ops[i];
-                    if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0 &&
-                        o.type == ZYDIS_OPERAND_TYPE_REGISTER && r1::Ctx::gpr_index(o.reg.value) == 0) {
-                        return false;
-                    }
-                    if (o.type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                        (r1::Ctx::gpr_index(o.mem.base) == 0 || r1::Ctx::gpr_index(o.mem.index) == 0)) {
-                        return false;
-                    }
-                }
-                for (std::uint8_t i = 0; i < d.ins.operand_count; ++i) {
-                    const ZydisDecodedOperand& o = d.ops[i];
-                    if ((o.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
-                        o.type == ZYDIS_OPERAND_TYPE_REGISTER && r1::Ctx::gpr_index(o.reg.value) == 0 &&
-                        o.size >= 32) {
-                        rax_written = true;
-                    }
-                }
             }
             if (d.ins.cpu_flags != nullptr) {
                 flags_defined |= (d.ins.cpu_flags->modified | d.ins.cpu_flags->set_0 | d.ins.cpu_flags->set_1);
@@ -1011,11 +969,11 @@ bool R1Translator::Impl::lift_body(Impl& impl, const DFunction& fn, llvm::Functi
         for (int k = 0; k < r1::kFlagCount; ++k) {
             c.B.CreateStore(c.B.getFalse(), c.flag_slot[k]);
         }
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 8; ++i) {
             c.B.CreateStore(f->getArg(1 + i), c.gpr_slot[kFastArgGprs[i]]);
         }
         for (int i = 0; i < 4; ++i) {
-            c.B.CreateStore(f->getArg(8 + i), c.xmm_slot[i]);
+            c.B.CreateStore(f->getArg(9 + i), c.xmm_slot[i]);
         }
     } else {
         c.reload();
@@ -1210,7 +1168,7 @@ bool R1Translator::Impl::lift_body(Impl& impl, const DFunction& fn, llvm::Functi
                         c.set_gpr64(4, rsp);
                         c.store(rsp, c.B.getInt64(ret_va), r1::Mem::stack);
                         std::vector<llvm::Value*> fargs{c.state};
-                        for (int i = 0; i < 7; ++i) fargs.push_back(c.gpr64(kFastArgGprs[i]));
+                        for (int i = 0; i < 8; ++i) fargs.push_back(c.gpr64(kFastArgGprs[i]));
                         for (int i = 0; i < 4; ++i) fargs.push_back(c.xmm_vec(i));
                         llvm::CallInst* call = nullptr;
                         if (const auto fit = impl.fast_functions.find(target); fit != impl.fast_functions.end()) {
@@ -1373,7 +1331,7 @@ bool R1Translator::lift(const DFunction& fn, std::string* why) {
             llvm::Type* i64 = b.getInt64Ty();
             llvm::Type* v2 = llvm::FixedVectorType::get(i64, 2);
             std::vector<llvm::Value*> args{st};
-            for (int i = 0; i < 7; ++i) {
+            for (int i = 0; i < 8; ++i) {
                 args.push_back(b.CreateLoad(i64, b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::gpr + 8U * kFastArgGprs[i])));
             }
             for (int i = 0; i < 4; ++i) {
@@ -1521,13 +1479,13 @@ bool R1Translator::emit_object(int opt_level, std::vector<char>& object, Transla
             stub->addFnAttr(llvm::Attribute::NoUnwind);
             b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", stub));
             llvm::Value* st = stub->getArg(0);
-            for (int i = 0; i < 7; ++i) {
+            for (int i = 0; i < 8; ++i) {
                 b.CreateStore(stub->getArg(1 + i),
                               b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::gpr + 8U * kFastArgGprs[i]));
             }
             for (int i = 0; i < 4; ++i) {
                 llvm::StoreInst* xs = b.CreateStore(
-                    stub->getArg(8 + i),
+                    stub->getArg(9 + i),
                     b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), st, cpu_offset::xmm + 16U * i));
                 xs->setAlignment(llvm::Align(16));
             }

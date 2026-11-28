@@ -1047,6 +1047,70 @@ void test_r9_features(const char* dir) {
         s.gpr[1] = 10;
         s.gpr[2] = 20;
         expect(rt.run(s, kInlineCallerVa) && s.gpr[0] == 55, "R9 Wave 2: cross-batch cloned inline leaf returns 55");
+
+        // Regression test: void fast-ABI leaf that does NOT modify RAX must preserve caller's RAX.
+        constexpr std::uint64_t kVoidLeafVa = kImgBase + 0x1300U;
+        constexpr std::uint64_t kVoidCallerVa = kImgBase + 0x1400U;
+        std::vector<std::uint8_t> img2(0x2000U, 0xCCU);
+        // 0x301300: mov [rcx], edx; ret
+        const std::uint8_t vleaf_bytes[] = {0x89, 0x11, 0xC3};
+        std::memcpy(img2.data() + 0x1300U, vleaf_bytes, sizeof(vleaf_bytes));
+        // 0x301400: call 0x301300; mov [r8], rax; ret  (rel32 = -0x105)
+        const std::uint8_t vcaller_bytes[] = {0xE8, 0xFB, 0xFE, 0xFF, 0xFF, 0x49, 0x89, 0x00, 0xC3};
+        std::memcpy(img2.data() + 0x1400U, vcaller_bytes, sizeof(vcaller_bytes));
+
+        const ImageView view2(img2.data(), kImgBase, img2.size(), kImgBase + 0x1300U, kImgBase + 0x1500U);
+        const std::set<std::uint64_t> entries2{kVoidLeafVa, kVoidCallerVa};
+        Discoverer disc2(view2);
+        ImageInfo info2;
+        info2.base = kImgBase;
+        const DFunction df_vleaf = disc2.discover(kVoidLeafVa, entries2);
+        expect(is_fast_abi_eligible(df_vleaf, info2), "R9 Wave 2: void leaf is fast-ABI eligible");
+        info2.fast_abi_vas.insert(kVoidLeafVa);
+        R1Translator tr2(info2);
+        tr2.declare({kVoidLeafVa, kVoidCallerVa});
+        std::string why2;
+        expect(tr2.lift(df_vleaf, &why2) && tr2.lift(disc2.discover(kVoidCallerVa, entries2), &why2),
+               "R9 Wave 2: lift void leaf + caller");
+        std::vector<char> obj2;
+        std::string err2;
+        expect(tr2.emit_object(2, obj2, nullptr, &err2) && !obj2.empty(), "R9 Wave 2: emit void leaf obj");
+        const std::string o2 = std::string(dir) + "/r9_void_rax.o";
+        const std::string so2 = std::string(dir) + "/r9_void_rax.so";
+        std::ofstream(o2, std::ios::binary).write(obj2.data(), static_cast<std::streamsize>(obj2.size()));
+        std::string log2;
+        expect(link_shared_object({o2}, so2, &log2), "R9 Wave 2: link void leaf so");
+        LoadedCode c_v;
+        void* h_v = dlopen(so2.c_str(), RTLD_NOW | RTLD_LOCAL);
+        expect(h_v != nullptr, "R9 Wave 2: dlopen void leaf");
+        if (h_v != nullptr) {
+            c_v.adopt_handle(h_v);
+            Runtime rt2;
+            rt2.add_table(static_cast<const FnRow*>(c_v.sym("wse_fn_table")),
+                          static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c_v.sym("wse_fn_table_count"))));
+            rt2.add_fast_table(
+                static_cast<const FastFnRow*>(c_v.sym("wse_fast_table")),
+                static_cast<std::size_t>(*static_cast<const std::uint64_t*>(c_v.sym("wse_fast_table_count"))));
+            std::uint32_t out_edx = 0;
+            std::uint64_t out_rax = 0;
+            constexpr std::uint64_t kRaxSentinel = 0x123456789ABCDEF0ULL;
+            stack.prepare(s);
+            s.gpr[0] = kRaxSentinel;
+            s.gpr[1] = reinterpret_cast<std::uintptr_t>(&out_edx);
+            s.gpr[2] = 0xCAFEBABEU;
+            s.gpr[8] = reinterpret_cast<std::uintptr_t>(&out_rax);
+            expect(rt2.run(s, kVoidCallerVa) && out_edx == 0xCAFEBABEU && out_rax == kRaxSentinel &&
+                       s.gpr[0] == kRaxSentinel,
+                   "R9 Wave 2: void fast-ABI callee preserves RAX via wse_fast_<va>");
+
+            out_edx = 0;
+            stack.prepare(s);
+            s.gpr[0] = kRaxSentinel;
+            s.gpr[1] = reinterpret_cast<std::uintptr_t>(&out_edx);
+            s.gpr[2] = 0xDEADBEEFU;
+            expect(rt2.run(s, kVoidLeafVa) && out_edx == 0xDEADBEEFU && s.gpr[0] == kRaxSentinel,
+                   "R9 Wave 2: void fast-ABI callee preserves RAX via wse_fn_<va> thunk");
+        }
     }
 
     // 3. Wave 3: PGO profile save / load / select_pgo_hot_vas.
